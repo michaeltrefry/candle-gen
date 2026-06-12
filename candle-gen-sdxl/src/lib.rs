@@ -21,8 +21,8 @@
 //! sequential load), and the VAE decode tiles + blends above 512² output ([`set_vae_tiling`], default
 //! on) — together targeting torch-parity peak VRAM at 1024².
 //!
-//! Carried forward as named follow-ups: component caching across `generate` calls (a latency win, in
-//! tension with sc-4987's mid-call frees), RealVisXL + parity (sc-3677).
+//! Carried forward as named follow-ups: component caching across `generate` calls (sc-5037 — a
+//! latency win, in tension with sc-4987's mid-call frees), RealVisXL + parity (sc-3677).
 
 mod pipeline;
 
@@ -91,7 +91,7 @@ pub fn vae_tiling_enabled() -> bool {
 /// A loaded candle SDXL generator. Loading is **lazy**: this carries only the resolved snapshot
 /// `root` + the compute device/dtype (so `load` does no file I/O and registry introspection against a
 /// missing path still resolves). The heavy components ([`Pipeline`]) are built at the top of
-/// [`generate`](Generator::generate); caching them across calls is sc-3674.
+/// [`generate`](Generator::generate); caching them across calls is sc-5037.
 pub struct SdxlGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,

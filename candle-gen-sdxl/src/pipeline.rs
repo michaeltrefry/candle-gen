@@ -33,9 +33,10 @@
 //!   — the fp16-VAE-fix and the CLIP-L/bigG `tokenizer.json`s — still resolve via `hf-hub` (cached),
 //!   exactly as the spike.
 //!
-//! Component *caching across* `generate` calls (the spike's per-call reload) stays a follow-up — and
-//! is in tension with the sc-4987 staged load, which deliberately frees components mid-call to bound
-//! peak VRAM; a cache would hold UNet+VAE resident between calls (a latency, not a peak-VRAM, win).
+//! Component *caching across* `generate` calls (the spike's per-call reload) stays a follow-up
+//! (sc-5037) — and is in tension with the sc-4987 staged load, which deliberately frees components
+//! mid-call to bound peak VRAM; a cache must keep CLIP load-on-demand-and-free and only hold the
+//! UNet+VAE resident (a latency, not a peak-VRAM, win).
 
 use std::path::{Path, PathBuf};
 
