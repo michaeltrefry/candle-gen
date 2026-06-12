@@ -230,6 +230,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-z-image"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-transformers",
+ "image",
+ "inventory",
+ "rand",
+ "rand_distr",
+ "sceneworks-gen-core-testkit",
+ "tokenizers 0.22.2",
+]
+
+[[package]]
 name = "candle-kernels"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
