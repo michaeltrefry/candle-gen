@@ -6,7 +6,7 @@
 //! production). Build with the CUDA backend on the Windows/Blackwell box:
 //!
 //! ```text
-//! cargo run --release --example txt2img --features cuda -- \
+//! cargo run --release --example sdxl-txt2img --features cuda -- \
 //!   --snapshot "C:\Users\…\models--stabilityai--stable-diffusion-xl-base-1.0\snapshots\<hash>" \
 //!   --prompt "a photo of a rusty robot holding a lit candle" --steps 30 --seed 42 --out out.png
 //! ```

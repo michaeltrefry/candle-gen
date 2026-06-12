@@ -119,7 +119,7 @@ build is driven through `vcvars64.bat`. From a `cmd` shell that has sourced vcva
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 set CUDA_COMPUTE_CAP=80
 set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
-cargo build --release -p candle-gen-sdxl --example txt2img --features cuda
+cargo build --release -p candle-gen-sdxl --example sdxl-txt2img --features cuda
 ```
 
 The scripted, reproducible form of this — sources vcvars, sets the env, runs `cargo build/test
@@ -144,7 +144,7 @@ install. `scripts/package-cuda.ps1` copies the binary plus the redistributable D
 dynamic-links, resolved from the exe's own directory) into `dist/`:
 
 ```powershell
-pwsh scripts/package-cuda.ps1 -BinaryPath target\release\examples\txt2img.exe
+pwsh scripts/package-cuda.ps1 -BinaryPath target\release\examples\sdxl-txt2img.exe
 ```
 
 Bundled redist DLLs (CUDA 12.9; the script globs the version suffixes):

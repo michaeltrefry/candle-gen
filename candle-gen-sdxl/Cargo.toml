@@ -33,7 +33,7 @@ cuda = ["candle-gen/cuda", "candle-transformers/cuda"]
 flash-attn = ["candle-gen/flash-attn", "candle-transformers/flash-attn"]
 
 [dev-dependencies]
-# `examples/txt2img.rs` smoke driver only — encode the produced `gen_core::Image` (RGB8) to PNG so a
+# `examples/sdxl-txt2img.rs` smoke driver only — encode the produced `gen_core::Image` (RGB8) to PNG so a
 # real GPU run can be eyeballed. Not a library dependency (the worker owns asset writes).
 image = { version = "0.25", default-features = false, features = ["png"] }
 # gen-core conformance suite (sc-4481): drives this provider through the public Generator contract

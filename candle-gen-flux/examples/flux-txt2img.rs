@@ -7,7 +7,7 @@
 //! production). Build with the CUDA backend on the Windows/Blackwell box:
 //!
 //! ```text
-//! cargo run --release --example txt2img --features cuda -- \
+//! cargo run --release --example flux-txt2img --features cuda -- \
 //!   --snapshot "C:\Users\…\models--black-forest-labs--FLUX.1-schnell\snapshots\<hash>" \
 //!   --model schnell --prompt "a photo of a rusty robot holding a lit candle" --seed 42 --out out.png
 //! ```

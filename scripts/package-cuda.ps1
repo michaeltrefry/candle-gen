@@ -18,7 +18,7 @@
 
 .PARAMETER BinaryPath
   Path to the CUDA-built .exe to package (e.g. the SceneWorks worker, or this repo's txt2img example
-  at target\release\examples\txt2img.exe).
+  at target\release\examples\sdxl-txt2img.exe).
 
 .PARAMETER OutDir
   Output directory for the bundle. Created if absent; existing contents are NOT cleared. Default: dist
@@ -27,7 +27,7 @@
   CUDA Toolkit root holding bin\*.dll. Default: $env:CUDA_PATH, else the v12.9 default install path.
 
 .EXAMPLE
-  pwsh scripts/package-cuda.ps1 -BinaryPath target\release\examples\txt2img.exe
+  pwsh scripts/package-cuda.ps1 -BinaryPath target\release\examples\sdxl-txt2img.exe
 #>
 [CmdletBinding()]
 param(

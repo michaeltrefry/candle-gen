@@ -7,7 +7,7 @@
 //! production). Build with the CUDA backend on the Windows/Blackwell box:
 //!
 //! ```text
-//! cargo run --release --example txt2img --features cuda -- \
+//! cargo run --release --example z-image-txt2img --features cuda -- \
 //!   --snapshot "C:\Users\…\models--Tongyi-MAI--Z-Image-Turbo\snapshots\<hash>" \
 //!   --prompt "a photo of a rusty robot holding a lit candle" --steps 4 --seed 42 --out out.png
 //! ```
