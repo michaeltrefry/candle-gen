@@ -165,8 +165,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 [[package]]
 name = "candle-core"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bd9895436c1ba5dc1037a19935d084b838db066ff4e15ef7dded020b7c12a4a"
+source = "git+https://github.com/huggingface/candle?rev=65ecb58c11d2244a7e60c71bdcdb19b15b0a4343#65ecb58c11d2244a7e60c71bdcdb19b15b0a4343"
 dependencies = [
  "byteorder",
  "candle-kernels",
@@ -176,6 +175,7 @@ dependencies = [
  "float8",
  "gemm 0.19.0",
  "half",
+ "libc",
  "libm",
  "memmap2",
  "num-traits",
@@ -195,8 +195,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12512cf8e706744642e9a8579305a6ed1e44a0c636ce20c416cd5c519de19b7d"
+source = "git+https://github.com/huggingface/candle?rev=65ecb58c11d2244a7e60c71bdcdb19b15b0a4343#65ecb58c11d2244a7e60c71bdcdb19b15b0a4343"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -230,10 +229,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-z-image"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-transformers",
+ "image",
+ "inventory",
+ "rand",
+ "rand_distr",
+ "sceneworks-gen-core-testkit",
+ "tokenizers 0.22.2",
+]
+
+[[package]]
 name = "candle-kernels"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "742e2ac226b777134436e9e692f44e77c278b8a7abb1554dc10e44dc911b349f"
+source = "git+https://github.com/huggingface/candle?rev=65ecb58c11d2244a7e60c71bdcdb19b15b0a4343#65ecb58c11d2244a7e60c71bdcdb19b15b0a4343"
 dependencies = [
  "cudaforge",
 ]
@@ -241,9 +253,9 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b6b5a4cae6b4e1ab0efcee4dc05272d11b374a3d1ba121b3a961e36be54ab60"
+source = "git+https://github.com/huggingface/candle?rev=65ecb58c11d2244a7e60c71bdcdb19b15b0a4343#65ecb58c11d2244a7e60c71bdcdb19b15b0a4343"
 dependencies = [
+ "block2",
  "half",
  "objc2",
  "objc2-foundation",
@@ -256,8 +268,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9317a09d6530b758990ed7f625ac69ff43653bc9ee28b0464644ad1169ada87"
+source = "git+https://github.com/huggingface/candle?rev=65ecb58c11d2244a7e60c71bdcdb19b15b0a4343#65ecb58c11d2244a7e60c71bdcdb19b15b0a4343"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -274,8 +285,7 @@ dependencies = [
 [[package]]
 name = "candle-transformers"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f59d08c89e9f4af9c464e2f3a8e16199e7cc601e6f34538c2cfbb42b623b1783"
+source = "git+https://github.com/huggingface/candle?rev=65ecb58c11d2244a7e60c71bdcdb19b15b0a4343#65ecb58c11d2244a7e60c71bdcdb19b15b0a4343"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -294,8 +304,7 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca0fc3167cbc99c8ec1be618cb620aa21dca95038f118c3579a79370e3dc5f77"
+source = "git+https://github.com/huggingface/candle?rev=65ecb58c11d2244a7e60c71bdcdb19b15b0a4343#65ecb58c11d2244a7e60c71bdcdb19b15b0a4343"
 dependencies = [
  "ug",
  "ug-cuda",
@@ -590,7 +599,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -673,7 +682,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -684,9 +693,9 @@ checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 
 [[package]]
 name = "fancy-regex"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72cf461f865c862bb7dc573f643dd6a2b6842f7c30b07882b56bd148cc2761b8"
+checksum = "e1e1dacd0d2082dfcf1351c4bdd566bbe89a2b263235a2b50058f1e130a47277"
 dependencies = [
  "bit-set",
  "regex-automata",
@@ -2235,7 +2244,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2447,7 +2456,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3108,7 +3117,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3435,9 +3444,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "7.2.0"
+version = "8.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
+checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
 dependencies = [
  "crc32fast",
  "indexmap",

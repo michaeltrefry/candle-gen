@@ -1,5 +1,5 @@
 [workspace]
-members = ["candle-gen", "candle-gen-sdxl"]
+members = ["candle-gen", "candle-gen-sdxl", "candle-gen-z-image"]
 resolver = "2"
 
 # Single source of truth for the deps shared across the workspace (mirrors mlx-gen's F-151). The
@@ -13,13 +13,16 @@ resolver = "2"
 # fires. candle-gen is the Windows/CUDA sibling of mlx-gen; both satisfy this one contract.
 sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "95cd5c692b974ecaafa57c0af437f085b052e260" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
-# under the `cuda` feature). Latest crates.io release that builds cleanly on macOS (see README).
-candle-core = "0.10.2"
-candle-nn = "0.10.2"
+# under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
+# sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels
+# kernel the moment candle-transformers is linked (repo-wide; SDXL + z-image both; plain candle-core
+# works). Rev 65ecb58 clears it — verified by the SDXL + Z-Image GPU conformance on RTX PRO 6000
+# (sm_120). All three crates share ONE rev so the whole tree is one candle build. Re-pin in lockstep.
+candle-core = { git = "https://github.com/huggingface/candle", rev = "65ecb58c11d2244a7e60c71bdcdb19b15b0a4343" }
+candle-nn = { git = "https://github.com/huggingface/candle", rev = "65ecb58c11d2244a7e60c71bdcdb19b15b0a4343" }
 # SDXL building blocks (dual CLIP, UNet2DConditionModel, VAE, schedulers) — the candle-gen-sdxl
 # pipeline (sc-3675) reuses these, mirroring how the spike (epic 3494) built on candle-transformers.
-# Same 0.10.2 release as candle-core/nn so the whole tree shares one candle build.
-candle-transformers = "0.10.2"
+candle-transformers = { git = "https://github.com/huggingface/candle", rev = "65ecb58c11d2244a7e60c71bdcdb19b15b0a4343" }
 # HF tokenizers (CLIP-L + CLIP-bigG tokenizer.json) and snapshot/file resolution for SDXL weights.
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }

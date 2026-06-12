@@ -15,6 +15,19 @@ calls the identical `Generator` / registry API regardless of which tensor backen
 > (sc-4987), and UNet/VAE component caching across `generate` calls (sc-5037). The provider still
 > self-registers into the shared `gen_core` inventory registry, with the
 > `CandleError → gen_core::Error` bridge + device plumbing wired (scaffold sc-4946).
+>
+> **Z-Image txt2img** is the first model-family expansion beyond SDXL (epic 3692, sc-3693):
+> `ZImageGenerator::generate` adapts the `candle-transformers` `z_image` reference (Qwen3 text
+> encoder → DiT flow-match Euler, distilled 4-step, **no CFG** → AutoencoderKL VAE), registered under
+> `"z_image_turbo"`. Same deterministic CPU-seeded-noise contract; the Qwen chat-template tokenization
+> is reused from gen-core (`TextTokenizer` / `ChatTemplate::QwenInstruct`). txt2img-only first slice
+> (img2img / LoRA / quantization are rejected, not silently dropped). **GPU-verified** on RTX PRO 6000
+> (sm_120): real 1024² renders + the conformance suite pass.
+>
+> **candle pinned to git main (post-0.10.2)** — REQUIRED for Blackwell sm_120. The crates.io 0.10.2
+> release throws `CUDA_ERROR_INVALID_PTX` at the first candle-kernels kernel whenever
+> candle-transformers is linked (SDXL + Z-Image both; plain candle-core works). The git rev clears it
+> and is source-compatible. See `[workspace.dependencies]`.
 
 ## Layout
 
@@ -23,6 +36,7 @@ candle-gen/                 # workspace root
   candle-gen/               # core crate: re-exports gen_core + candle; device/dtype helpers;
                             #   CandleError -> gen_core::Error bridge
   candle-gen-sdxl/          # SDXL provider crate: Generator impl + descriptor + inventory::submit!
+  candle-gen-z-image/       # Z-Image (Z-Image-Turbo) provider crate: txt2img via candle-transformers
   scripts/
     check-gen-core-skew.sh  # version-skew gate: fails if >1 sceneworks-gen-core resolves
     check-cuda.ps1          # local cuda gate: vcvars + cargo build/test --features cuda (run pre-push)
