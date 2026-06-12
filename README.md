@@ -7,11 +7,14 @@ backend-neutral [`gen_core`](https://github.com/michaeltrefry/mlx-gen/tree/main/
 (SceneWorks epic 3720), so a consumer pins one backend by git SHA, links its provider crates, and
 calls the identical `Generator` / registry API regardless of which tensor backend is underneath.
 
-> **Status: Phase 1 scaffold (sc-4946).** The workspace compiles on macOS (candle CPU/Metal), an
-> SDXL provider self-registers into the shared `gen_core` inventory registry, and the
-> `CandleError → gen_core::Error` bridge + device plumbing are wired. The **real SDXL pipeline is
-> not implemented yet** — `SdxlGenerator::generate` returns `gen_core::Error::Unsupported` (the
-> UNet/CLIP/VAE port lands in a later slice, sc-3675).
+> **Status: SDXL txt2img implemented on the Candle/CUDA lane.** `SdxlGenerator::generate` runs the
+> full pipeline — dual CLIP → UNet (real CFG) → f16 VAE — for both `sdxl` and `realvisxl`
+> (sc-3675, RealVisXL + parity tests sc-3677). Output is deterministic and launch-portable per seed
+> (CPU-seeded noise + non-ancestral DDIM, sc-3673). Perf/VRAM work has landed: f16 CLIP + optional
+> flash-attention (sc-3674), VAE tiling + staged CLIP free for torch-parity peak VRAM at 1024²
+> (sc-4987), and UNet/VAE component caching across `generate` calls (sc-5037). The provider still
+> self-registers into the shared `gen_core` inventory registry, with the
+> `CandleError → gen_core::Error` bridge + device plumbing wired (scaffold sc-4946).
 
 ## Layout
 
