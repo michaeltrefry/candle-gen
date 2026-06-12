@@ -75,6 +75,11 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--no-flash") {
         candle_gen_sdxl::set_flash_attn(false);
     }
+    // `--no-tiling` turns VAE tiling off (sc-4987) so a bench can compare the tiled vs monolithic VAE
+    // decode peak VRAM at the same resolution. Default is on (tiles above 512² output).
+    if args.iter().any(|a| a == "--no-tiling") {
+        candle_gen_sdxl::set_vae_tiling(false);
+    }
 
     // Resolve through the registry — proves the inventory seam (THIS crate's `submit!` is linked).
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
@@ -134,8 +139,9 @@ fn main() -> Result<()> {
         deltas.iter().sum::<f32>() / deltas.len() as f32
     };
     let flash = cfg!(feature = "flash-attn") && candle_gen_sdxl::flash_attn_enabled();
+    let tiling = candle_gen_sdxl::vae_tiling_enabled();
     println!(
-        "[smoke] {} image(s) in {gen_s:.1}s total; steady-state {:.3}s/step (flash_attn={flash})",
+        "[smoke] {} image(s) in {gen_s:.1}s total; steady-state {:.3}s/step (flash_attn={flash} vae_tiling={tiling})",
         images.len(),
         mean_step
     );
@@ -145,7 +151,7 @@ fn main() -> Result<()> {
     let _ = std::fs::write(
         out.with_extension("meta.txt"),
         format!(
-            "engine=sdxl backend={} flash_attn={flash}\n{width}x{height} steps={steps} guidance={guidance} seed={seed} count={count}\ngen_total_s={gen_s:.2} steady_per_step_s={mean_step:.3}\nimages={}\n",
+            "engine=sdxl backend={} flash_attn={flash} vae_tiling={tiling}\n{width}x{height} steps={steps} guidance={guidance} seed={seed} count={count}\ngen_total_s={gen_s:.2} steady_per_step_s={mean_step:.3}\nimages={}\n",
             gen.descriptor().backend,
             images.len()
         ),

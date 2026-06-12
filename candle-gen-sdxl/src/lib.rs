@@ -17,8 +17,12 @@
 //! Perf (sc-3674): CLIP loads f16 and the UNet attention runs through fused **flash-attention** when
 //! built `--features flash-attn` and the runtime toggle ([`set_flash_attn`], default on) is set.
 //!
-//! Carried forward as named follow-ups: component caching across `generate` calls + VAE-tiling for
-//! lower peak VRAM (sc-3674 cont.), RealVisXL + parity (sc-3677).
+//! Peak VRAM (sc-4987): the dual CLIP is loaded/run/freed before the UNet+VAE load (staged
+//! sequential load), and the VAE decode tiles + blends above 512² output ([`set_vae_tiling`], default
+//! on) — together targeting torch-parity peak VRAM at 1024².
+//!
+//! Carried forward as named follow-ups: component caching across `generate` calls (a latency win, in
+//! tension with sc-4987's mid-call frees), RealVisXL + parity (sc-3677).
 
 mod pipeline;
 
@@ -61,6 +65,27 @@ pub fn set_flash_attn(on: bool) {
 /// non-flash build does not enable anything.
 pub fn flash_attn_enabled() -> bool {
     FLASH_ATTN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Process-global VAE-tiling runtime toggle (sc-4987). When on, the VAE decode tiles the latent into
+/// overlapping 64²-latent (512²-output) tiles and trapezoidally blends the seams — bounding the
+/// decode's peak VRAM to one tile (the tallest single allocation at 1024², for torch-parity). Unlike
+/// flash-attn there is no build feature: it is pure candle, so the switch alone decides. It only
+/// *fires* above 512² output (smaller renders stay monolithic), so leaving it on is free at/below
+/// 512². The SceneWorks worker/UI drives it; default **on** to hit the <12 GiB target out of the box.
+static VAE_TILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Enable/disable VAE tiling for subsequent decodes (sc-4987). Process-global; the worker drives it
+/// from its backend setting. Off restores the monolithic single-pass decode (higher peak VRAM).
+pub fn set_vae_tiling(on: bool) {
+    VAE_TILING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether VAE tiling is currently enabled (the runtime toggle, [`set_vae_tiling`]). The pipeline
+/// additionally only tiles when the output exceeds the 512² threshold, so this returning `true` does
+/// not change ≤512² output.
+pub fn vae_tiling_enabled() -> bool {
+    VAE_TILING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A loaded candle SDXL generator. Loading is **lazy**: this carries only the resolved snapshot
@@ -254,6 +279,20 @@ mod tests {
         assert!(!flash_attn_enabled());
         set_flash_attn(true);
         assert!(flash_attn_enabled());
+    }
+
+    /// sc-4987: the VAE-tiling runtime toggle defaults on (to hit the <12 GiB target out of the box)
+    /// and round-trips — what the worker/UI drive.
+    #[test]
+    fn vae_tiling_toggle_roundtrips() {
+        assert!(
+            vae_tiling_enabled(),
+            "vae-tiling runtime toggle defaults on"
+        );
+        set_vae_tiling(false);
+        assert!(!vae_tiling_enabled());
+        set_vae_tiling(true);
+        assert!(vae_tiling_enabled());
     }
 
     /// A txt2img request passes validation; unsupported shapes are rejected clearly (not silently
