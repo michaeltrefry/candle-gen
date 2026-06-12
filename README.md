@@ -22,7 +22,9 @@ candle-gen/                 # workspace root
   candle-gen-sdxl/          # SDXL provider crate: Generator impl + descriptor + inventory::submit!
   scripts/
     check-gen-core-skew.sh  # version-skew gate: fails if >1 sceneworks-gen-core resolves
-  .github/workflows/ci.yml  # macOS/Linux fmt+clippy+check+test + skew self-test (CUDA lane TODO)
+    check-cuda.ps1          # local cuda gate: vcvars + cargo build/test --features cuda (run pre-push)
+    package-cuda.ps1        # bundle a CUDA build + redist DLLs into dist/ (sc-3676; see Packaging)
+  .github/workflows/ci.yml  # macOS/Linux fmt+clippy+check+test + skew self-test; manual Windows/CUDA lane
 ```
 
 A provider crate self-registers just by being linked (`inventory::submit!`), so adding a model is
@@ -44,6 +46,99 @@ The default build is **CPU** (`candle-core`'s default) and works on macOS with n
 `cuda` / `flash-attn` need the CUDA toolkit and **do not build on Mac**; all CUDA-only code is gated
 behind `#[cfg(feature = "cuda")]`. `flash-attn` currently just implies `cuda` — the fused kernels
 need the separate `candle-flash-attn` crate, wired in a later slice on the Windows box.
+
+## Packaging (Windows / CUDA) — sc-3676
+
+The goal is **one distributable CUDA worker that runs on every NVIDIA GPU we support, not just the
+build box's Blackwell** — the "central fat binary, like torch" model.
+
+### How portability actually works here: baseline PTX, not a fatbin
+
+The spike (sc-3495) assumed candle compiles a multi-arch **SASS fatbin** at build time and that we
+would feed it a multi-cap list (`CUDA_COMPUTE_CAP=80;86;89;90;120`). **That is not how candle 0.10.2
+works**, and this was verified against the vendored sources:
+
+- candle-kernels 0.10.2 builds via **cudaforge 0.1.5** `.build_ptx()` → `nvcc --ptx`, emitting **one
+  PTX (virtual ISA) per kernel**, embedded in the binary. No `.cubin`/fatbin is produced.
+- cudaforge parses `CUDA_COMPUTE_CAP` as a **single** value (`GpuArch::parse` runs `parse::<usize>()`
+  on the whole string). A `;`-separated list **fails to parse** — candle does not accept a cap list.
+
+So portability comes from **PTX forward-compatibility** instead: we build at a **baseline virtual
+arch, `CUDA_COMPUTE_CAP=80`** (Ampere). The embedded `compute_80` PTX is **JIT-compiled by the
+driver** to the runtime GPU's native SASS at first load, so a **single binary runs on every NVIDIA
+arch ≥ sm_80** — Ampere (sm_80/86) → Ada (sm_89) → Hopper (sm_90) → Blackwell (sm_120). This is
+broader coverage than any fixed fatbin cap list, with no candle fork.
+
+Tradeoffs (acceptable for SDXL): `compute_80` PTX does **not** use sm_90a/sm_120a arch-accelerated
+tensor features, and **first run is slower** while the driver JIT-compiles the PTX. The driver caches
+the result per-GPU under `%APPDATA%\NVIDIA\ComputeCache`, so subsequent launches load cached SASS.
+
+> If we ever need true per-arch SASS (e.g. to use sm_90a/sm_120a features), the path is to **fork
+> candle-kernels' `build.rs`** to emit `-gencode` for a cap list (a real fatbin) — deliberately out
+> of scope here; baseline PTX is the lighter, more portable default.
+
+### Build
+
+Build-time needs the **CUDA 12.9 toolkit (nvcc)** + **VS 2022 v143 (MSVC 14.4x) Build Tools**; the
+build is driven through `vcvars64.bat`. From a `cmd` shell that has sourced vcvars:
+
+```bat
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+set CUDA_COMPUTE_CAP=80
+set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
+cargo build --release -p candle-gen-sdxl --example txt2img --features cuda
+```
+
+The scripted, reproducible form of this — sources vcvars, sets the env, runs `cargo build/test
+--workspace --features cuda` — is `scripts/check-cuda.ps1`. **Run it before pushing CUDA-touching
+changes**: the CPU/Metal CI lanes are blind to `#[cfg(feature = "cuda")]` code, so this is the real
+cuda gate.
+
+```powershell
+pwsh scripts/check-cuda.ps1            # build + test
+pwsh scripts/check-cuda.ps1 -SkipTests # build-only smoke check
+```
+
+The `windows-cuda` lane in `.github/workflows/ci.yml` runs the same recipe but is **manual-only**
+(`workflow_dispatch`) — it needs no standing runner. To run it in CI you must first register a
+self-hosted `[self-hosted, windows, cuda]` runner, then dispatch the workflow by hand. (GitHub's
+hosted GPU larger-runners are Tesla T4 / sm_75, below our sm_80 baseline, so they can't run it.)
+
+### Bundle the runtime DLLs
+
+The target machine needs the CUDA **runtime** libraries but should **not** require a CUDA Toolkit
+install. `scripts/package-cuda.ps1` copies the binary plus the redistributable DLLs (which cudarc
+dynamic-links, resolved from the exe's own directory) into `dist/`:
+
+```powershell
+pwsh scripts/package-cuda.ps1 -BinaryPath target\release\examples\txt2img.exe
+```
+
+Bundled redist DLLs (CUDA 12.9; the script globs the version suffixes):
+
+| DLL                          | provides            |
+|------------------------------|---------------------|
+| `cudart64_12.dll`            | CUDA runtime        |
+| `cublas64_12.dll`            | cuBLAS              |
+| `cublasLt64_12.dll`          | cuBLAS-Lt           |
+| `curand64_10.dll`            | cuRAND              |
+| `nvrtc64_120_0.dll`          | NVRTC               |
+| `nvrtc-builtins64_129.dll`   | NVRTC builtins      |
+
+The script also writes a `RUNTIME.txt` manifest into the bundle. Verified: with the bundle's DLLs
+present and the **CUDA toolkit removed from `PATH`**, the binary runs end-to-end (DLLs resolve from
+the exe's directory).
+
+### Minimum driver
+
+The **NVIDIA driver is not bundled** (it is not redistributable) and is what JIT-compiles the PTX +
+provides `libcuda`. For the bundled **CUDA 12.9** runtime the floor is:
+
+- **Windows: driver ≥ 576.02** (CUDA 12.9 GA).
+- GPU compute capability **≥ 8.0** (Ampere / RTX 30-series or newer).
+
+Older drivers should be updated from nvidia.com; the CUDA runtime DLLs in the bundle do **not** lift
+the driver requirement.
 
 ## gen-core pinning (read before bumping)
 
