@@ -24,6 +24,21 @@ calls the identical `Generator` / registry API regardless of which tensor backen
 > (img2img / LoRA / quantization are rejected, not silently dropped). **GPU-verified** on RTX PRO 6000
 > (sm_120): real 1024² renders + the conformance suite pass.
 >
+> **FLUX.1 [schnell] + [dev] txt2img** is the second model-family expansion (epic 3692, sc-3694):
+> `FluxGenerator::generate` adapts the `candle-transformers` `flux` reference (dual **CLIP-L + T5-XXL**
+> text encoders → FLUX DiT flow-match Euler → FLUX AutoencoderKL VAE), registered under both
+> `"flux1_schnell"` (Apache-2.0, timestep-distilled: 4-step, **no guidance**) and `"flux1_dev"`
+> (gated, guidance-distilled: 25-step time-shifted schedule, embedded guidance ~3.5). The DiT + VAE
+> load directly from the black-forest-labs **root** checkpoints (`flux1-*.safetensors`,
+> `ae.safetensors`) — candle's `flux` speaks the BFL key layout, so no diffusers→BFL remap is needed —
+> while the text encoders come from the `text_encoder/` (CLIP) and `text_encoder_2/` (T5) subdirs. The
+> CLIP `tokenizer.json` is **vendored** (the snapshot ships CLIP only as `vocab.json`+`merges.txt`,
+> which a byte-level BPE mis-tokenizes; sc-2787 parity). Same deterministic CPU-seeded-noise contract;
+> FLUX.1[dev] license/credential gating stays upstream in the worker (no descriptor gating flag,
+> consistent with the mlx provider). txt2img-only first slice (Reference/IP-adapter, LoRA,
+> quantization rejected). **GPU-verified** on RTX PRO 6000 (sm_120): real 1024² schnell + dev renders
+> + both conformance suites pass.
+>
 > **candle pinned to git main (post-0.10.2)** — REQUIRED for Blackwell sm_120. The crates.io 0.10.2
 > release throws `CUDA_ERROR_INVALID_PTX` at the first candle-kernels kernel whenever
 > candle-transformers is linked (SDXL + Z-Image both; plain candle-core works). The git rev clears it
@@ -37,6 +52,7 @@ candle-gen/                 # workspace root
                             #   CandleError -> gen_core::Error bridge
   candle-gen-sdxl/          # SDXL provider crate: Generator impl + descriptor + inventory::submit!
   candle-gen-z-image/       # Z-Image (Z-Image-Turbo) provider crate: txt2img via candle-transformers
+  candle-gen-flux/          # FLUX.1 [schnell]+[dev] provider crate: txt2img via candle-transformers `flux`
   scripts/
     check-gen-core-skew.sh  # version-skew gate: fails if >1 sceneworks-gen-core resolves
     check-cuda.ps1          # local cuda gate: vcvars + cargo build/test --features cuda (run pre-push)

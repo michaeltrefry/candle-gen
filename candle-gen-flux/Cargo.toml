@@ -1,0 +1,48 @@
+[package]
+name = "candle-gen-flux"
+version = "0.0.0"
+edition = "2021"
+description = "FLUX.1 (schnell + dev) provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-flux."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "diffusion", "flux", "inference"]
+categories = ["science"]
+
+[dependencies]
+# Core crate — re-exports gen_core + candle, so this provider links exactly one gen-core / candle
+# build (single resolution; see scripts/check-gen-core-skew.sh).
+candle-gen = { path = "../candle-gen" }
+# Link-time self-registration into gen-core's model registry (the two `inventory::submit!` below).
+inventory = { workspace = true }
+# FLUX building blocks: the `flux` model (DiT) + `autoencoder` (VAE) read the original
+# black-forest-labs checkpoint layout directly; `t5` (T5-XXL) and `clip` (CLIP-L) are the dual text
+# encoders. Backend features are passed through below so it shares candle-gen's exact candle build.
+candle-transformers = { workspace = true }
+# Prompt tokenization for the dual encoders. FLUX has no chat template (plain encode), so this uses
+# the HF `tokenizers` runtime directly (the candle reference path), NOT gen-core's chat-template
+# `TextTokenizer` — the T5 `tokenizer.json` comes from the snapshot, CLIP's is vendored (see below).
+tokenizers = { workspace = true }
+# Deterministic CPU-seeded initial noise (sc-3673 parity) — NOT candle's CUDA `randn`.
+rand = { workspace = true }
+rand_distr = { workspace = true }
+# Parse the snapshot's `text_encoder_2/config.json` into candle's `t5::Config` (same path the candle
+# `flux` example uses). Matches the serde_json major candle's own tree pulls in (no dup).
+serde_json = "1"
+
+[features]
+# Pass the backend selection through to the core crate AND candle-transformers so a downstream
+# `--features metal`/`cuda` on this provider crate selects the matching candle backend everywhere.
+default = []
+metal = ["candle-gen/metal", "candle-transformers/metal"]
+cuda = ["candle-gen/cuda", "candle-transformers/cuda"]
+flash-attn = ["candle-gen/flash-attn", "candle-transformers/flash-attn"]
+
+[dev-dependencies]
+# `examples/txt2img.rs` smoke driver only — encode the produced `gen_core::Image` (RGB8) to PNG so a
+# real GPU run can be eyeballed. Not a library dependency (the worker owns asset writes).
+image = { version = "0.25", default-features = false, features = ["png"] }
+# gen-core conformance suite (sc-4481): drives this provider through the public Generator contract
+# (cancel / progress / seed-determinism / capability honesty). Pinned to the SAME gen-core rev the
+# workspace pins (95cd5c6) so it shares one contract build. Used by tests/conformance.rs (cuda-gated,
+# #[ignore]d — it runs a real generate, so it needs weights + GPU).
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "95cd5c692b974ecaafa57c0af437f085b052e260" }
