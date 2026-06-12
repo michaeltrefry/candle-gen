@@ -39,6 +39,14 @@ pub enum CandleError {
     /// A contextual message (config/validation/shape errors).
     #[error("{0}")]
     Msg(String),
+
+    /// Cooperative cancellation tripped mid-generation (the request's `CancelFlag`). Kept a typed
+    /// variant — NOT a `Msg` — so a provider's rich-`Result` body can `return Err(CandleError::Canceled)`
+    /// between denoise steps and the [`From`] bridge lifts it to the contract-load-bearing
+    /// [`gen_core::Error::Canceled`] (the worker + gen-core-testkit conformance suite key off the typed
+    /// variant, sc-4481). Mirrors mlx-gen's `Error::Canceled`.
+    #[error("cancelled")]
+    Canceled,
 }
 
 impl From<CandleError> for gen_core::Error {
@@ -47,6 +55,8 @@ impl From<CandleError> for gen_core::Error {
             // candle's Error is `Send + Sync + 'static`, so it boxes straight into Backend.
             CandleError::Candle(c) => gen_core::Error::backend(c),
             CandleError::Msg(s) => gen_core::Error::Msg(s),
+            // Preserve the typed cancellation signal across the bridge (do NOT stringify to Msg).
+            CandleError::Canceled => gen_core::Error::Canceled,
         }
     }
 }

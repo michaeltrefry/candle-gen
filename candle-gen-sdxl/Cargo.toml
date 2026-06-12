@@ -14,11 +14,22 @@ categories = ["science"]
 candle-gen = { path = "../candle-gen" }
 # Link-time self-registration into gen-core's model registry (the `inventory::submit!` below).
 inventory = { workspace = true }
+# SDXL pipeline building blocks (dual CLIP / UNet / VAE / schedulers). Backend features are passed
+# through from this crate's features below so it shares candle-gen's exact candle build.
+candle-transformers = { workspace = true }
+# CLIP tokenizers + HF snapshot resolution (the spike's proven loader path).
+tokenizers = { workspace = true }
+hf-hub = { workspace = true }
 
 [features]
-# Pass the backend selection through to the core crate so a downstream `--features metal`/`cuda`
-# on this provider crate selects the matching candle backend.
+# Pass the backend selection through to the core crate AND candle-transformers so a downstream
+# `--features metal`/`cuda` on this provider crate selects the matching candle backend everywhere.
 default = []
-metal = ["candle-gen/metal"]
-cuda = ["candle-gen/cuda"]
-flash-attn = ["candle-gen/flash-attn"]
+metal = ["candle-gen/metal", "candle-transformers/metal"]
+cuda = ["candle-gen/cuda", "candle-transformers/cuda"]
+flash-attn = ["candle-gen/flash-attn", "candle-transformers/flash-attn"]
+
+[dev-dependencies]
+# `examples/txt2img.rs` smoke driver only — encode the produced `gen_core::Image` (RGB8) to PNG so a
+# real GPU run can be eyeballed. Not a library dependency (the worker owns asset writes).
+image = { version = "0.25", default-features = false, features = ["png"] }

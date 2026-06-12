@@ -16,6 +16,13 @@ sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = 
 # under the `cuda` feature). Latest crates.io release that builds cleanly on macOS (see README).
 candle-core = "0.10.2"
 candle-nn = "0.10.2"
+# SDXL building blocks (dual CLIP, UNet2DConditionModel, VAE, schedulers) — the candle-gen-sdxl
+# pipeline (sc-3675) reuses these, mirroring how the spike (epic 3494) built on candle-transformers.
+# Same 0.10.2 release as candle-core/nn so the whole tree shares one candle build.
+candle-transformers = "0.10.2"
+# HF tokenizers (CLIP-L + CLIP-bigG tokenizer.json) and snapshot/file resolution for SDXL weights.
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
 # Link-time model registration (the DI-container stand-in) — matches gen-core's `inventory`.
 inventory = "0.3"
 # Error bridge (CandleError -> gen_core::Error). Major matches mlx-gen (thiserror 2).
