@@ -21,8 +21,13 @@
 //! sequential load), and the VAE decode tiles + blends above 512² output ([`set_vae_tiling`], default
 //! on) — together targeting torch-parity peak VRAM at 1024².
 //!
-//! Carried forward as named follow-ups: component caching across `generate` calls (sc-5037 — a
-//! latency win, in tension with sc-4987's mid-call frees), RealVisXL + parity (sc-3677).
+//! Component caching across `generate` calls (sc-5037 — a latency win, in tension with sc-4987's
+//! mid-call frees) is wired. **RealVisXL + parity (sc-3677):** RealVisXL_V5.0 ships the standard
+//! diffusers tree with the *same* `.fp16.safetensors` component filenames as SDXL-base, so it loads
+//! through this identical path unmodified (no single-file loader needed); parity with the Python
+//! `SdxlDiffusersAdapter` is locked by the CPU parity tests here + `tests/conformance.rs`
+//! (`sdxl_conformance` / `realvisxl_conformance` on the CUDA lane). See [`pipeline`] for the layout
+//! finding and the one accepted sampler difference (DDIM vs euler_ancestral, sc-3673).
 
 mod pipeline;
 
@@ -311,6 +316,27 @@ mod tests {
         assert!(!d.capabilities.supports_lokr);
         // sc-3673: the wired sampler is the deterministic DDIM (not the spike's euler-ancestral).
         assert_eq!(d.capabilities.samplers, vec!["ddim"]);
+    }
+
+    /// sc-3677 parity: the worker maps BOTH `sdxl` and `realvisxl` onto this single descriptor, so
+    /// the contract surface it reads (capability advertisement + request validation) is identical for
+    /// the two model ids. This pins the parity-relevant shape the Python `SdxlDiffusersAdapter` path
+    /// is reconciled against — dims policy (min/max size, the latent-/8 size multiple), batch ceiling,
+    /// and the deterministic `ddim` sampler. The accepted *differences* (DDIM vs the adapter's
+    /// euler_ancestral default, sc-3673; the txt2img-only surface routing conditioning/LoRA to the
+    /// Python fallback, sc-3678) are documented in the crate docs + tests/conformance.rs.
+    #[test]
+    fn realvisxl_shares_the_sdxl_contract_surface() {
+        let d = descriptor();
+        assert_eq!(d.family, "sdxl");
+        assert_eq!(d.backend, "candle");
+        assert_eq!(d.capabilities.min_size, 512);
+        assert_eq!(d.capabilities.max_size, 2048);
+        assert_eq!(d.capabilities.max_count, 8);
+        assert_eq!(d.capabilities.samplers, vec!["ddim"]);
+        // SDXL works in latent space at /8 — the size policy both ids share (validate rejects
+        // non-multiples). Anchored here so a change to the alignment is a parity-visible diff.
+        assert_eq!(SIZE_MULTIPLE, 8);
     }
 
     /// sc-3674: the flash-attn runtime toggle defaults on and round-trips (what the worker/UI drive).

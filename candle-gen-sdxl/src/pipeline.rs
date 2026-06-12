@@ -41,6 +41,17 @@
 //!   text embeddings *before* acquiring the cached UNet/VAE — so the cold-call ordering (CLIP freed
 //!   before UNet/VAE load) and the ~8.7 GiB peak are preserved; the cache holds only UNet+VAE
 //!   resident between calls (a latency win, not a peak-VRAM regression).
+//!
+//! - **RealVisXL (sc-3677)**: RealVisXL_V5.0 (`SG161222/RealVisXL_V5.0`) shares the SDXL architecture
+//!   AND ships the standard diffusers multi-component tree with the *same* component filenames this
+//!   pipeline already resolves — `unet/diffusion_pytorch_model.fp16.safetensors`,
+//!   `text_encoder{,_2}/model.fp16.safetensors`. So it loads through this exact snapshot path
+//!   unmodified; the single-file root checkpoints it also publishes are not needed and no single-file
+//!   loader was added (the [`snapshot_file`] component layout is present, not absent). The model-
+//!   agnostic VAE-fix + CLIP tokenizers and the production defaults below ([`DEFAULT_STEPS`],
+//!   [`DEFAULT_GUIDANCE`], [`VAE_SCALE`]) are shared, matching the Python `SdxlDiffusersAdapter`; the
+//!   one accepted sampler difference (DDIM eta=0 vs the adapter's euler_ancestral) is the sc-3673
+//!   launch-portable-determinism choice. Parity is locked by `tests/conformance.rs::realvisxl_conformance`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -65,6 +76,15 @@ const VAE_SCALE: f64 = 0.13025;
 /// omits them.
 const DEFAULT_STEPS: usize = 30;
 const DEFAULT_GUIDANCE: f64 = 7.0;
+
+/// The per-image seed within a batch: image `index` of a `count`-image request renders at
+/// `base_seed + index` (wrapping at the u64 ceiling). Mirrors the SceneWorks `SdxlDiffusersAdapter`'s
+/// per-image seed increment (sc-3677 parity), so the *n*-th image of a batch reproduces in isolation
+/// as a single `count: 1` render at that derived seed. A pure function so the law is unit-testable
+/// without a GPU.
+pub(crate) fn image_seed(base_seed: u64, index: u32) -> u64 {
+    base_seed.wrapping_add(index as u64)
+}
 
 /// The fp16-stable SDXL VAE (the base VAE NaNs in f16). Model-agnostic across every SDXL checkpoint,
 /// so it is fetched by repo id rather than read from the per-model snapshot.
@@ -290,7 +310,7 @@ impl Pipeline {
 
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
-            let seed = base_seed.wrapping_add(index as u64);
+            let seed = image_seed(base_seed, index);
 
             // sc-3673 — deterministic, launch-portable initial noise: draw N(0,1) from a
             // fixed-algorithm CPU RNG (`StdRng`, ChaCha-based) seeded by `seed`, build the latent on
@@ -481,6 +501,31 @@ fn snapshot_file(root: &Path, sub: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-3677 parity: the production txt2img values the candle lane resolves an omitted field to
+    /// must match the SceneWorks `SdxlDiffusersAdapter` reference (30 steps, CFG 7.0), and the
+    /// VAE un-scale must be the diffusers-correct SDXL `scaling_factor` (0.13025 — NOT candle's
+    /// hardcoded SD1.5 0.18215). `sdxl` and `realvisxl` map to this one engine, so this pins the
+    /// shared default surface both ids inherit. GPU-free (asserts the constants directly).
+    #[test]
+    fn parity_defaults_match_diffusers_adapter() {
+        assert_eq!(DEFAULT_STEPS, 30);
+        // float consts: compare with an epsilon (clippy's float_cmp would reject `==`).
+        assert!((DEFAULT_GUIDANCE - 7.0).abs() < f64::EPSILON);
+        assert!((VAE_SCALE - 0.13025).abs() < f64::EPSILON);
+    }
+
+    /// sc-3677 parity: each image in a `count`-image batch renders at `base_seed + index` (wrapping),
+    /// mirroring the Python adapter's per-image seed increment — so image *n* of a batch reproduces
+    /// in isolation at that derived seed. Pure function, no GPU/weights.
+    #[test]
+    fn parity_image_seed_is_base_plus_index() {
+        assert_eq!(image_seed(42, 0), 42);
+        assert_eq!(image_seed(42, 1), 43);
+        assert_eq!(image_seed(42, 7), 49);
+        // Wraps rather than panicking at the u64 ceiling (a non-default high base seed + a batch).
+        assert_eq!(image_seed(u64::MAX, 1), 0);
+    }
 
     /// The tiled blend (slice → mask → pad → accumulate → normalize) must exactly reconstruct the
     /// input under an **identity** decode at spatial-scale 1 — every output position is

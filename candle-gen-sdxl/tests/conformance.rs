@@ -12,6 +12,30 @@
 //! set SDXL_SNAPSHOT=C:\Users\…\models--stabilityai--stable-diffusion-xl-base-1.0\snapshots\<hash>
 //! cargo test -p candle-gen-sdxl --features cuda --release --test conformance -- --ignored
 //! ```
+//!
+//! ## SDXL parity (sc-3677)
+//!
+//! Both [`sdxl_conformance`] and [`realvisxl_conformance`] run the SAME suite against the SAME
+//! `candle_gen_sdxl::load` — the worker maps both ids onto one engine and RealVisXL_V5.0 shares the
+//! SDXL architecture + diffusers component layout, so the only input that varies is the snapshot dir.
+//! Passing the suite *is* the parity evidence the story asks for (AC: realvisxl generates a correct
+//! image on the Candle lane; parity tests pass): it locks **output dims** (the request's WxH is the
+//! emitted image size), **seed semantics** (same request+seed ⇒ byte-identical output;
+//! [`check_seed_determinism`]), **scheduler/steps/guidance defaults** (`Step.total` == resolved
+//! steps; [`check_progress`]), **contract/sidecar field shape** (validate-honesty +
+//! [`gen_core::GenerationOutput::Images`]), and **cancellation/progress** (typed `Canceled`, monotone
+//! `Step`).
+//!
+//! **Accepted differences vs the Python `SdxlDiffusersAdapter` (documented, not bugs):**
+//! - **Sampler:** the candle lane runs **DDIM (eta=0)** and advertises only `ddim`; the Python/MLX
+//!   default is `euler_ancestral`. sc-3673 chose DDIM for launch-portable determinism (the spike's
+//!   ancestral path was non-reproducible across launches, sc-3498). Both are SDXL-correct solvers;
+//!   cross-backend *pixel* equality is explicitly NOT a goal (RNG algorithms differ).
+//! - **Surface:** txt2img only — conditioning / LoRA / accel samplers are not advertised, so the
+//!   worker keeps those shapes on the Python fallback (sc-3678) rather than the backend silently
+//!   dropping a control.
+//! - **dtype:** CLIP + UNet + VAE load f16 with the `madebyollin/sdxl-vae-fp16-fix` VAE; the VAE
+//!   un-scale is the diffusers-correct 0.13025. These match diffusers' fp16 path, not a deviation.
 #![cfg(feature = "cuda")]
 
 use std::path::PathBuf;
@@ -39,5 +63,36 @@ fn sdxl_conformance() {
 
     // Resolve through THIS crate's `load` (its inventory registration is linked into the test binary,
     // so the suite's registry round-trip check also passes). Panics with aggregated failures.
+    conformance(|| candle_gen_sdxl::load(&spec).unwrap(), &profile);
+}
+
+/// sc-3677: the same conformance suite against a **RealVisXL_V5.0** snapshot — the parity evidence
+/// that `realvisxl` generates a correct image on the Candle lane. RealVisXL ships the standard
+/// diffusers tree with the SAME `.fp16.safetensors` component filenames this pipeline loads
+/// (`unet/diffusion_pytorch_model.fp16.safetensors`, `text_encoder{,_2}/model.fp16.safetensors`), so
+/// it resolves through the identical `candle_gen_sdxl::load` path — no single-file loader is needed
+/// (the diffusers component layout is present, not absent). Only the snapshot env var differs from
+/// [`sdxl_conformance`]. See the module header for the accepted differences vs the Python adapter.
+///
+/// ```text
+/// set REALVISXL_SNAPSHOT=C:\Users\…\models--SG161222--RealVisXL_V5.0\snapshots\<hash>
+/// cargo test -p candle-gen-sdxl --features cuda --release --test conformance -- --ignored
+/// ```
+#[test]
+#[ignore = "needs REALVISXL_SNAPSHOT (a RealVisXL_V5.0 diffusers snapshot dir) + a CUDA GPU; run with --features cuda --ignored"]
+fn realvisxl_conformance() {
+    let snap = std::env::var("REALVISXL_SNAPSHOT")
+        .expect("set REALVISXL_SNAPSHOT to an SG161222/RealVisXL_V5.0 snapshot dir");
+    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(snap)));
+
+    // Same cheap 512²/4-step profile as sdxl_conformance — this verifies contract parity, not image
+    // quality; the human-eyeball check is the txt2img example pointed at a RealVisXL snapshot.
+    let profile = Profile {
+        width: 512,
+        height: 512,
+        steps: 4,
+        ..Profile::cheap()
+    };
+
     conformance(|| candle_gen_sdxl::load(&spec).unwrap(), &profile);
 }
