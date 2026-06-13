@@ -22,6 +22,7 @@
 //! transcode that keeps the ~12 GB footprint is sc-5111.
 
 pub mod rope;
+pub mod schedule;
 pub mod text;
 pub mod text_encoder;
 pub mod transformer;
