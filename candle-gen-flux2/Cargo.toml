@@ -40,6 +40,6 @@ flash-attn = ["candle-gen/flash-attn", "candle-transformers/flash-attn"]
 # so a real GPU run can be eyeballed. Not a library dependency (the worker owns asset writes).
 image = { version = "0.25", default-features = false, features = ["png"] }
 # gen-core conformance suite (sc-4481): drives this provider through the public Generator contract.
-# Pinned to the SAME gen-core rev the workspace pins (95cd5c6). Used by tests/conformance.rs
+# Pinned to the SAME gen-core rev the workspace pins (e9c569c2). Used by tests/conformance.rs
 # (cuda-gated, #[ignore]d — it runs a real generate, so it needs weights + GPU).
-sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "95cd5c692b974ecaafa57c0af437f085b052e260" }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "e9c569c211b77fb9061aa3968dfd03bd02804109" }
