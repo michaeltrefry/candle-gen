@@ -13,11 +13,19 @@
 //! weights — have no candle-transformers precedent and are carried over from that reference.
 //!
 //! Expert weights ship fused + MXFP4 (`gate_up_proj` / `down_proj` as `_blocks` + `_scales`, one e8m0
-//! exponent per 32-value block); they are dequantized to bf16 at load (see [`dequant_mxfp4`]). gate/up
+//! exponent per 32-value block); they are unpacked to floats at load (see [`dequant_mxfp4`]). gate/up
 //! are interleaved on the output dim. Everything else (attention, router, embeddings) is bf16 per the
-//! checkpoint `quantization_config.modules_to_not_convert`. The MXFP4 → GGUF Q4 `QMatMul` transcode
-//! that keeps the ~12 GB footprint is a follow-up (sc-5111); this brings the encoder up in bf16 first.
+//! checkpoint `quantization_config.modules_to_not_convert`.
+//!
+//! Two expert load modes (sc-5111): the default **dense** path dequantizes to bf16 (~40 GB resident);
+//! [`GptOssTextEncoder::new_quant`] instead **transcodes** MXFP4 → GGUF `Q4_0`/`Q8_0` `QMatMul` (the
+//! contraction dim 2880 is ÷32 but not ÷256, so only the 32-block quants apply), keeping the experts
+//! at ~4/8 bits (~13 GB at Q4). At inference the Q weight is dequantized to an f16 tile and run through
+//! the *standard* matmul ([`ExpertProj`]) — candle's GGUF mat-vec/mat-mul CUDA kernels miscompute on
+//! Blackwell sm_120 at our pin. The transcode is lossy-on-lossy (Q4 is "coherent", Q8 near-lossless);
+//! both are parity-gated against the bf16 floor.
 
+use candle_gen::candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_gen::candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_gen::candle_nn::{
     embedding, linear, ops::sigmoid, ops::softmax_last_dim, rms_norm, Embedding, Linear, Module,
@@ -299,8 +307,14 @@ const FP4_LUT: [f32; 16] = [
 
 /// Dequantize MXFP4 expert weights to `dtype`. Each byte in `blocks` packs two 4-bit e2m1 codes;
 /// `scales` holds one e8m0 exponent per 32-value block: `value = FP4_LUT[code] * 2^(scale - 127)`.
-/// Done once at load on CPU.
 ///   blocks: u8 `[E, out, nb, 16]`, scales: u8 `[E, out, nb]` -> dtype `[E, out, nb*32]`
+///
+/// The unpack is a tight **host** loop over contiguous bytes, then the result is moved back to the
+/// source device. A vectorized tensor-op version (nibble split via float arithmetic + `index_select`
+/// LUTs) was tried (sc-5111): on the GPU it's fast but candle's stream-ordered allocator *caches* the
+/// per-call f32 buffers (resident +~the dense size), and on the CPU `index_select`'s random-access
+/// gather is far slower than this cache-friendly sequential loop. So the quant transcode runs this on
+/// CPU (the f32 never reaches the GPU — only the final Q4/Q8 bytes do), keeping resident at ~12 GB.
 fn dequant_mxfp4(blocks: &Tensor, scales: &Tensor, dtype: DType) -> Result<Tensor> {
     use candle_gen::candle_core::bail;
     let dev = blocks.device().clone();
@@ -341,27 +355,39 @@ fn dequant_mxfp4(blocks: &Tensor, scales: &Tensor, dtype: DType) -> Result<Tenso
         .to_device(&dev)
 }
 
+/// One expert projection. The dense path is a bf16 [`Linear`] (sc-5108); the quantized path (sc-5111)
+/// is a GGUF `Q4_0`/`Q8_0` [`QMatMul`] with a separate dense (f32) bias — quant only ever touches the
+/// expert weight matrices, the biases stay full-precision.
 #[derive(Debug, Clone)]
-struct Expert {
-    gate_up_proj: Linear, // hidden -> 2*intermediate (gate/up interleaved)
-    down_proj: Linear,    // intermediate -> hidden
-    limit: f64,
+enum ExpertProj {
+    Dense(Linear),
+    Quant { w: QMatMul, bias: Tensor },
 }
 
-impl Expert {
-    fn from_weights(
-        gate_up_w: Tensor,
-        gate_up_b: Tensor,
-        down_w: Tensor,
-        down_b: Tensor,
-        limit: f64,
-    ) -> Self {
-        Self {
-            gate_up_proj: Linear::new(gate_up_w, Some(gate_up_b)),
-            down_proj: Linear::new(down_w, Some(down_b)),
-            limit,
+impl ExpertProj {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            // `forward_via_f16` dequantizes the Q4/Q8 weight to a dense f16 tile and uses the *standard*
+            // matmul (the f32 bias is added after). This is deliberate: candle's GGUF mat-vec/mat-mul
+            // CUDA kernels miscompute on Blackwell sm_120 at our pinned rev (the PTX-JIT surface,
+            // [[candle-transformers-blackwell-ptx]]) — they return all-zeros/garbage regardless of the
+            // activation dtype — whereas the standard matmul is the same path the rest of the model
+            // runs correctly. The weight stays Q4/Q8 *resident* (the f16 tile is transient per call), so
+            // the ~12 GB memory win holds; only the per-call compute reconstructs f16. Q8 ~lossless.
+            Self::Quant { w, bias } => w
+                .forward_via_f16(xs)?
+                .to_dtype(DType::F32)?
+                .broadcast_add(bias),
+            Self::Dense(l) => l.forward(xs),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct Expert {
+    gate_up_proj: ExpertProj, // hidden -> 2*intermediate (gate/up interleaved)
+    down_proj: ExpertProj,    // intermediate -> hidden
+    limit: f64,
 }
 
 impl Module for Expert {
@@ -386,45 +412,106 @@ struct SparseMoe {
     router: Linear, // gpt-oss router has a bias
     experts: Vec<Expert>,
     num_experts_per_tok: usize,
+    /// Experts transcoded to GGUF Q4/Q8 (sc-5111) — the MoE then runs them in f32.
+    quantized: bool,
 }
 
 impl SparseMoe {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    /// `quant = None` keeps the dense bf16 experts (sc-5108); `Some(Q4_0 | Q8_0)` transcodes the fused
+    /// MXFP4 experts to GGUF `QMatMul` (sc-5111), dequantizing to f32 then requantizing per expert.
+    fn new(cfg: &Config, vb: VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
         let router = linear(cfg.hidden_size, cfg.num_local_experts, vb.pp("router"))?;
         let e = cfg.num_local_experts;
         let h = cfg.hidden_size;
         let i = cfg.intermediate_size;
         let dtype = vb.dtype();
         let vb_e = vb.pp("experts");
-        // Fused MXFP4 expert weights, dequantized once: blocks/scales load as raw u8
-        // (get_unchecked_dtype avoids the dtype coercion get() would apply).
-        let gate_up_w = dequant_mxfp4(
-            &vb_e.get_unchecked_dtype("gate_up_proj_blocks", DType::U8)?,
-            &vb_e.get_unchecked_dtype("gate_up_proj_scales", DType::U8)?,
-            dtype,
-        )?; // [E, 2*inter, hidden]
+        // Fused MXFP4 expert weights: blocks/scales load as raw u8 (get_unchecked_dtype avoids the
+        // dtype coercion get() would apply). gate_up: [E, 2*inter, hidden]; down: [E, hidden, inter].
+        let gate_up_blocks = vb_e.get_unchecked_dtype("gate_up_proj_blocks", DType::U8)?;
+        let gate_up_scales = vb_e.get_unchecked_dtype("gate_up_proj_scales", DType::U8)?;
+        let down_blocks = vb_e.get_unchecked_dtype("down_proj_blocks", DType::U8)?;
+        let down_scales = vb_e.get_unchecked_dtype("down_proj_scales", DType::U8)?;
         let gate_up_b = vb_e.get((e, 2 * i), "gate_up_proj_bias")?;
-        let down_w = dequant_mxfp4(
-            &vb_e.get_unchecked_dtype("down_proj_blocks", DType::U8)?,
-            &vb_e.get_unchecked_dtype("down_proj_scales", DType::U8)?,
-            dtype,
-        )?; // [E, hidden, inter]
         let down_b = vb_e.get((e, h), "down_proj_bias")?;
-        let experts = (0..e)
-            .map(|x| {
-                Ok(Expert::from_weights(
-                    gate_up_w.i(x)?.contiguous()?,
-                    gate_up_b.i(x)?.contiguous()?,
-                    down_w.i(x)?.contiguous()?,
-                    down_b.i(x)?.contiguous()?,
-                    cfg.swiglu_limit,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+
+        let experts = match quant {
+            None => {
+                // Dense: dequant the fused experts to the model dtype once and slice per expert.
+                let gate_up_w = dequant_mxfp4(&gate_up_blocks, &gate_up_scales, dtype)?;
+                let down_w = dequant_mxfp4(&down_blocks, &down_scales, dtype)?;
+                (0..e)
+                    .map(|x| {
+                        Ok(Expert {
+                            gate_up_proj: ExpertProj::Dense(Linear::new(
+                                gate_up_w.i(x)?.contiguous()?,
+                                Some(gate_up_b.i(x)?.contiguous()?),
+                            )),
+                            down_proj: ExpertProj::Dense(Linear::new(
+                                down_w.i(x)?.contiguous()?,
+                                Some(down_b.i(x)?.contiguous()?),
+                            )),
+                            limit: cfg.swiglu_limit,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+            Some(ggml) => {
+                // Quant: transcode each expert MXFP4 → GGUF QMatMul entirely host-side, uploading only
+                // the final Q4/Q8 bytes (`quantize_onto`). The blocks are pulled to the CPU once so the
+                // f32 unpack never lands on the GPU — a GPU-side dequant churns per-expert f32 buffers
+                // that candle's stream-ordered allocator caches (and a per-expert `synchronize()` does
+                // not reclaim), inflating resident toward the dense size; keeping the floats on the CPU
+                // settles GPU resident at the quantized weights (~12 GB at Q4). Per expert (not
+                // whole-layer) also dodges a `QTensor::quantize*` footgun: it quantizes the *whole
+                // backing storage*, so a `[E,…].i(x)` offset sub-view would be wrong — a fresh per-expert
+                // tensor owns exactly its `[out, in]` storage.
+                let dev = vb.device().clone();
+                let cpu = Device::Cpu;
+                let gate_up_blocks = gate_up_blocks.to_device(&cpu)?;
+                let gate_up_scales = gate_up_scales.to_device(&cpu)?;
+                let down_blocks = down_blocks.to_device(&cpu)?;
+                let down_scales = down_scales.to_device(&cpu)?;
+                let gate_up_b = gate_up_b.to_dtype(DType::F32)?;
+                let down_b = down_b.to_dtype(DType::F32)?;
+                (0..e)
+                    .map(|x| {
+                        let guw = dequant_mxfp4(
+                            &gate_up_blocks.narrow(0, x, 1)?,
+                            &gate_up_scales.narrow(0, x, 1)?,
+                            DType::F32,
+                        )?
+                        .reshape((2 * i, h))?;
+                        let dnw = dequant_mxfp4(
+                            &down_blocks.narrow(0, x, 1)?,
+                            &down_scales.narrow(0, x, 1)?,
+                            DType::F32,
+                        )?
+                        .reshape((h, i))?;
+                        Ok(Expert {
+                            gate_up_proj: ExpertProj::Quant {
+                                w: QMatMul::from_qtensor(QTensor::quantize_onto(
+                                    &guw, ggml, &dev,
+                                )?)?,
+                                bias: gate_up_b.i(x)?.contiguous()?,
+                            },
+                            down_proj: ExpertProj::Quant {
+                                w: QMatMul::from_qtensor(QTensor::quantize_onto(
+                                    &dnw, ggml, &dev,
+                                )?)?,
+                                bias: down_b.i(x)?.contiguous()?,
+                            },
+                            limit: cfg.swiglu_limit,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
         Ok(Self {
             router,
             experts,
             num_experts_per_tok: cfg.num_experts_per_tok,
+            quantized: quant.is_some(),
         })
     }
 }
@@ -456,20 +543,28 @@ impl Module for SparseMoe {
                 top_w[e as usize].push(w * inv_sum); // normalize over the top-k
             }
         }
-        let mut ys = xs.zeros_like()?;
+        // Quantized experts compute in f32 (candle's qmatmul needs f32 activations and stays coherent
+        // at Q4); the dense path stays in the model dtype. Accumulate in that dtype, then cast back.
+        let compute_dtype = if self.quantized {
+            DType::F32
+        } else {
+            xs.dtype()
+        };
+        let xc = xs.to_dtype(compute_dtype)?;
+        let mut ys = xc.zeros_like()?;
         for (e, expert) in self.experts.iter().enumerate() {
             if top_x[e].is_empty() {
                 continue;
             }
-            let idx = Tensor::new(top_x[e].as_slice(), xs.device())?;
-            let w = Tensor::new(top_w[e].as_slice(), xs.device())?
+            let idx = Tensor::new(top_x[e].as_slice(), xc.device())?;
+            let w = Tensor::new(top_w[e].as_slice(), xc.device())?
                 .reshape(((), 1))?
-                .to_dtype(xs.dtype())?;
-            let state = xs.index_select(&idx, 0)?;
+                .to_dtype(compute_dtype)?;
+            let state = xc.index_select(&idx, 0)?;
             let out = expert.forward(&state)?.broadcast_mul(&w)?;
             ys = ys.index_add(&idx, &out, 0)?;
         }
-        ys.reshape((b, seq_len, hidden))
+        ys.reshape((b, seq_len, hidden))?.to_dtype(xs.dtype())
     }
 }
 
@@ -485,10 +580,15 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(cfg: &Config, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(
+        cfg: &Config,
+        layer_idx: usize,
+        vb: VarBuilder,
+        quant: Option<GgmlDType>,
+    ) -> Result<Self> {
         Ok(Self {
             self_attn: Attention::new(cfg, vb.pp("self_attn"))?,
-            mlp: SparseMoe::new(cfg, vb.pp("mlp"))?,
+            mlp: SparseMoe::new(cfg, vb.pp("mlp"), quant)?,
             input_layernorm: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
             post_attention_layernorm: rms_norm(
                 cfg.hidden_size,
@@ -539,14 +639,22 @@ pub struct GptOssTextEncoder {
 
 impl GptOssTextEncoder {
     /// `vb` is the `text_encoder` root: tensors load as `model.embed_tokens`, `model.layers.N.*`,
-    /// `model.norm` (the `lm_head` is unused for the encoder).
+    /// `model.norm` (the `lm_head` is unused for the encoder). The MoE experts load **dense** (bf16);
+    /// use [`new_quant`](Self::new_quant) for the Q4/Q8 transcode.
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        Self::new_quant(cfg, vb, None)
+    }
+
+    /// As [`new`](Self::new) but transcodes the MoE experts to GGUF `Q4_0` (`quant = Some(Q4_0)`) or
+    /// `Q8_0` (sc-5111), keeping the experts at ~4/8 bits resident (~12 GB at Q4 vs ~40 GB dense).
+    /// Attention / router / embeddings / norms stay bf16. `quant = None` is the dense path.
+    pub fn new_quant(cfg: &Config, vb: VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let rotary = RotaryEmbedding::new(cfg, vb.device(), vb.dtype())?;
         let vb_l = vb_m.pp("layers");
         let layers = (0..cfg.num_hidden_layers)
-            .map(|i| DecoderLayer::new(cfg, i, vb_l.pp(i)))
+            .map(|i| DecoderLayer::new(cfg, i, vb_l.pp(i), quant))
             .collect::<Result<Vec<_>>>()?;
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
         Ok(Self {
@@ -647,6 +755,202 @@ mod tests {
         let scales = Tensor::zeros((e, out, nb), DType::U8, &dev).unwrap();
         let t = dequant_mxfp4(&blocks, &scales, DType::F32).unwrap();
         assert_eq!(t.dims(), &[e, out, nb * 32]);
+    }
+
+    // Cheap deterministic pseudo-random floats in [-1, 1) (SplitMix64-ish), test-only.
+    fn prng(len: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed;
+        (0..len)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 33) as f32 / 2147483648.0) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn cosine_cpu(a: &Tensor, b: &Tensor) -> f32 {
+        let a = a
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let b = b
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for (x, y) in a.iter().zip(b.iter()) {
+            dot += (*x as f64) * (*y as f64);
+            na += (*x as f64) * (*x as f64);
+            nb += (*y as f64) * (*y as f64);
+        }
+        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
+    }
+
+    // The Q4_0/Q8_0 quantized projection (sc-5111) must track its dense `Linear` counterpart on the
+    // same weight + bias: Q8 near-lossless, Q4 coherent. Validates the QMatMul wiring + the f16
+    // activation path + the separate dense-bias add. Runs on the default device, so `--features cuda`
+    // exercises the exact GPU path the encoder uses (and would have caught the f32/bf16-activation
+    // miscompute on Blackwell).
+    #[test]
+    fn quant_expert_proj_matches_dense() {
+        let dev = candle_gen::default_device().unwrap();
+        let (out, inn, n) = (512usize, 256usize, 4usize); // inn ÷ 32 (block size); k like the real model
+        let w = Tensor::from_vec(prng(out * inn, 1), (out, inn), &dev).unwrap();
+        let bias = Tensor::from_vec(prng(out, 2), (out,), &dev).unwrap();
+        let xs = Tensor::from_vec(prng(n * inn, 3), (n, inn), &dev).unwrap();
+
+        let dense = ExpertProj::Dense(Linear::new(w.clone(), Some(bias.clone())));
+        let want = dense.forward(&xs).unwrap();
+
+        for (ggml, thr) in [(GgmlDType::Q8_0, 0.999f32), (GgmlDType::Q4_0, 0.95)] {
+            let qt = QTensor::quantize(&w, ggml).unwrap();
+            let quant = ExpertProj::Quant {
+                w: QMatMul::from_qtensor(qt).unwrap(),
+                bias: bias.clone(),
+            };
+            let got = quant.forward(&xs).unwrap();
+            assert_eq!(got.dims(), want.dims());
+            let cos = cosine_cpu(&got, &want);
+            assert!(
+                cos > thr,
+                "{ggml:?} expert proj cosine {cos:.5} ≤ {thr} on {dev:?}"
+            );
+        }
+    }
+
+    // The vectorized `dequant_mxfp4` must give the same result on the default device as the CPU scalar
+    // reference — so `--features cuda` catches a GPU-only divergence in the unpack (floor / index_select
+    // / interleave) before it corrupts every expert weight.
+    #[test]
+    fn dequant_matches_across_devices() {
+        let dev = candle_gen::default_device().unwrap();
+        let (e, out, nb) = (2usize, 96usize, 3usize);
+        let blocks: Vec<u8> = prng(e * out * nb * 16, 30)
+            .iter()
+            .map(|x| (x.abs() * 255.0) as u8)
+            .collect();
+        // Scales spread around 127 (= 2^0) but strictly < the reserved 0xFF.
+        let scales: Vec<u8> = prng(e * out * nb, 31)
+            .iter()
+            .map(|x| (120.0 + x.abs() * 14.0) as u8)
+            .collect();
+
+        let cpu = dequant_mxfp4(
+            &Tensor::from_vec(blocks.clone(), (e, out, nb, 16), &Device::Cpu).unwrap(),
+            &Tensor::from_vec(scales.clone(), (e, out, nb), &Device::Cpu).unwrap(),
+            DType::F32,
+        )
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+        let ondev = dequant_mxfp4(
+            &Tensor::from_vec(blocks, (e, out, nb, 16), &dev).unwrap(),
+            &Tensor::from_vec(scales, (e, out, nb), &dev).unwrap(),
+            DType::F32,
+        )
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+        assert_eq!(cpu.len(), ondev.len());
+        let max_abs = cpu
+            .iter()
+            .zip(&ondev)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            max_abs == 0.0,
+            "dequant device mismatch: max abs diff {max_abs}"
+        );
+    }
+
+    // A small end-to-end MoE round-trip: the quantized (Q8_0) `SparseMoe` must track the dense one on
+    // synthetic MXFP4 expert weights — exercises the per-expert transcode + the f32 expert dispatch.
+    // Runs on the default device, so `--features cuda` runs the *same* path on the GPU (catches CUDA-
+    // only divergence, e.g. a NaN out of the quantized matmul) in milliseconds, not a 250 s load.
+    #[test]
+    fn quant_moe_matches_dense() {
+        let dev = candle_gen::default_device().unwrap();
+        // Tiny config: 4 experts top-2, hidden 64, intermediate 32 (both ÷32 so the contraction tiles).
+        let mut cfg = Config::gpt_oss_20b();
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 32;
+        cfg.num_local_experts = 4;
+        cfg.num_experts_per_tok = 2;
+
+        let (e, h, i) = (
+            cfg.num_local_experts,
+            cfg.hidden_size,
+            cfg.intermediate_size,
+        );
+        let nb = h / 32; // gate_up contracts over hidden
+        let nb_d = i / 32; // down contracts over intermediate
+                           // Random MXFP4 bytes + small scales (near 2^0 so values stay in range), and router/biases.
+        let gate_up_blocks = Tensor::from_vec(
+            prng(e * 2 * i * nb * 16, 10)
+                .iter()
+                .map(|x| (x.abs() * 255.0) as u8)
+                .collect::<Vec<u8>>(),
+            (e, 2 * i, nb, 16),
+            &dev,
+        )
+        .unwrap();
+        let gate_up_scales =
+            Tensor::from_vec(vec![127u8; e * 2 * i * nb], (e, 2 * i, nb), &dev).unwrap();
+        let down_blocks = Tensor::from_vec(
+            prng(e * h * nb_d * 16, 11)
+                .iter()
+                .map(|x| (x.abs() * 255.0) as u8)
+                .collect::<Vec<u8>>(),
+            (e, h, nb_d, 16),
+            &dev,
+        )
+        .unwrap();
+        let down_scales = Tensor::from_vec(vec![127u8; e * h * nb_d], (e, h, nb_d), &dev).unwrap();
+        let router_w = Tensor::from_vec(prng(e * h, 12), (e, h), &dev).unwrap();
+        let router_b = Tensor::from_vec(prng(e, 13), (e,), &dev).unwrap();
+        let gate_up_b = Tensor::from_vec(prng(e * 2 * i, 14), (e, 2 * i), &dev).unwrap();
+        let down_b = Tensor::from_vec(prng(e * h, 15), (e, h), &dev).unwrap();
+
+        let tensors = std::collections::HashMap::from([
+            ("router.weight".to_string(), router_w),
+            ("router.bias".to_string(), router_b),
+            ("experts.gate_up_proj_blocks".to_string(), gate_up_blocks),
+            ("experts.gate_up_proj_scales".to_string(), gate_up_scales),
+            ("experts.gate_up_proj_bias".to_string(), gate_up_b),
+            ("experts.down_proj_blocks".to_string(), down_blocks),
+            ("experts.down_proj_scales".to_string(), down_scales),
+            ("experts.down_proj_bias".to_string(), down_b),
+        ]);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &dev);
+
+        let dense = SparseMoe::new(&cfg, vb.clone(), None).unwrap();
+        let quant = SparseMoe::new(&cfg, vb, Some(GgmlDType::Q8_0)).unwrap();
+
+        let xs = Tensor::from_vec(prng(2 * 3 * h, 20), (2, 3, h), &dev).unwrap();
+        let want = dense.forward(&xs).unwrap();
+        let got = quant.forward(&xs).unwrap();
+        assert_eq!(got.dims(), want.dims());
+        let g = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            g.iter().all(|x| x.is_finite()),
+            "Q8 MoE produced non-finite output ({} of {} non-finite)",
+            g.iter().filter(|x| !x.is_finite()).count(),
+            g.len()
+        );
+        let cos = cosine_cpu(&got, &want);
+        assert!(cos > 0.99, "Q8 MoE cosine {cos:.5} ≤ 0.99 vs dense");
     }
 
     #[test]

@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::registry::ModelRegistration;
@@ -69,8 +70,9 @@ pub const VAE_SCALE_FACTOR: u32 = 16;
 /// constant keeps generation deterministic regardless of wall-clock.
 pub const DEFAULT_DATE: &str = "2025-01-01";
 
-/// The encoder + DiT run **bf16** (the checkpoint dtype; the MXFP4 experts dequantize to bf16 at
-/// load). The VAE always runs **f32** (the shared Flux.2 decoder).
+/// The encoder + DiT run **bf16** (the checkpoint dtype). By default the MXFP4 experts dequantize to
+/// bf16 at load; with `spec.quantize` they transcode to GGUF Q4/Q8 instead (sc-5111, the quantized
+/// experts then compute in f32). The VAE always runs **f32** (the shared Flux.2 decoder).
 const ENC_DTYPE: DType = DType::BF16;
 const DIT_DTYPE: DType = DType::BF16;
 const VAE_DTYPE: DType = DType::F32;
@@ -92,14 +94,23 @@ struct Pipeline {
     /// LoRA/LoKr adapters merged into the `transformer/` weights on load (sc-5116). Empty = the stock
     /// mmap path.
     adapters: Vec<AdapterSpec>,
+    /// MoE-expert quantization for the gpt-oss encoder (sc-5111): `None` = dense bf16, `Some(Q4_0 |
+    /// Q8_0)` = the ~12 GB transcode. The DiT/VAE stay bf16/f32 (DiT quant is sc-5117).
+    enc_quant: Option<GgmlDType>,
 }
 
 impl Pipeline {
-    fn load(root: &Path, device: &Device, adapters: Vec<AdapterSpec>) -> Self {
+    fn load(
+        root: &Path,
+        device: &Device,
+        adapters: Vec<AdapterSpec>,
+        enc_quant: Option<GgmlDType>,
+    ) -> Self {
         Self {
             root: root.to_path_buf(),
             device: device.clone(),
             adapters,
+            enc_quant,
         }
     }
 
@@ -158,9 +169,10 @@ impl Pipeline {
     fn load_components(&self) -> CResult<Components> {
         let tokenizer =
             LensTokenizer::from_file(self.root.join("tokenizer").join("tokenizer.json"))?;
-        let encoder = GptOssTextEncoder::new(
+        let encoder = GptOssTextEncoder::new_quant(
             &EncoderConfig::gpt_oss_20b(),
             self.component_vb("text_encoder", ENC_DTYPE)?,
+            self.enc_quant,
         )?;
         let transformer = LensTransformer::new(&LensDitConfig::lens(), self.transformer_vb()?)?;
         let vae = Flux2Vae::new(self.component_vb("vae", VAE_DTYPE)?)?;
@@ -444,7 +456,7 @@ impl LensGenerator {
         Ok(Self {
             descriptor: descriptor_turbo(),
             defaults: TURBO_DEFAULTS,
-            pipeline: Pipeline::load(root.as_ref(), &device, Vec::new()),
+            pipeline: Pipeline::load(root.as_ref(), &device, Vec::new(), None),
             components: Mutex::new(None),
         })
     }
@@ -525,8 +537,8 @@ impl Generator for LensGenerator {
 
 /// Lens' identity + capabilities for `id` — constructible without loading weights. The norm-rescaled
 /// CFG path is always present; turbo simply defaults guidance to 1.0. **Standard guidance, not
-/// true-CFG.** LoRA/LoKr are wired (sc-5116, merged into the DiT on load); Q4/Q8 quant (sc-5111/5117)
-/// is advertised as the family's surface but rejected at load until those stories land.
+/// true-CFG.** LoRA/LoKr are wired (sc-5116, merged into the DiT on load) and Q4/Q8 quant the gpt-oss
+/// encoder experts (sc-5111). DiT quant (sc-5117) is advertised but ignored at load until it lands.
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
         id,
@@ -590,8 +602,10 @@ fn validate_request(
 /// Construct a lazy candle Lens generator with the given per-variant defaults. `spec.weights` must be
 /// a `microsoft/Lens` / `microsoft/Lens-Turbo` diffusers snapshot dir (`tokenizer/`, `text_encoder/`,
 /// `transformer/`, `vae/`). DiT LoRA/LoKr adapters (`spec.adapters`) are merged into the transformer
-/// weights on first use (sc-5116). Quant / control are advertised but not yet wired (sc-5111 /
-/// sc-5117) and are rejected here.
+/// weights on first use (sc-5116). `spec.quantize` Q4/Q8 transcodes the **gpt-oss encoder experts** to
+/// GGUF `Q4_0`/`Q8_0` (sc-5111; ~13 GB at Q4 vs ~40 GB bf16); the DiT stays bf16 (its own quant is
+/// sc-5117 — partial quant is fine, the encoder is the memory hog). ControlNet / IP-Adapter are not
+/// part of the Lens port and are rejected here.
 fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -603,12 +617,14 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Ge
             )));
         }
     };
-    if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{}: Q4/Q8 quantization not yet wired (sc-5111/sc-5117)",
-            defaults.id
-        )));
-    }
+    // Map the requested quant level to the matching GGUF block dtype (the encoder's 2880-wide
+    // contraction is ÷32 but not ÷256, so only the 32-block quants apply). LoRA/LoKr adapters are
+    // merged downstream in `transformer_vb` (sc-5116), so neither adapters nor quant is rejected here.
+    let enc_quant = match spec.quantize {
+        None => None,
+        Some(Quant::Q4) => Some(GgmlDType::Q4_0),
+        Some(Quant::Q8) => Some(GgmlDType::Q8_0),
+    };
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: ControlNet / IP-Adapter conditioning is not part of the Lens port",
@@ -619,7 +635,7 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Ge
     Ok(Box::new(LensGenerator {
         descriptor: descriptor_for(defaults.id),
         defaults,
-        pipeline: Pipeline::load(&root, &device, spec.adapters.clone()),
+        pipeline: Pipeline::load(&root, &device, spec.adapters.clone(), enc_quant),
         components: Mutex::new(None),
     }))
 }
