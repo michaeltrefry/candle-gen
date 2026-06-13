@@ -16,7 +16,7 @@ use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::VarBuilder;
 
 use crate::config::{VaeConfig, LATENTS_MEAN, LATENTS_STD};
-use crate::conv3d::CausalConv3d;
+use crate::conv3d::{CausalConv3d, Ctx};
 
 const NORM_EPS: f64 = 1e-12;
 
@@ -102,14 +102,22 @@ impl Resnet {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
         let h = match &self.shortcut {
-            Some(c) => c.forward(x)?,
+            Some(c) => c.forward(x, ctx)?,
             None => x.clone(),
         };
-        let y = self.conv1.forward(&self.norm1.forward(x)?.silu()?)?;
-        let y = self.conv2.forward(&self.norm2.forward(&y)?.silu()?)?;
+        let y = self.conv1.forward(&self.norm1.forward(x)?.silu()?, ctx)?;
+        let y = self.conv2.forward(&self.norm2.forward(&y)?.silu()?, ctx)?;
         y + h
+    }
+
+    fn reset_cache(&self) {
+        self.conv1.reset_cache();
+        self.conv2.reset_cache();
+        if let Some(c) = &self.shortcut {
+            c.reset_cache();
+        }
     }
 }
 
@@ -184,7 +192,7 @@ impl Dup {
         }
     }
 
-    fn apply(&self, x: &Tensor) -> Result<Tensor> {
+    fn apply(&self, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
         let (b, c, t, h, w) = x.dims5()?;
         // repeat_interleave channels: [B,C,T,H,W] → [B,C,repeats,T,H,W] → [B,C*repeats,T,H,W].
         let x = x
@@ -197,8 +205,12 @@ impl Dup {
             .permute(&[0usize, 1, 5, 2, 6, 3, 7, 4][..])? // [B,out,t,ft,h,fs,w,fs]
             .reshape((b, self.out_c, t * ft, h * fs, w * fs))?
             .contiguous()?;
-        // first_chunk: drop the leading ft-1 duplicated frames.
-        if ft > 1 {
+        // Drop the leading ft-1 duplicated frames so the shortcut aligns with the causal main-path
+        // temporal expansion (the "first frame un-doubled" rule). Single pass: always (the clip's
+        // leading frames). Streaming: only on the first latent frame — later chunks keep all t·ft
+        // frames, matching the temporal upsampler which doubles them.
+        let drop_leading = ft > 1 && (!ctx.streaming || ctx.first_chunk);
+        if drop_leading {
             let tt = x.dim(2)?;
             x.narrow(2, ft - 1, tt - (ft - 1))
         } else {
@@ -233,29 +245,52 @@ impl Upsampler {
             .contiguous()
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    /// Double `t` frames → `2t` via the channel-interleave of `time_conv` (a `[B,2C,t,H,W]` output).
+    fn double_temporal(time_conv: &CausalConv3d, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+        let (b, c, t, h, w) = x.dims5()?;
+        let tc = time_conv.forward(x, ctx)?; // [B,2C,t,H,W]
+        tc.reshape((b, 2, c, t, h, w))?
+            .permute((0, 2, 3, 1, 4, 5))? // [B,C,t,2,H,W]
+            .reshape((b, c, 2 * t, h, w))?
+            .contiguous()
+    }
+
+    fn forward(&self, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
         match self {
             Upsampler::Spatial { resample } => Self::spatial(resample, x),
             Upsampler::Temporal {
                 time_conv,
                 resample,
             } => {
-                let (b, c, t, h, w) = x.dims5()?;
-                let x_t = if t > 1 {
-                    let first = x.narrow(2, 0, 1)?;
-                    let rest = x.narrow(2, 1, t - 1)?;
-                    let tc = time_conv.forward(&rest)?; // [B,2C,t-1,H,W]
-                    let doubled = tc
-                        .reshape((b, 2, c, t - 1, h, w))?
-                        .permute((0, 2, 3, 1, 4, 5))? // [B,C,t-1,2,H,W]
-                        .reshape((b, c, 2 * (t - 1), h, w))?
-                        .contiguous()?;
-                    Tensor::cat(&[&first, &doubled], 2)?
+                let x_t = if ctx.streaming {
+                    // Per-frame: the first latent frame passes un-doubled (and never touches the
+                    // time_conv cache, matching the single-pass `first`); every later frame is
+                    // doubled through the streaming time_conv.
+                    if ctx.first_chunk {
+                        x.clone()
+                    } else {
+                        Self::double_temporal(time_conv, x, ctx)?
+                    }
                 } else {
-                    x.narrow(2, 0, 1)?
+                    // Single pass: frame 0 un-doubled, frames 1.. doubled in one time_conv call.
+                    let t = x.dim(2)?;
+                    if t > 1 {
+                        let first = x.narrow(2, 0, 1)?;
+                        let rest = x.narrow(2, 1, t - 1)?;
+                        let doubled = Self::double_temporal(time_conv, &rest, ctx)?;
+                        Tensor::cat(&[&first, &doubled], 2)?
+                    } else {
+                        x.narrow(2, 0, 1)?
+                    }
                 };
                 Self::spatial(resample, &x_t)
             }
+        }
+    }
+
+    fn reset_cache(&self) {
+        if let Upsampler::Temporal { time_conv, .. } = self {
+            time_conv.reset_cache();
         }
     }
 }
@@ -267,19 +302,28 @@ struct UpBlock {
 }
 
 impl UpBlock {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
         let x_copy = x.clone();
         let mut h = x.clone();
         for r in &self.resnets {
-            h = r.forward(&h)?;
+            h = r.forward(&h, ctx)?;
         }
         if let Some(up) = &self.upsampler {
-            h = up.forward(&h)?;
+            h = up.forward(&h, ctx)?;
         }
         if let Some(dup) = &self.dup {
-            h = (h + dup.apply(&x_copy)?)?;
+            h = (h + dup.apply(&x_copy, ctx)?)?;
         }
         Ok(h)
+    }
+
+    fn reset_cache(&self) {
+        for r in &self.resnets {
+            r.reset_cache();
+        }
+        if let Some(up) = &self.upsampler {
+            up.reset_cache();
+        }
     }
 }
 
@@ -394,20 +438,70 @@ impl WanVae {
     }
 
     /// Decode latents `[B,48,T,H,W]` → RGB frames `[B,3, 1+(T-1)·4, 16H, 16W]` in `[-1,1]`.
+    ///
+    /// **Streams one latent frame at a time** (sc-5176): the original single pass decoded every frame
+    /// at once, spiking VAE memory ~60 GB on a 320²×17 clip (OOM). Each `CausalConv3d` carries its
+    /// causal `feat_cache` across frames, so this is bit-equivalent to [`Self::decode_full`] while
+    /// bounding peak memory to ~one frame's activations. Frame 0 expands to 1 output frame, each later
+    /// latent frame to 4 (the two temporal upsamplers) — total `1+(T-1)·4`.
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
-        let z = z.to_dtype(DType::F32)?;
-        let z = z.broadcast_mul(&self.std)?.broadcast_add(&self.mean)?;
-        let mut h = self.post_quant_conv.forward(&z)?;
-        h = self.conv_in.forward(&h)?;
-        h = self.mid_resnet0.forward(&h)?;
+        let z = self.unnormalize(z)?;
+        let t_lat = z.dim(2)?;
+        self.reset_caches();
+        let mut out: Option<Tensor> = None;
+        for i in 0..t_lat {
+            let zi = z.narrow(2, i, 1)?.contiguous()?;
+            let oi = self.decode_inner(&zi, &Ctx::streaming(i == 0))?;
+            out = Some(match out {
+                Some(o) => Tensor::cat(&[&o, &oi], 2)?,
+                None => oi,
+            });
+        }
+        self.reset_caches();
+        out.expect("decode needs >= 1 latent frame")
+            .clamp(-1f32, 1f32)
+    }
+
+    /// Single-pass decode over all frames (the original path). Retained for the streaming-parity test
+    /// (`decode` must match this bit-for-bit); not used in production (it OOMs on real clips).
+    pub fn decode_full(&self, z: &Tensor) -> Result<Tensor> {
+        let z = self.unnormalize(z)?;
+        self.decode_inner(&z, &Ctx::single_pass())?
+            .clamp(-1f32, 1f32)
+    }
+
+    /// `z_pixel = z·std + mean` in f32 (the inverse of the encoder's per-channel normalize).
+    fn unnormalize(&self, z: &Tensor) -> Result<Tensor> {
+        z.to_dtype(DType::F32)?
+            .broadcast_mul(&self.std)?
+            .broadcast_add(&self.mean)
+    }
+
+    /// The decoder graph for one chunk (`ctx.streaming` selects the per-frame `feat_cache` path).
+    fn decode_inner(&self, z: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+        let mut h = self.post_quant_conv.forward(z, ctx)?;
+        h = self.conv_in.forward(&h, ctx)?;
+        h = self.mid_resnet0.forward(&h, ctx)?;
         h = self.mid_attn.forward(&h)?;
-        h = self.mid_resnet1.forward(&h)?;
+        h = self.mid_resnet1.forward(&h, ctx)?;
         for ub in &self.up_blocks {
-            h = ub.forward(&h)?;
+            h = ub.forward(&h, ctx)?;
         }
         let h = self.norm_out.forward(&h)?.silu()?;
-        let h = self.conv_out.forward(&h)?; // [B,12,T',H8,W8]
-        self.unpatchify(&h)?.clamp(-1f32, 1f32)
+        let h = self.conv_out.forward(&h, ctx)?; // [B,12,T',H8,W8]
+        self.unpatchify(&h)
+    }
+
+    /// Drop every streaming `feat_cache` (called around the [`Self::decode`] frame loop).
+    fn reset_caches(&self) {
+        self.post_quant_conv.reset_cache();
+        self.conv_in.reset_cache();
+        self.mid_resnet0.reset_cache();
+        self.mid_resnet1.reset_cache();
+        for ub in &self.up_blocks {
+            ub.reset_cache();
+        }
+        self.conv_out.reset_cache();
     }
 
     /// 12 → 3 channels, 2× spatial (inverse of the encoder's 2×2 patchify).
