@@ -101,6 +101,20 @@ calls the identical `Generator` / registry API regardless of which tensor backen
 > prompt-enhance, LoRA/IC-LoRA, and fp8/quant are deferred. **GPU-verified** on RTX PRO 6000 (sm_120):
 > real cat-walking clip renders coherently on the first visual try.
 >
+> **JoyCaption (Llama-JoyCaption-beta-one) image captioning** is the seventh model-family expansion
+> (epic 3692, sc-3699) and the first **`Captioner`** (image → text, not `Generator`): a
+> `LlavaForConditionalGeneration` ported from scratch (no candle-transformers — the contract needs the
+> SigLIP **`-2`** hidden state and a Llama fed pre-spliced `inputs_embeds`, neither of which it exposes).
+> A **SigLIP-so400m/14@384** vision tower (27 layers, 1152-d; returns the penultimate hidden state, all
+> 729 patch tokens) → a **gelu-MLP** multimodal projector (1152→4096) → the single `<|image|>` marker is
+> expanded to 729 placeholders and the projected rows are spliced over them → a **Llama-3.1-8B** decoder
+> (GQA 32/8, head-dim 128, **llama3 RoPE scaling**, KV-cache) generates the caption autoregressively
+> (greedy or temperature/top-p with a small CTRL-style repetition penalty; stops at the eot/eom/eos set).
+> The whole assembly runs **bf16** (native checkpoint dtype), logits upcast to f32 for sampling; the
+> SceneWorks caption prompt map (12 caption types × length templates) and the Llama-3 chat wrapper port
+> verbatim. Single snapshot dir (4 shards + `tokenizer.json`). **GPU-verified** on RTX PRO 6000 (sm_120):
+> a real photo captions coherently and on-subject. `backend = "candle"`, `mac_only = false`.
+>
 > **candle pinned to git main (post-0.10.2)** — REQUIRED for Blackwell sm_120. The crates.io 0.10.2
 > release throws `CUDA_ERROR_INVALID_PTX` at the first candle-kernels kernel whenever
 > candle-transformers is linked (SDXL + Z-Image both; plain candle-core works). The git rev clears it
@@ -119,6 +133,7 @@ candle-gen/                 # workspace root
   candle-gen-qwen-image/    # Qwen-Image provider crate: from-scratch 60-layer MMDiT + Qwen2.5-VL + causal-Conv3d VAE
   candle-gen-wan/           # Wan2.2 TI2V-5B video provider crate: WanTransformer3DModel + UMT5-XXL + temporal AutoencoderKLWan (from-scratch conv3d)
   candle-gen-ltx/           # LTX-2.3 (distilled 22B) video provider crate: AVTransformer3DModel DiT + Gemma-3-12B encoder + connector + CausalVideoAutoencoder (from-scratch conv3d)
+  candle-gen-joycaption/    # JoyCaption image-captioning provider crate (first Captioner): SigLIP-so400m tower + gelu-MLP projector + Llama-3.1-8B decoder (from-scratch LLaVA)
   scripts/
     check-gen-core-skew.sh  # version-skew gate: fails if >1 sceneworks-gen-core resolves
     check-cuda.ps1          # local cuda gate: vcvars + cargo build/test --features cuda (run pre-push)

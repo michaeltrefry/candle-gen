@@ -1,0 +1,31 @@
+[package]
+name = "candle-gen-joycaption"
+version = "0.0.0"
+edition = "2021"
+description = "JoyCaption (LLaVA: SigLIP + Llama-3.1-8B) image-captioning provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-joycaption."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "joycaption", "captioning", "inference"]
+categories = ["science"]
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+inventory = { workspace = true }
+# JoyCaption is a LLaVA assembly (SigLIP-so400m vision tower + gelu-MLP projector + Llama-3.1-8B
+# decoder). It is a from-scratch candle port (no candle-transformers): the contract needs the
+# SigLIP **-2** hidden state and a Llama that consumes pre-spliced `inputs_embeds`, neither of which
+# candle-transformers exposes — so the tower, projector, splice, and autoregressive decoder are all
+# built in-crate on `candle_nn` primitives (mirroring the other no-reference family ports).
+tokenizers = { workspace = true }
+# Deterministic CPU-seeded sampling RNG (parity with the generators' sc-3673 approach).
+rand = { workspace = true }
+
+[features]
+default = []
+metal = ["candle-gen/metal"]
+cuda = ["candle-gen/cuda"]
+flash-attn = ["candle-gen/flash-attn"]
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "95cd5c692b974ecaafa57c0af437f085b052e260" }
