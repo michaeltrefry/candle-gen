@@ -17,12 +17,15 @@
 //! **First-slice surface:** txt2video only. The mlx provider's image-conditioning (TI2V / I2V),
 //! VACE, LoRA, quantization, and tiling surface is **deferred** and rejected.
 
+pub mod adapters;
 pub mod config;
 pub mod conv3d;
+pub mod dit_train;
 pub mod pipeline;
 pub mod rope;
 pub mod scheduler;
 pub mod text_encoder;
+pub mod training;
 pub mod transformer;
 pub mod vae;
 pub mod vae16;

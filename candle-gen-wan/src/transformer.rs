@@ -13,7 +13,7 @@ use candle_gen::candle_nn::{Linear, Module, VarBuilder};
 use crate::config::TransformerConfig;
 use crate::rope::apply_rope;
 
-fn linear(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Linear> {
+pub(crate) fn linear(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Linear> {
     Ok(Linear::new(
         vb.get((out_c, in_c), "weight")?,
         Some(vb.get(out_c, "bias")?),
@@ -21,7 +21,7 @@ fn linear(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Linear> {
 }
 
 /// LayerNorm over the last dim with no learnable affine, in f32.
-fn ln_no_affine(x: &Tensor, eps: f64) -> Result<Tensor> {
+pub(crate) fn ln_no_affine(x: &Tensor, eps: f64) -> Result<Tensor> {
     let mean = x.mean_keepdim(D::Minus1)?;
     let xc = x.broadcast_sub(&mean)?;
     let var = xc.sqr()?.mean_keepdim(D::Minus1)?;
@@ -29,7 +29,7 @@ fn ln_no_affine(x: &Tensor, eps: f64) -> Result<Tensor> {
 }
 
 /// RMSNorm over the last dim (qk-norm "across heads") with affine weight, in f32.
-fn rms(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+pub(crate) fn rms(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
     let dt = x.dtype();
     let xf = x.to_dtype(DType::F32)?;
     let var = xf.sqr()?.mean_keepdim(D::Minus1)?;
@@ -202,7 +202,7 @@ impl Block {
 
 /// Build the `[B, freq_dim]` sinusoidal timestep embedding (diffusers `Timesteps`,
 /// `flip_sin_to_cos=True`, `downscale_freq_shift=0`): `[cos(t·ω) | sin(t·ω)]`.
-fn timestep_sinusoid(t: f64, freq_dim: usize, b: usize, dev: &Device) -> Result<Tensor> {
+pub(crate) fn timestep_sinusoid(t: f64, freq_dim: usize, b: usize, dev: &Device) -> Result<Tensor> {
     let half = freq_dim / 2;
     let mut row = vec![0f32; freq_dim];
     for i in 0..half {

@@ -19,16 +19,18 @@
 //! mirroring the 5B. The VAE decode **streams one latent frame at a time** (sc-5176) to bound the
 //! decode-stage peak — the heavier-than-5B fix the story (sc-5174) requires.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::candle_core::{safetensors as cst, DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
-    self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
+    self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert, Progress,
+    Quant, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
@@ -111,10 +113,13 @@ struct Pipeline {
     variant: Variant,
     root: PathBuf,
     device: Device,
+    /// Trained LoRA/LoKr adapters to merge into the experts at load (sc-5167). Each is routed to the
+    /// high and/or low expert by its [`AdapterSpec::moe_expert`].
+    adapters: Vec<AdapterSpec>,
 }
 
 impl Pipeline {
-    fn load(root: &Path, device: &Device, variant: Variant) -> Self {
+    fn load(root: &Path, device: &Device, variant: Variant, adapters: Vec<AdapterSpec>) -> Self {
         Self {
             te_cfg: TextEncoderConfig::umt5_xxl(),
             dit_cfg: variant.dit_cfg(),
@@ -122,6 +127,7 @@ impl Pipeline {
             variant,
             root: root.to_path_buf(),
             device: device.clone(),
+            adapters,
         }
     }
 
@@ -155,15 +161,59 @@ impl Pipeline {
         Ok(vb)
     }
 
+    /// Build one expert from its `sub` dir, folding in any adapter whose [`AdapterSpec::moe_expert`]
+    /// targets it (`Some(expert)` or `None` = shared). With no adapter for this expert, the fast
+    /// mmap path is used; otherwise the weights are loaded to CPU, the delta is merged
+    /// ([`crate::adapters::merge_adapters`], f32 math), and the expert is built from the merged map
+    /// (`VarBuilder::from_tensors` casts/moves per-tensor on `get`, so peak GPU is unchanged) — the
+    /// merge-not-residual pattern the SDXL/Z-Image ports established.
+    fn build_expert(&self, sub: &str, expert: MoeExpert) -> CResult<WanTransformer> {
+        let specs: Vec<AdapterSpec> = self
+            .adapters
+            .iter()
+            .filter(|s| s.moe_expert.is_none_or(|e| e == expert))
+            .cloned()
+            .collect();
+        if specs.is_empty() {
+            return Ok(WanTransformer::new(
+                &self.dit_cfg,
+                self.component_vb(sub, DIT_DTYPE)?,
+            )?);
+        }
+        let mut map = self.load_component_map(sub)?;
+        crate::adapters::merge_adapters(&mut map, &specs)?;
+        let vb = VarBuilder::from_tensors(map, DIT_DTYPE, &self.device);
+        Ok(WanTransformer::new(&self.dit_cfg, vb)?)
+    }
+
+    /// Load every `.safetensors` in the component subdir `sub` into one CPU tensor map (native dtype) —
+    /// the merge-ready form the adapter fold needs (vs the mmap `component_vb` fast path).
+    fn load_component_map(&self, sub: &str) -> CResult<HashMap<String, Tensor>> {
+        let dir = self.root.join(sub);
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map_err(|e| CandleError::Msg(format!("wan-14b: read {sub}/: {e}")))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .collect();
+        files.sort();
+        if files.is_empty() {
+            return Err(CandleError::Msg(format!(
+                "wan-14b: no .safetensors in {sub}/ (at {})",
+                dir.display()
+            )));
+        }
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        for f in &files {
+            map.extend(cst::load(f, &Device::Cpu)?);
+        }
+        Ok(map)
+    }
+
     fn load_components(&self) -> CResult<Components> {
         let te = Umt5Encoder::new(&self.te_cfg, self.component_vb("text_encoder", ENC_DTYPE)?)?;
         // transformer/ = high-noise expert, transformer_2/ = low-noise expert (diffusers WanPipeline).
-        let high =
-            WanTransformer::new(&self.dit_cfg, self.component_vb("transformer", DIT_DTYPE)?)?;
-        let low = WanTransformer::new(
-            &self.dit_cfg,
-            self.component_vb("transformer_2", DIT_DTYPE)?,
-        )?;
+        let high = self.build_expert("transformer", MoeExpert::High)?;
+        let low = self.build_expert("transformer_2", MoeExpert::Low)?;
         let vae_vb = self.component_vb("vae", VAE_DTYPE)?;
         let vae = match self.variant {
             // I2V needs the VAE encoder (the conditioning image's first-frame latent).
@@ -430,6 +480,7 @@ pub struct Wan14bGenerator {
     variant: Variant,
     root: PathBuf,
     device: Device,
+    adapters: Vec<AdapterSpec>,
     components: Mutex<Option<Components>>,
 }
 
@@ -493,7 +544,12 @@ impl Generator for Wan14bGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let pipe = Pipeline::load(&self.root, &self.device, self.variant);
+        let pipe = Pipeline::load(
+            &self.root,
+            &self.device,
+            self.variant,
+            self.adapters.clone(),
+        );
         let components = self.components(&pipe)?;
         let (frames, fps) = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Video {
@@ -505,8 +561,8 @@ impl Generator for Wan14bGenerator {
 }
 
 /// Shared descriptor surface for both A14B variants — CFG (per-expert guidance) + negative prompt,
-/// UniPC/Euler samplers; H/W multiple of 16; no LoRA/quant (deferred, like the 5B). `conditioning`
-/// differs per variant.
+/// UniPC/Euler samplers; H/W multiple of 16; **LoRA/LoKr supported** (sc-5167 — merged per-expert at
+/// load; quant still deferred). `conditioning` differs per variant.
 fn descriptor_for(variant: Variant) -> ModelDescriptor {
     ModelDescriptor {
         id: variant.id(),
@@ -521,8 +577,8 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
                 Variant::T2v => vec![],
                 Variant::I2v => vec![ConditioningKind::Reference],
             },
-            supports_lora: false,
-            supports_lokr: false,
+            supports_lora: true,
+            supports_lokr: true,
             samplers: vec!["unipc", "euler"],
             schedulers: vec![],
             min_size: 16,
@@ -557,11 +613,6 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
             )));
         }
     };
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{id} does not support LoRA/LoKr yet"
-        )));
-    }
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{id} does not support on-the-fly Q4/Q8 quantization yet"
@@ -580,6 +631,7 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
         variant,
         root,
         device,
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
     }))
 }
@@ -684,15 +736,15 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_unwired_surfaces() {
+    fn load_accepts_adapters_rejects_quant() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+        // LoRA/LoKr are now supported (sc-5167) — load is lazy, so attaching adapters resolves OK
+        // (the merge happens at the first `generate`).
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
-        assert!(matches!(
-            load_t2v_14b(&lora).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        assert!(load_t2v_14b(&lora).is_ok());
+        // Quant is still deferred.
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
         assert!(matches!(
             load_i2v_14b(&quant).err().expect("err"),

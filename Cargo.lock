@@ -326,6 +326,7 @@ dependencies = [
  "inventory",
  "rand",
  "rand_distr",
+ "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "tokenizers 0.22.2",
 ]

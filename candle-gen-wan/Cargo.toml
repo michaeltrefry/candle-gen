@@ -18,6 +18,9 @@ tokenizers = { workspace = true }
 # Deterministic CPU-seeded initial noise (sc-3673 parity).
 rand = { workspace = true }
 rand_distr = { workspace = true }
+# Read a trained adapter `.safetensors`' `__metadata__` (the LoKr `networkType`/`rank`/`alpha`), which
+# candle's own `safetensors::load` drops — the inference-side adapter merge (sc-5167, `adapters`).
+safetensors = "0.7"
 
 [features]
 default = []
