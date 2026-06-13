@@ -39,6 +39,10 @@ mod pipeline;
 // UNet weights before the stock UNet is built (`pipeline` calls this on the adapter path). The candle
 // twin of `mlx-gen-sdxl::adapters`; closes the train→infer loop with the trainer below.
 mod adapters;
+// The merge entry point + its report are public: the worker can introspect what merged (the candle
+// analog of `mlx-gen-sdxl::apply_sdxl_adapters`'s report), and the trainer-verify lane
+// (`tests/trainer_e2e.rs`) asserts a trained adapter merges into every target with nothing skipped.
+pub use adapters::{merge_adapters, MergeReport};
 
 // Vendored, training-adapted SDXL UNet + VAE-encode stack (sc-5165) — used by the native LoRA/LoKr
 // trainer below. Inference continues to use the stock candle-transformers UNet via `pipeline`; the
