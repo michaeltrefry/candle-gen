@@ -1,0 +1,33 @@
+[package]
+name = "candle-gen-qwen-image"
+version = "0.0.0"
+edition = "2021"
+description = "Qwen-Image provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-qwen-image."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "diffusion", "qwen-image", "inference"]
+categories = ["science"]
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+inventory = { workspace = true }
+# Qwen-Image has NO candle-transformers reference: the dual-stream MMDiT, the causal-Conv3d VAE, and
+# the Qwen2.5-VL prompt-embeds path are all written here on candle-core/candle-nn.
+candle-transformers = { workspace = true }
+# Qwen2.5-VL tokenizer.json loading; the QwenImage T2I chat template comes from gen-core's
+# `TextTokenizer` (re-exported through `candle_gen::gen_core`).
+tokenizers = { workspace = true }
+# Deterministic CPU-seeded initial noise (sc-3673 parity).
+rand = { workspace = true }
+rand_distr = { workspace = true }
+serde_json = "1"
+
+[features]
+default = []
+metal = ["candle-gen/metal", "candle-transformers/metal"]
+cuda = ["candle-gen/cuda", "candle-transformers/cuda"]
+flash-attn = ["candle-gen/flash-attn", "candle-transformers/flash-attn"]
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "95cd5c692b974ecaafa57c0af437f085b052e260" }
