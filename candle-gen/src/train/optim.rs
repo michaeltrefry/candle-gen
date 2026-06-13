@@ -70,6 +70,40 @@ pub fn clip_grad_norm(grads: &mut GradStore, vars: &[Var], max_norm: f64) -> Res
     Ok(norm)
 }
 
+/// Accumulate one micro-step's `grads` into `acc` (`+=` per `Var`); the first step seeds it. The
+/// gradient-accumulation companion to [`scale_grads`] (the `1/accum` averaging that follows) — the
+/// generic `GradStore` half of every family trainer's step loop, so it lives in the shared harness
+/// rather than each `training.rs`.
+pub fn accumulate_grads(acc: &mut Option<GradStore>, grads: GradStore, vars: &[Var]) -> Result<()> {
+    match acc {
+        None => *acc = Some(grads),
+        Some(a) => {
+            for v in vars {
+                if let Some(g) = grads.get(v.as_tensor()) {
+                    let summed = match a.get(v.as_tensor()) {
+                        Some(prev) => (prev + g)?,
+                        None => g.clone(),
+                    };
+                    a.insert(v.as_tensor(), summed);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Scale every `Var`'s gradient in `grads` by `factor` in place — the `1/accumulation` averaging
+/// applied before [`clip_grad_norm`] + [`TrainOptimizer::step`].
+pub fn scale_grads(grads: &mut GradStore, vars: &[Var], factor: f64) -> Result<()> {
+    for v in vars {
+        if let Some(g) = grads.get(v.as_tensor()) {
+            let scaled = (g * factor)?;
+            grads.insert(v.as_tensor(), scaled);
+        }
+    }
+    Ok(())
+}
+
 /// One of the supported training optimizers, owning the factor `Var`s it steps.
 pub enum TrainOptimizer {
     /// candle AdamW (also serves plain `adam` with `weight_decay = 0`).

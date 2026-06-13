@@ -40,13 +40,14 @@
 //! components resident too); peak-VRAM staging is the Z-Image analogue of SDXL's sc-4987 and is left
 //! to a later slice.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
-use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
+use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
 use candle_transformers::models::z_image::sampling::postprocess_image;
@@ -79,12 +80,13 @@ const LATENT_CHANNELS: usize = 16;
 
 /// Qwen3 pad token id (`<|endoftext|>`). Only consulted when padding to a fixed length, which the
 /// txt2img path does not do (`pad_to_max_length: false`); the DiT's `prepare_inputs` does the
-/// SEQ_MULTI_OF padding + mask. Carried for correctness/parity with the mlx loader.
-const QWEN_PAD_TOKEN_ID: i32 = 151643;
+/// SEQ_MULTI_OF padding + mask. Carried for correctness/parity with the mlx loader. `pub(crate)` so
+/// the trainer's caption caching uses the exact same tokenizer config (single source of truth).
+pub(crate) const QWEN_PAD_TOKEN_ID: i32 = 151643;
 
 /// Right-truncation cap for prompt tokenization (HF single-sequence truncation). Z-Image prompts are
 /// short; 512 is generous and never engages in practice.
-const TOKENIZER_MAX_LEN: usize = 512;
+pub(crate) const TOKENIZER_MAX_LEN: usize = 512;
 
 /// The per-image seed within a batch: image `index` of a `count`-image request renders at
 /// `base_seed + index` (wrapping). Mirrors `mlx-gen-z-image`'s `seed + i` convention, so the *n*-th
@@ -94,13 +96,16 @@ pub(crate) fn image_seed(base_seed: u64, index: u32) -> u64 {
     base_seed.wrapping_add(index as u64)
 }
 
-/// A txt2img pipeline handle: the snapshot `root` + the compute device/dtype (bf16). Loading the
-/// heavy components is done by [`load_components`](Self::load_components) and owned/cached by the
-/// generator, mirroring the SDXL provider's lazy split.
+/// A txt2img pipeline handle: the snapshot `root` + the compute device/dtype (bf16) + any LoRA/LoKr
+/// adapters to merge into the DiT at component-load time (sc-5166). Loading the heavy components is
+/// done by [`load_components`](Self::load_components) and owned/cached by the generator, mirroring
+/// the SDXL provider's lazy split.
 pub(crate) struct Pipeline {
     root: PathBuf,
     device: Device,
     dtype: DType,
+    /// Adapters merged into the DiT weights at load. Empty ⇒ the stock mmap build (zero regression).
+    adapters: Vec<AdapterSpec>,
 }
 
 /// The loaded Z-Image components, `Arc`-shared so the generator can cache them across `generate`
@@ -114,13 +119,20 @@ pub(crate) struct Components {
 }
 
 impl Pipeline {
-    /// Build the (light) pipeline handle for the Z-Image snapshot `root` at the given device/dtype.
-    /// Does **no** weight I/O — components load lazily via [`load_components`](Self::load_components).
-    pub(crate) fn load(root: &Path, device: &Device, dtype: DType) -> Self {
+    /// Build the (light) pipeline handle for the Z-Image snapshot `root` at the given device/dtype,
+    /// with `adapters` to merge into the DiT. Does **no** weight I/O — components load lazily via
+    /// [`load_components`](Self::load_components).
+    pub(crate) fn load(
+        root: &Path,
+        device: &Device,
+        dtype: DType,
+        adapters: &[AdapterSpec],
+    ) -> Self {
         Self {
             root: root.to_path_buf(),
             device: device.clone(),
             dtype,
+            adapters: adapters.to_vec(),
         }
     }
 
@@ -134,7 +146,12 @@ impl Pipeline {
 
         let mut dit_cfg = DitConfig::z_image_turbo();
         dit_cfg.set_use_accelerated_attn(use_accelerated_attn);
-        let dit_vb = self.component_vb("transformer")?;
+        let dit_vb = if self.adapters.is_empty() {
+            // No adapters: the stock mmap build — byte-identical to the pre-sc-5166 path.
+            self.component_vb("transformer")?
+        } else {
+            self.transformer_vb_with_adapters()?
+        };
         let transformer = ZImageTransformer2DModel::new(&dit_cfg, dit_vb)?;
 
         let vae_vb = self.component_vb("vae")?;
@@ -147,9 +164,10 @@ impl Pipeline {
         })
     }
 
-    /// Build a [`VarBuilder`] over every `.safetensors` in the snapshot component subdir `sub`
-    /// (single-file or sharded — diffusers ships both layouts), at this pipeline's dtype/device.
-    fn component_vb(&self, sub: &str) -> Result<VarBuilder<'static>> {
+    /// Resolve the sorted list of `.safetensors` files in the snapshot component subdir `sub`
+    /// (single-file or sharded — diffusers ships both layouts), erroring if the dir or files are
+    /// missing.
+    fn component_files(&self, sub: &str) -> Result<Vec<PathBuf>> {
         let dir = self.root.join(sub);
         if !dir.is_dir() {
             return Err(CandleError::Msg(format!(
@@ -170,9 +188,32 @@ impl Pipeline {
                 dir.display()
             )));
         }
+        Ok(files)
+    }
+
+    /// Build a [`VarBuilder`] over every `.safetensors` in the snapshot component subdir `sub`, at
+    /// this pipeline's dtype/device (the stock mmap path; no adapters).
+    fn component_vb(&self, sub: &str) -> Result<VarBuilder<'static>> {
+        let files = self.component_files(sub)?;
         // SAFETY: mmap of read-only weight files; standard candle loading path.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, self.dtype, &self.device)? };
         Ok(vb)
+    }
+
+    /// Build the DiT [`VarBuilder`] with the LoRA/LoKr [`AdapterSpec`]s merged into its weights
+    /// (sc-5166). The base `transformer/` tensors are loaded into a CPU map, each adapter's delta is
+    /// folded in ([`crate::adapters::merge_adapters`], f32 math), then the stock candle DiT is built
+    /// from the merged map — **merge, not residual** (Z-Image's flow-match sampler is chaos-sensitive;
+    /// `(W+δ)·x` ≠ `W·x + δ·x` to ~1 ULP). Only reached when adapters are present.
+    fn transformer_vb_with_adapters(&self) -> Result<VarBuilder<'static>> {
+        let files = self.component_files("transformer")?;
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+        for f in &files {
+            let part = candle_gen::candle_core::safetensors::load(f, &Device::Cpu)?;
+            tensors.extend(part);
+        }
+        crate::adapters::merge_adapters(&mut tensors, &self.adapters)?;
+        Ok(VarBuilder::from_tensors(tensors, self.dtype, &self.device))
     }
 
     /// Prompt → `cap_feats` `(seq, 2560)` at the compute dtype. Tokenizes with the Qwen chat

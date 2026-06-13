@@ -21,7 +21,12 @@
 //! sampler is the model's static-shift-3.0 flow-match Euler schedule. See [`pipeline`] for the parity
 //! choices reconciled against the macOS `mlx-gen-z-image` provider.
 
+mod adapters;
+mod dit;
 mod pipeline;
+mod training;
+
+pub use adapters::{merge_adapters, MergeReport};
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -29,8 +34,8 @@ use std::sync::Mutex;
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, WeightsSource,
+    self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
+    Modality, ModelDescriptor, Progress, WeightsSource,
 };
 
 use pipeline::{Components, Pipeline};
@@ -74,6 +79,9 @@ pub struct ZImageGenerator {
     root: PathBuf,
     device: Device,
     dtype: DType,
+    /// LoRA/LoKr adapters merged into the DiT weights at component-load (sc-5166). Fixed for this
+    /// generator instance; empty ⇒ the stock unadapted build.
+    adapters: Vec<AdapterSpec>,
     /// Cached components + the accel-attn flag they were built with. `Mutex` because `Generator` is
     /// shared and `generate` takes `&self`; the lock is held only to read/populate the cache, never
     /// across the denoise.
@@ -142,15 +150,15 @@ impl Generator for ZImageGenerator {
         // The rich-`CandleError` tail — including the typed `Canceled` — bridges into
         // `gen_core::Error` via `?`. The light `Pipeline` handle carries the snapshot/device; the
         // heavy components come from the cache.
-        let pipe = Pipeline::load(&self.root, &self.device, self.dtype);
+        let pipe = Pipeline::load(&self.root, &self.device, self.dtype, &self.adapters);
         let components = self.components(&pipe)?;
         let images = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Images(images))
     }
 }
 
-/// Z-Image-Turbo's identity + the surface sc-3693 actually wires: distilled txt2img (no CFG, no
-/// negative prompt), no conditioning / LoRA / quantization advertised — those are the Python
+/// Z-Image-Turbo's identity + the wired surface: distilled txt2img (no CFG, no negative prompt) plus
+/// LoRA/LoKr adapter merge (sc-5166). img2img conditioning + Q4/Q8 quantization stay the Python
 /// fallback's job until candle wires them, so the descriptor never promises a path `generate` can't
 /// serve. Two backend-correct deviations from `mlx-gen-z-image`: `backend = "candle"` and
 /// `mac_only = false`.
@@ -170,10 +178,11 @@ pub fn descriptor() -> ModelDescriptor {
             // empty list means the shared `validate_request` rejects any conditioning and the worker
             // keeps those shapes on the Python path.
             conditioning: vec![],
-            // LoRA/LoKr (mlx supports both) and Q4/Q8 quantization are deferred to a later slice;
-            // not advertised, and rejected at load rather than silently dropped.
-            supports_lora: false,
-            supports_lokr: false,
+            // LoRA/LoKr now wired (sc-5166): a trained adapter merges into the dense DiT weights at
+            // load ([`crate::adapters::merge_adapters`]), closing the candle train→infer loop. Q4/Q8
+            // quantization is still deferred (rejected at load, not silently dropped).
+            supports_lora: true,
+            supports_lokr: true,
             // Distilled: the worker sends no `sampler`/`scheduler` for Z-Image (the static-shift
             // flow-match schedule is fixed), matching the mlx descriptor's empty lists.
             samplers: vec![],
@@ -192,9 +201,10 @@ pub fn descriptor() -> ModelDescriptor {
 
 /// Construct the (lazy) candle Z-Image generator from a [`LoadSpec`]. `spec.weights` must be a
 /// [`WeightsSource::Dir`] pointing at a `Tongyi-MAI/Z-Image-Turbo`-layout snapshot (the diffusers
-/// multi-component tree: `tokenizer/`, `text_encoder/`, `transformer/`, `vae/`). LoRA adapters,
-/// on-the-fly quantization, and control/IP-adapter overlays are rejected — none are wired in this
-/// slice, so refusing is more honest than silently dropping them (the worker falls back to Python).
+/// multi-component tree: `tokenizer/`, `text_encoder/`, `transformer/`, `vae/`). LoRA/LoKr adapters
+/// are accepted and merged into the DiT at first `generate` (sc-5166); on-the-fly quantization and
+/// control/IP-adapter overlays are still rejected — not wired, so refusing is more honest than
+/// silently dropping them (the worker falls back to Python).
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -206,13 +216,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(
-            "candle z_image_turbo does not support LoRA/LoKr yet — refusing to silently drop the \
-             adapters"
-                .into(),
-        ));
-    }
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(
             "candle z_image_turbo does not support on-the-fly Q4/Q8 quantization yet".into(),
@@ -232,6 +235,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         root,
         device,
         dtype: DType::BF16,
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
     }))
 }
@@ -280,8 +284,9 @@ mod tests {
         assert!(!d.capabilities.supports_true_cfg);
         assert!(!d.capabilities.mac_only);
         assert!(d.capabilities.conditioning.is_empty());
-        assert!(!d.capabilities.supports_lora);
-        assert!(!d.capabilities.supports_lokr);
+        // LoRA/LoKr wired (sc-5166) — merged into the DiT at load.
+        assert!(d.capabilities.supports_lora);
+        assert!(d.capabilities.supports_lokr);
         assert!(d.capabilities.supported_quants.is_empty());
         assert_eq!(d.capabilities.min_size, 256);
         assert_eq!(d.capabilities.max_size, 2048);
@@ -346,18 +351,16 @@ mod tests {
             .accepts(ConditioningKind::Reference));
     }
 
-    /// LoRA adapters / quantization / control overlays are rejected at load as typed `Unsupported`,
-    /// so the worker can fall back to Python rather than the backend silently dropping them.
+    /// Quantization / control overlays are rejected at load as typed `Unsupported`, so the worker
+    /// can fall back to Python rather than the backend silently dropping them. LoRA/LoKr are now
+    /// wired (sc-5166), so a LoRA `LoadSpec` is **accepted** (lazily — the merge happens at generate).
     #[test]
     fn load_rejects_unwired_surfaces() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec, Quant};
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
-        assert!(matches!(
-            load(&lora).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        assert!(load(&lora).is_ok(), "LoRA load is wired + lazy (sc-5166)");
 
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
         assert!(matches!(

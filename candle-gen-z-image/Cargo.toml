@@ -18,6 +18,13 @@ inventory = { workspace = true }
 # scheduler). Backend features are passed through from this crate's features below so it shares
 # candle-gen's exact candle build.
 candle-transformers = { workspace = true }
+# Direct candle deps for the vendored, training-adapted DiT (`src/dit.rs`, sc-5166): the stock
+# candle-transformers z_image transformer exposes no LoRA seam (its attention builds frozen
+# `nn::Linear`), so the trainer vendors + adapts the 3 structs that own the attention projections
+# (attention / block / model). Same workspace pin candle-gen uses, so cargo unifies to one candle
+# build (no skew; the vendored code refers to `candle_core`/`candle_nn` directly).
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
 # Qwen tokenizer.json loading. The Qwen chat-template + host-vec tokenization itself comes from
 # gen-core's `TextTokenizer` (re-exported through `candle_gen::gen_core`); this is only the
 # underlying HF `tokenizers` runtime gen-core builds on, shared at the workspace pin.
@@ -25,6 +32,10 @@ tokenizers = { workspace = true }
 # Deterministic CPU-seeded initial noise (sc-3673 parity) — NOT candle's CUDA `randn`.
 rand = { workspace = true }
 rand_distr = { workspace = true }
+# Read trained adapter `.safetensors` (tensors + the `networkType`/`rank`/`alpha` metadata the LoKr
+# merge needs) at inference-side load (sc-5166 adapter merge). Candle's own version (0.7), matching
+# candle-gen, so the `View` impl candle-core provides for `Tensor` is the same one.
+safetensors = "0.7"
 
 [features]
 # Pass the backend selection through to the core crate AND candle-transformers so a downstream
