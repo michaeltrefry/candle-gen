@@ -9,7 +9,8 @@
 //! 2. a **48-layer dual-stream MMDiT** ([`transformer`], `LensTransformer2DModel`, sc-5112) —
 //!    fused-QKV joint attention over `[img, txt]`, complex axial RoPE ([`rope`]), AdaLN dual
 //!    modulation, SwiGLU MLPs, multi-layer text front-end;
-//! 3. the **Flux.2 VAE** (`AutoencoderKLFlux2`) — *to come, sc-5113, reuses candle-gen-flux2*.
+//! 3. the **Flux.2 VAE** ([`vae`], `AutoencoderKLFlux2`, sc-5113) — reused from `candle-gen-flux2`
+//!    via a thin decode shim (reshape the DiT output into the packed NCHW grid → `decode_packed`).
 //!
 //! This crate is being built story-by-story under epic **5107**. The first landed piece is the
 //! gpt-oss encoder decoder block ([`text_encoder`], sc-5108): a from-scratch port — candle-transformers
@@ -24,3 +25,4 @@ pub mod rope;
 pub mod text;
 pub mod text_encoder;
 pub mod transformer;
+pub mod vae;

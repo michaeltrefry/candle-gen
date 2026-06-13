@@ -15,9 +15,12 @@ candle-gen = { path = "../candle-gen" }
 # PRs #3129/#3581/#3391 are all unmerged), and it is used encoder-only with multi-layer hidden
 # capture, which no upstream model exposes. The decoder is adapted from the verified-parity reference
 # in candle PR #3581 (attention sinks + YaRN + sliding/full + clamped-SwiGLU + MXFP4 expert dequant).
+# The Lens VAE *is* the Flux.2 `AutoencoderKLFlux2` (32-ch latent, 2×2 patchify, bn-stats normalize),
+# already ported in candle-gen-flux2 — the Lens decode path reuses `Flux2Vae::decode_packed` (sc-5113).
+candle-gen-flux2 = { path = "../candle-gen-flux2" }
 
 [features]
 default = []
-metal = ["candle-gen/metal"]
-cuda = ["candle-gen/cuda"]
-flash-attn = ["candle-gen/flash-attn"]
+metal = ["candle-gen/metal", "candle-gen-flux2/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda"]
+flash-attn = ["candle-gen/flash-attn", "candle-gen-flux2/flash-attn"]

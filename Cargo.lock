@@ -264,6 +264,7 @@ name = "candle-gen-lens"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-flux2",
 ]
 
 [[package]]
