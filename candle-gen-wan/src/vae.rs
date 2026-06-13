@@ -21,14 +21,14 @@ use crate::conv3d::{CausalConv3d, Ctx};
 const NORM_EPS: f64 = 1e-12;
 
 /// Channel-L2 norm (`F.normalize(dim=channel) · √C · γ`). Works on 4-D `[N,C,H,W]` and 5-D
-/// `[B,C,T,H,W]` tensors (channel axis 1).
-struct ChanNorm {
+/// `[B,C,T,H,W]` tensors (channel axis 1). `pub(crate)` so the z16 [`crate::vae16`] sibling reuses it.
+pub(crate) struct ChanNorm {
     gamma: Tensor, // [C]
     sqrt_c: f64,
 }
 
 impl ChanNorm {
-    fn new(channels: usize, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(channels: usize, vb: VarBuilder) -> Result<Self> {
         let gamma = vb.get_unchecked("gamma")?.flatten_all()?;
         Ok(Self {
             gamma,
@@ -36,7 +36,7 @@ impl ChanNorm {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let l2 = x.sqr()?.sum_keepdim(1)?.sqrt()?.clamp(NORM_EPS, 1e30)?;
         let normed = (x.broadcast_div(&l2)? * self.sqrt_c)?;
         let c = self.gamma.dim(0)?;
@@ -49,15 +49,22 @@ impl ChanNorm {
     }
 }
 
-/// A native 2-D conv applied per video frame (resample / attention 1×1 convs).
-struct Conv2dW {
+/// A native 2-D conv applied per video frame (resample / attention 1×1 convs). `pub(crate)` for the
+/// z16 [`crate::vae16`] sibling.
+pub(crate) struct Conv2dW {
     w: Tensor,
     b: Tensor, // [1,O,1,1]
     pad: usize,
 }
 
 impl Conv2dW {
-    fn load(in_c: usize, out_c: usize, k: usize, pad: usize, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn load(
+        in_c: usize,
+        out_c: usize,
+        k: usize,
+        pad: usize,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         Ok(Self {
             w: vb.get((out_c, in_c, k, k), "weight")?.contiguous()?,
             b: vb.get(out_c, "bias")?.reshape((1, out_c, 1, 1))?,
@@ -65,12 +72,12 @@ impl Conv2dW {
         })
     }
     /// `x`: `[N, C, H, W]`.
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
         x.conv2d(&self.w, self.pad, 1, 1, 1)?.broadcast_add(&self.b)
     }
 }
 
-fn causal(
+pub(crate) fn causal(
     in_c: usize,
     out_c: usize,
     kernel: (usize, usize, usize),
@@ -79,7 +86,7 @@ fn causal(
     CausalConv3d::load(in_c, out_c, kernel, vb)
 }
 
-struct Resnet {
+pub(crate) struct Resnet {
     norm1: ChanNorm,
     conv1: CausalConv3d,
     norm2: ChanNorm,
@@ -88,7 +95,7 @@ struct Resnet {
 }
 
 impl Resnet {
-    fn new(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
             norm1: ChanNorm::new(in_c, vb.pp("norm1"))?,
             conv1: causal(in_c, out_c, (3, 3, 3), vb.pp("conv1"))?,
@@ -102,7 +109,7 @@ impl Resnet {
         })
     }
 
-    fn forward(&self, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+    pub(crate) fn forward(&self, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
         let h = match &self.shortcut {
             Some(c) => c.forward(x, ctx)?,
             None => x.clone(),
@@ -112,7 +119,7 @@ impl Resnet {
         y + h
     }
 
-    fn reset_cache(&self) {
+    pub(crate) fn reset_cache(&self) {
         self.conv1.reset_cache();
         self.conv2.reset_cache();
         if let Some(c) = &self.shortcut {
@@ -121,7 +128,7 @@ impl Resnet {
     }
 }
 
-struct MidAttn {
+pub(crate) struct MidAttn {
     norm: ChanNorm,
     qkv: Conv2dW,
     proj: Conv2dW,
@@ -129,7 +136,7 @@ struct MidAttn {
 }
 
 impl MidAttn {
-    fn new(channels: usize, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(channels: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
             norm: ChanNorm::new(channels, vb.pp("norm"))?,
             qkv: Conv2dW::load(channels, channels * 3, 1, 0, vb.pp("to_qkv"))?,
@@ -139,7 +146,7 @@ impl MidAttn {
     }
 
     /// `x`: `[B,C,T,H,W]`. Per-frame spatial self-attention.
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (b, c, t, h, w) = x.dims5()?;
         let merged = x
             .permute((0, 2, 1, 3, 4))?
@@ -219,7 +226,7 @@ impl Dup {
     }
 }
 
-enum Upsampler {
+pub(crate) enum Upsampler {
     /// Temporal (3D): `time_conv` doubling + spatial 2× conv.
     Temporal {
         time_conv: CausalConv3d,
@@ -255,7 +262,7 @@ impl Upsampler {
             .contiguous()
     }
 
-    fn forward(&self, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+    pub(crate) fn forward(&self, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
         match self {
             Upsampler::Spatial { resample } => Self::spatial(resample, x),
             Upsampler::Temporal {
@@ -288,7 +295,7 @@ impl Upsampler {
         }
     }
 
-    fn reset_cache(&self) {
+    pub(crate) fn reset_cache(&self) {
         if let Upsampler::Temporal { time_conv, .. } = self {
             time_conv.reset_cache();
         }

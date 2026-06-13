@@ -7,6 +7,12 @@
 /// backends.
 pub const MODEL_ID: &str = "wan2_2_ti2v_5b";
 
+/// Registry id for the Wan2.2 **T2V-A14B** dual-expert MoE (text→video). Matches the mlx-gen-wan
+/// descriptor so a consumer resolves the same engine across backends.
+pub const MODEL_ID_T2V_14B: &str = "wan2_2_t2v_14b";
+/// Registry id for the Wan2.2 **I2V-A14B** dual-expert MoE (channel-concat image→video).
+pub const MODEL_ID_I2V_14B: &str = "wan2_2_i2v_14b";
+
 /// Default denoise steps (diffusers `sample_steps` / the UniPC default for the 5B).
 pub const DEFAULT_STEPS: u32 = 40;
 /// Default classifier-free guidance scale (`sample_guide_scale`).
@@ -73,6 +79,37 @@ impl TransformerConfig {
             rope_max_seq_len: 1024,
         }
     }
+
+    /// `WanTransformer3DModel` dims for **one A14B expert** (dim 5120, 40 layers, 40 heads, z16 in/out).
+    /// Both the `transformer/` (high-noise) and `transformer_2/` (low-noise) experts share these dims;
+    /// only the loaded weights differ. From `Wan-AI/Wan2.2-T2V-A14B-Diffusers/transformer/config.json`.
+    pub fn t2v_14b() -> Self {
+        Self {
+            in_channels: 16,
+            out_channels: 16,
+            num_layers: 40,
+            num_heads: 40,
+            head_dim: 128,
+            dim: 5120,
+            ffn_dim: 13824,
+            freq_dim: 256,
+            text_dim: 4096,
+            patch: (1, 2, 2),
+            eps: 1e-6,
+            rope_theta: 10000.0,
+            rope_max_seq_len: 1024,
+        }
+    }
+
+    /// A14B I2V expert dims — identical to [`Self::t2v_14b`] but **`in_channels = 36`**: the 16-channel
+    /// noise latent channel-concatenated with the 20-channel image conditioning `y` (4 mask + 16 image
+    /// latent). The patch embedding consumes 36 channels; the prediction stays `out_channels = 16`.
+    pub fn i2v_14b() -> Self {
+        Self {
+            in_channels: 36,
+            ..Self::t2v_14b()
+        }
+    }
 }
 
 /// `AutoencoderKLWan` (z48, `is_residual`) decoder dims.
@@ -116,6 +153,73 @@ pub const LATENTS_STD: [f32; 48] = [
     0.7069, 0.5338, 0.4889, 0.4917, 0.4069, 0.4999, 0.6866, 0.4093, 0.5709, 0.6065, 0.6415, 0.4944,
     0.5726, 1.2042, 0.5458, 1.6887, 0.3971, 1.06, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744,
 ];
+
+// ===========================================================================================
+// Wan2.2 A14B (MoE) — z16 VAE + dual-expert inference knobs
+// ===========================================================================================
+
+/// `AutoencoderKLWan` (z16, Wan2.1 VAE) dims, used by **both** A14B variants. From
+/// `Wan2.2-T2V-A14B-Diffusers/vae/config.json`: `base_dim 96`, `dim_mult [1,2,4,4]`, `z_dim 16`,
+/// `num_res_blocks 2`, `temperal_downsample [false, true, true]`, **non-residual, no patchify** (unlike
+/// the 5B's z48 [`VaeConfig`]). Spatial stride 8 (3 spatial up/down stages), temporal stride 4.
+#[derive(Clone, Copy, Debug)]
+pub struct Vae16Config {
+    pub z_dim: usize,
+    pub base_dim: usize,
+    pub num_res_blocks: usize,
+    pub out_channels: usize,
+}
+
+impl Vae16Config {
+    pub fn wan21() -> Self {
+        Self {
+            z_dim: 16,
+            base_dim: 96,
+            num_res_blocks: 2,
+            out_channels: 3,
+        }
+    }
+}
+
+/// Per-channel z16 latent de-normalization (`z = z·std + mean` before decode), from the z16
+/// `vae/config.json` (`latents_mean`/`latents_std`). Distinct from the z48 [`LATENTS_MEAN`].
+pub const LATENTS16_MEAN: [f32; 16] = [
+    -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134, -0.0715, 0.5517,
+    -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
+];
+pub const LATENTS16_STD: [f32; 16] = [
+    2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579,
+    1.6382, 1.1253, 2.8251, 1.916,
+];
+
+/// z16 VAE spatial downsample factor (latent `H = height / 8`).
+pub const VAE16_STRIDE_SPATIAL: u32 = 8;
+/// z16 VAE temporal downsample factor (latent `T = (frames - 1) / 4 + 1`).
+pub const VAE16_STRIDE_TEMPORAL: u32 = 4;
+/// Spatial size must be a multiple of `vae_stride_spatial (8) × patch (2) = 16` (vs 32 for the 5B).
+pub const SIZE_MULTIPLE_14B: u32 = 16;
+
+/// A14B defaults (the reference `WanModelConfig` MoE presets / the diffusers `model_index.json`).
+pub const DEFAULT_STEPS_14B: u32 = 40;
+pub const DEFAULT_FRAMES_14B: u32 = 81;
+/// A14B playback cadence (`sample_fps`; 16 for both variants, vs the 5B's 24).
+pub const DEFAULT_FPS_14B: u32 = 16;
+
+/// T2V-A14B MoE knobs: timestep boundary `0.875·1000` selects high (≥) vs low (<) expert; flow-shift
+/// 12.0; per-expert CFG (low 3.0, high 4.0).
+pub const T2V_14B_BOUNDARY: f64 = 0.875;
+pub const T2V_14B_FLOW_SHIFT: f64 = 12.0;
+pub const T2V_14B_GUIDANCE_LOW: f32 = 3.0;
+pub const T2V_14B_GUIDANCE_HIGH: f32 = 4.0;
+
+/// I2V-A14B MoE knobs: boundary `0.900·1000`; flow-shift 5.0; per-expert CFG (both 3.5). Max-area cap
+/// 704×1280 (aspect-preserving grid-aligned fit), like the 5B.
+pub const I2V_14B_BOUNDARY: f64 = 0.900;
+pub const I2V_14B_FLOW_SHIFT: f64 = 5.0;
+pub const I2V_14B_GUIDANCE_LOW: f32 = 3.5;
+pub const I2V_14B_GUIDANCE_HIGH: f32 = 3.5;
+/// Resolution cap for I2V (and the 5B): the long edge × short edge must fit `704·1280`.
+pub const MAX_AREA_14B: usize = 704 * 1280;
 
 /// `UMT5EncoderModel` (`google/umt5-xxl`) dims.
 #[derive(Clone, Copy, Debug)]

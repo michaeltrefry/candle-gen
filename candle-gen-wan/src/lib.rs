@@ -25,6 +25,8 @@ pub mod scheduler;
 pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
+pub mod vae16;
+pub mod wan14b;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
