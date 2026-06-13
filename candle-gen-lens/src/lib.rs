@@ -22,6 +22,7 @@
 //! transcode that keeps the ~12 GB footprint is sc-5111.
 
 pub mod adapters;
+pub mod quant;
 pub mod resolution;
 pub mod rope;
 pub mod schedule;
@@ -31,12 +32,12 @@ pub mod transformer;
 pub mod vae;
 
 pub use adapters::{merge_adapters, MergeReport};
+pub use quant::QLinear;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::registry::ModelRegistration;
@@ -86,17 +87,19 @@ struct Components {
     vae: Arc<Flux2Vae>,
 }
 
-/// A loadable Lens pipeline (the snapshot root + device + any DiT LoRA/LoKr adapters); components are
-/// loaded lazily on first use.
+/// A loadable Lens pipeline (the snapshot root + device + any DiT LoRA/LoKr adapters + optional DiT
+/// quant level); components are loaded lazily on first use.
 struct Pipeline {
     root: PathBuf,
     device: Device,
     /// LoRA/LoKr adapters merged into the `transformer/` weights on load (sc-5116). Empty = the stock
     /// mmap path.
     adapters: Vec<AdapterSpec>,
-    /// MoE-expert quantization for the gpt-oss encoder (sc-5111): `None` = dense bf16, `Some(Q4_0 |
-    /// Q8_0)` = the ~12 GB transcode. The DiT/VAE stay bf16/f32 (DiT quant is sc-5117).
-    enc_quant: Option<GgmlDType>,
+    /// Q4/Q8 quantization requested at load (`None` = dense bf16). When set it transcodes **both** the
+    /// gpt-oss encoder MoE experts to GGUF (sc-5111, the ~12 GB encoder footprint) and the DiT's
+    /// compute-heavy linears (sc-5117) — the encoder is the memory hog, the DiT the compute. The VAE
+    /// stays f32. One `Quant` drives both; each consumer maps it to the GGUF block dtype it needs.
+    quant: Option<Quant>,
 }
 
 impl Pipeline {
@@ -104,13 +107,13 @@ impl Pipeline {
         root: &Path,
         device: &Device,
         adapters: Vec<AdapterSpec>,
-        enc_quant: Option<GgmlDType>,
+        quant: Option<Quant>,
     ) -> Self {
         Self {
             root: root.to_path_buf(),
             device: device.clone(),
             adapters,
-            enc_quant,
+            quant,
         }
     }
 
@@ -172,9 +175,14 @@ impl Pipeline {
         let encoder = GptOssTextEncoder::new_quant(
             &EncoderConfig::gpt_oss_20b(),
             self.component_vb("text_encoder", ENC_DTYPE)?,
-            self.enc_quant,
+            self.quant.map(quant::ggml_dtype),
         )?;
-        let transformer = LensTransformer::new(&LensDitConfig::lens(), self.transformer_vb()?)?;
+        let mut transformer = LensTransformer::new(&LensDitConfig::lens(), self.transformer_vb()?)?;
+        // Q4/Q8 transcode the DiT's compute-heavy linears after the dense weights (and any merged
+        // adapter delta) have loaded — `apply_adapters → quantize` ordering (sc-5117).
+        if let Some(quant) = self.quant {
+            transformer.quantize(quant)?;
+        }
         let vae = Flux2Vae::new(self.component_vb("vae", VAE_DTYPE)?)?;
         Ok(Components {
             tokenizer: Arc::new(tokenizer),
@@ -537,8 +545,9 @@ impl Generator for LensGenerator {
 
 /// Lens' identity + capabilities for `id` — constructible without loading weights. The norm-rescaled
 /// CFG path is always present; turbo simply defaults guidance to 1.0. **Standard guidance, not
-/// true-CFG.** LoRA/LoKr are wired (sc-5116, merged into the DiT on load) and Q4/Q8 quant the gpt-oss
-/// encoder experts (sc-5111). DiT quant (sc-5117) is advertised but ignored at load until it lands.
+/// true-CFG.** LoRA/LoKr are wired (sc-5116, merged into the DiT on load); Q4/Q8 quant is wired for
+/// **both** the gpt-oss encoder experts (sc-5111) and the DiT (sc-5117, GGUF `QMatMul` folded in after
+/// the merge).
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
         id,
@@ -602,10 +611,10 @@ fn validate_request(
 /// Construct a lazy candle Lens generator with the given per-variant defaults. `spec.weights` must be
 /// a `microsoft/Lens` / `microsoft/Lens-Turbo` diffusers snapshot dir (`tokenizer/`, `text_encoder/`,
 /// `transformer/`, `vae/`). DiT LoRA/LoKr adapters (`spec.adapters`) are merged into the transformer
-/// weights on first use (sc-5116). `spec.quantize` Q4/Q8 transcodes the **gpt-oss encoder experts** to
-/// GGUF `Q4_0`/`Q8_0` (sc-5111; ~13 GB at Q4 vs ~40 GB bf16); the DiT stays bf16 (its own quant is
-/// sc-5117 — partial quant is fine, the encoder is the memory hog). ControlNet / IP-Adapter are not
-/// part of the Lens port and are rejected here.
+/// weights on first use (sc-5116). `spec.quantize` (Q4/Q8) transcodes **both** the gpt-oss encoder
+/// experts to GGUF `Q4_0`/`Q8_0` (sc-5111; ~13 GB at Q4 vs ~40 GB bf16, the encoder is the memory hog)
+/// and the DiT's compute-heavy linears (sc-5117, folded in after the adapter merge). ControlNet /
+/// IP-Adapter are not part of the Lens port and are rejected here.
 fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -617,14 +626,8 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Ge
             )));
         }
     };
-    // Map the requested quant level to the matching GGUF block dtype (the encoder's 2880-wide
-    // contraction is ÷32 but not ÷256, so only the 32-block quants apply). LoRA/LoKr adapters are
-    // merged downstream in `transformer_vb` (sc-5116), so neither adapters nor quant is rejected here.
-    let enc_quant = match spec.quantize {
-        None => None,
-        Some(Quant::Q4) => Some(GgmlDType::Q4_0),
-        Some(Quant::Q8) => Some(GgmlDType::Q8_0),
-    };
+    // `spec.quantize` (encoder + DiT) and `spec.adapters` (DiT merge, sc-5116) are both applied
+    // downstream in `load_components`/`transformer_vb`, so neither is rejected here.
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: ControlNet / IP-Adapter conditioning is not part of the Lens port",
@@ -635,7 +638,7 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Ge
     Ok(Box::new(LensGenerator {
         descriptor: descriptor_for(defaults.id),
         defaults,
-        pipeline: Pipeline::load(&root, &device, spec.adapters.clone(), enc_quant),
+        pipeline: Pipeline::load(&root, &device, spec.adapters.clone(), spec.quantize),
         components: Mutex::new(None),
     }))
 }

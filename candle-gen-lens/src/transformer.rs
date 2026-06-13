@@ -18,9 +18,11 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::{
-    linear, linear_no_bias, ops::softmax_last_dim, rms_norm, Linear, Module, RmsNorm, VarBuilder,
+    linear, ops::softmax_last_dim, rms_norm, Linear, Module, RmsNorm, VarBuilder,
 };
+use candle_gen::gen_core::Quant;
 
+use crate::quant::QLinear;
 use crate::rope::{apply_rope, LensRope};
 
 /// Block / QK-norm / norm_out epsilon (the reference builds its norms at eps 1e-6).
@@ -152,19 +154,20 @@ impl TimeEmbed {
     }
 }
 
-/// SwiGLU MLP (`GateMLP`): `w2(silu(w1·x) · w3·x)`, all bias-less. Hidden width `inner/3·8`.
+/// SwiGLU MLP (`GateMLP`): `w2(silu(w1·x) · w3·x)`, all bias-less. Hidden width `inner/3·8`. The three
+/// projections are [`QLinear`] so they can be Q4/Q8-quantized (sc-5117).
 struct GateMlp {
-    w1: Linear,
-    w2: Linear,
-    w3: Linear,
+    w1: QLinear,
+    w2: QLinear,
+    w3: QLinear,
 }
 
 impl GateMlp {
     fn new(inner: usize, hidden: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            w1: linear_no_bias(inner, hidden, vb.pp("w1"))?,
-            w2: linear_no_bias(hidden, inner, vb.pp("w2"))?,
-            w3: linear_no_bias(inner, hidden, vb.pp("w3"))?,
+            w1: QLinear::linear_no_bias(inner, hidden, vb.pp("w1"))?,
+            w2: QLinear::linear_no_bias(hidden, inner, vb.pp("w2"))?,
+            w3: QLinear::linear_no_bias(inner, hidden, vb.pp("w3"))?,
         })
     }
 
@@ -173,6 +176,13 @@ impl GateMlp {
         let up = self.w3.forward(x)?;
         self.w2.forward(&gate.mul(&up)?)
     }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.w1.quantize(quant)?;
+        self.w2.quantize(quant)?;
+        self.w3.quantize(quant)?;
+        Ok(())
+    }
 }
 
 /// Lens joint (dual-stream) attention. **Fused** `img_qkv`/`txt_qkv` (biased) split into per-stream
@@ -180,10 +190,10 @@ impl GateMlp {
 /// **`[img, txt]`**-concatenated sequence (image first), split back and projected (`to_out.0` for
 /// image, `to_add_out` for text).
 struct JointAttention {
-    img_qkv: Linear,
-    txt_qkv: Linear,
-    to_out: Linear,
-    to_add_out: Linear,
+    img_qkv: QLinear,
+    txt_qkv: QLinear,
+    to_out: QLinear,
+    to_add_out: QLinear,
     norm_q: RmsNorm,
     norm_k: RmsNorm,
     norm_added_q: RmsNorm,
@@ -197,10 +207,10 @@ impl JointAttention {
         let inner = cfg.inner_dim;
         let hd = cfg.head_dim;
         Ok(Self {
-            img_qkv: linear(inner, 3 * inner, vb.pp("img_qkv"))?,
-            txt_qkv: linear(inner, 3 * inner, vb.pp("txt_qkv"))?,
-            to_out: linear(inner, inner, vb.pp("to_out").pp("0"))?,
-            to_add_out: linear(inner, inner, vb.pp("to_add_out"))?,
+            img_qkv: QLinear::linear(inner, 3 * inner, vb.pp("img_qkv"))?,
+            txt_qkv: QLinear::linear(inner, 3 * inner, vb.pp("txt_qkv"))?,
+            to_out: QLinear::linear(inner, inner, vb.pp("to_out").pp("0"))?,
+            to_add_out: QLinear::linear(inner, inner, vb.pp("to_add_out"))?,
             norm_q: rms_norm(hd, EPS, vb.pp("norm_q"))?,
             norm_k: rms_norm(hd, EPS, vb.pp("norm_k"))?,
             norm_added_q: rms_norm(hd, EPS, vb.pp("norm_added_q"))?,
@@ -210,8 +220,19 @@ impl JointAttention {
         })
     }
 
+    /// Quantize the four fused/output projections to Q4/Q8 (sc-5117). Called **after** any adapter
+    /// merge (the merge folds `W += δ` into the dense weight before the DiT is built, so the quantized
+    /// base already carries the adapter delta). The QK-norm weights stay full precision.
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.img_qkv.quantize(quant)?;
+        self.txt_qkv.quantize(quant)?;
+        self.to_out.quantize(quant)?;
+        self.to_add_out.quantize(quant)?;
+        Ok(())
+    }
+
     /// Fused QKV → `(q, k, v)` each `[B, seq, heads, head_dim]`.
-    fn qkv(&self, lin: &Linear, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+    fn qkv(&self, lin: &QLinear, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let (b, s, _) = x.dims3()?;
         let (h, hd) = (self.heads, self.head_dim);
         let t = lin.forward(x)?.reshape((b, s, 3, h, hd))?;
@@ -280,7 +301,7 @@ impl JointAttention {
 
 /// Lens dual-stream MMDiT block. Each stream (image, text) gets two AdaLN modulations from the
 /// timestep embedding — `mod1` around the joint attention, `mod2` around the SwiGLU MLP — with gated
-/// residuals. Norms are affine RMSNorm (eps 1e-6). Public so the parity gate (and the eventual quant
+/// residuals. Norms are affine RMSNorm (eps 1e-6). Public so the parity gate (and the Q4/Q8 quant
 /// path, sc-5117) can drive a single block in isolation.
 pub struct LensTransformerBlock {
     img_mod: Linear,
@@ -309,6 +330,16 @@ impl LensTransformerBlock {
             img_mlp: GateMlp::new(inner, hidden, vb.pp("img_mlp"))?,
             txt_mlp: GateMlp::new(inner, hidden, vb.pp("txt_mlp"))?,
         })
+    }
+
+    /// Quantize the block's compute-heavy linears to Q4/Q8 (sc-5117): the joint-attention projections
+    /// and both SwiGLU MLPs. The AdaLN modulations (`img_mod`/`txt_mod`) and the RMSNorm weights stay
+    /// full precision (small, and precision-sensitive — the modulation drives every gated residual).
+    pub fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.attn.quantize(quant)?;
+        self.img_mlp.quantize(quant)?;
+        self.txt_mlp.quantize(quant)?;
+        Ok(())
     }
 
     /// Returns `(encoder_hidden_states, hidden_states)` (text, image) — the reference block's order.
@@ -385,13 +416,13 @@ impl NormOut {
 
 /// The Lens denoising DiT (`LensTransformer2DModel`).
 pub struct LensTransformer {
-    img_in: Linear,
+    img_in: QLinear,
     txt_norm: Vec<RmsNorm>, // per-layer text front-end RMSNorm (eps 1e-5)
-    txt_in: Linear,
+    txt_in: QLinear,
     time_embed: TimeEmbed,
     blocks: Vec<LensTransformerBlock>,
     norm_out: NormOut,
-    proj_out: Linear,
+    proj_out: QLinear,
     rope: LensRope,
     cfg: LensDitConfig,
     device: Device,
@@ -418,13 +449,13 @@ impl LensTransformer {
             )?);
         }
         Ok(Self {
-            img_in: linear(cfg.in_channels, inner, vb.pp("img_in"))?,
+            img_in: QLinear::linear(cfg.in_channels, inner, vb.pp("img_in"))?,
             txt_norm,
-            txt_in: linear(cfg.txt_in_dim(), inner, vb.pp("txt_in"))?,
+            txt_in: QLinear::linear(cfg.txt_in_dim(), inner, vb.pp("txt_in"))?,
             time_embed: TimeEmbed::new(cfg, vb.pp("time_text_embed"))?,
             blocks,
             norm_out: NormOut::new(cfg, vb.pp("norm_out"))?,
-            proj_out: linear(
+            proj_out: QLinear::linear(
                 inner,
                 cfg.patch_size * cfg.patch_size * cfg.out_channels,
                 vb.pp("proj_out"),
@@ -434,6 +465,22 @@ impl LensTransformer {
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
+    }
+
+    /// Fold the DiT's compute-heavy linears to Q4/Q8 in place (sc-5117): `img_in`, `txt_in`,
+    /// `proj_out`, and every block's attention projections + SwiGLU MLPs. The timestep embedder, the
+    /// AdaLN modulations, `norm_out`, and all RMSNorm weights stay full precision (small and
+    /// precision-sensitive). Call **after** any adapter merge — the merge folds `W += δ` into the dense
+    /// weight before the DiT is built, so quantizing here transcodes the already-adapted base. Mirrors
+    /// `mlx-gen-lens::dit::LensTransformer::quantize` (sc-3175).
+    pub fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.img_in.quantize(quant)?;
+        self.txt_in.quantize(quant)?;
+        self.proj_out.quantize(quant)?;
+        for block in &mut self.blocks {
+            block.quantize(quant)?;
+        }
+        Ok(())
     }
 
     /// Forward.
