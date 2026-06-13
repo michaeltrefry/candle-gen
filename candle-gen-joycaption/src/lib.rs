@@ -38,7 +38,7 @@ use candle_gen::{CandleError, Result as CResult};
 
 use language::{LlamaConfig, LlamaDecoder, LlavaProjector};
 use prompt::{
-    build_chat_text, capabilities, expand_image_tokens, BEGIN_OF_TEXT_TOKEN_ID,
+    build_chat_text, build_prompt, capabilities, expand_image_tokens, BEGIN_OF_TEXT_TOKEN_ID,
     DEFAULT_MAX_CONTEXT_TOKENS, JOY_CAPTION_FAMILY, JOY_CAPTION_MODEL_ID, PAD_TOKEN_ID,
 };
 use vision::{SiglipImageProcessor, SiglipVisionConfig, SiglipVisionTower};
@@ -211,14 +211,31 @@ impl Captioner for JoyCaptioner {
         req: &CaptionRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<CaptionOutput> {
-        self.validate(req)?;
+        // Construct the effective prompt from the caption type/length options when the caller didn't
+        // supply one (sc-5189), mirroring mlx-gen-joycaption's `normalized_request`
+        // (`out.prompt = build_prompt(out.options)`). SceneWorks' worker sends `prompt = custom_prompt`,
+        // which is empty for the normal type/length flow — without this the request fails validation
+        // ("prompt is required"). `validate`/`run` then see a non-empty, options-derived prompt.
+        let req = normalized_request(req);
+        self.validate(&req)?;
         // An already-cancelled request returns the typed `Canceled` before any inference (or even a
         // weight load) runs — the captioner cancellation contract (sc-4895).
         if req.cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
         }
-        Ok(self.run(req, on_progress)?)
+        Ok(self.run(&req, on_progress)?)
     }
+}
+
+/// Fill the request prompt from the caption options when the caller left it empty — the JoyCaption
+/// type/length template (or the custom-prompt override, which `build_prompt` returns as-is). Mirrors
+/// `mlx-gen-joycaption`'s `normalized_request` so both backends accept an options-only request.
+fn normalized_request(req: &CaptionRequest) -> CaptionRequest {
+    let mut out = req.clone();
+    if out.prompt.trim().is_empty() {
+        out.prompt = build_prompt(&out.options);
+    }
+    out
 }
 
 /// The JoyCaption captioner descriptor (candle backend; not mac-only).
@@ -275,6 +292,39 @@ pub fn force_link() {}
 mod tests {
     use super::*;
     use candle_gen::gen_core::registry;
+    use candle_gen::gen_core::{CaptionOptions, CaptionRequest};
+
+    #[test]
+    fn normalize_builds_prompt_from_options_when_empty() {
+        // sc-5189: the normal type/length flow sends no prompt; the provider must derive it (else
+        // `caption` fails "prompt is required"), mirroring mlx-gen-joycaption.
+        let req = CaptionRequest {
+            options: CaptionOptions {
+                caption_type: "Descriptive".to_owned(),
+                caption_length: "long".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(req.prompt.trim().is_empty());
+        let normalized = normalized_request(&req);
+        assert!(
+            !normalized.prompt.trim().is_empty(),
+            "empty prompt must be built from the caption options"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_an_explicit_prompt() {
+        let req = CaptionRequest {
+            prompt: "Describe the lighting only.".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            normalized_request(&req).prompt,
+            "Describe the lighting only."
+        );
+    }
 
     #[test]
     fn descriptor_advertises_joycaption_surface() {
