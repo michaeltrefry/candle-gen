@@ -58,7 +58,7 @@ use candle_gen::train::lora::{
     build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraSet,
     SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
 };
-use candle_gen::train::optim::{clip_grad_norm, TrainOptimizer};
+use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
 use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
 use candle_gen::{CandleError, Result};
 
@@ -304,37 +304,6 @@ fn compute_loss_grads(
         let grads = loss.backward()?;
         Ok((loss_val, grads))
     }
-}
-
-/// Accumulate one step's `grads` into `acc` (`+=` per adapter `Var`); the first step seeds it.
-fn accumulate_grads(acc: &mut Option<GradStore>, grads: GradStore, vars: &[Var]) -> Result<()> {
-    match acc {
-        None => *acc = Some(grads),
-        Some(a) => {
-            for v in vars {
-                if let Some(g) = grads.get(v.as_tensor()) {
-                    let summed = match a.get(v.as_tensor()) {
-                        Some(prev) => (prev + g)?,
-                        None => g.clone(),
-                    };
-                    a.insert(v.as_tensor(), summed);
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Scale every adapter `Var`'s gradient in `grads` by `factor` in place (the `1/accum` averaging
-/// before clip+step).
-fn scale_grads(grads: &mut GradStore, vars: &[Var], factor: f64) -> Result<()> {
-    for v in vars {
-        if let Some(g) = grads.get(v.as_tensor()) {
-            let scaled = (g * factor)?;
-            grads.insert(v.as_tensor(), scaled);
-        }
-    }
-    Ok(())
 }
 
 /// Resolve the config's target-module suffixes (default [`SDXL_ATTN_TARGETS`]) to full UNet attention
