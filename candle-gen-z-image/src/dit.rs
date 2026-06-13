@@ -38,6 +38,7 @@
 use candle_core::{DType, Module, Result, Tensor, D};
 use candle_nn::{RmsNorm, VarBuilder};
 
+use candle_gen::train::gradient_checkpoint::Segment;
 use candle_gen::train::lora::{lora_linear_no_bias, LoraHost, LoraLinear};
 
 // Reused verbatim from candle-transformers — frozen, non-adapter sub-modules + the patchify/RoPE
@@ -323,6 +324,23 @@ pub struct ZImageTransformer2DModel {
     cfg: Config,
 }
 
+/// The constant side tensors the **main** transformer layers and the final layer consume, produced
+/// once by [`ZImageTransformer2DModel::forward_pre_main`]. None of these depend on an adapter `Var`
+/// (the AdaLN conditioning is the frozen `t_embedder`'s output; the RoPE tables + masks are pure
+/// functions of the token geometry), so the gradient-checkpointing path captures them as detached
+/// constants shared across every recomputed main-layer segment — exactly how the SDXL trainer captures
+/// the time embedding + encoder states. The image-token bookkeeping (`img_seq_len`/`orig_size`) is what
+/// [`ZImageTransformer2DModel::velocity_out`] needs to narrow + unpatchify the image portion back out.
+#[derive(Debug, Clone)]
+pub struct MainContext {
+    adaln_input: Tensor,
+    unified_cos: Tensor,
+    unified_sin: Tensor,
+    unified_attn_mask: Tensor,
+    img_seq_len: usize,
+    orig_size: (usize, usize, usize),
+}
+
 impl ZImageTransformer2DModel {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let device = vb.device();
@@ -409,6 +427,11 @@ impl ZImageTransformer2DModel {
     /// Forward pass — returns the **raw** DiT velocity `(B, C, F, H, W)` (no sign flip; the inference
     /// pipeline and the trainer apply `.neg()`). Byte-faithful to the stock model's forward.
     ///
+    /// Factored into the three checkpointing phases ([`forward_pre_main`](Self::forward_pre_main) →
+    /// the main `layers` stack → [`velocity_out`](Self::velocity_out)) so the dense forward and the
+    /// gradient-checkpointed backward share one source of truth; the composition here is the dense
+    /// path, identical to the stock model (the `parity_tests` gate pins this).
+    ///
     /// * `x` — latent `(B, C, F, H, W)`
     /// * `t` — flow-match timestep in `[0, 1]` `(B,)`
     /// * `cap_feats` — caption features `(B, text_len, cap_feat_dim)`
@@ -420,6 +443,34 @@ impl ZImageTransformer2DModel {
         cap_feats: &Tensor,
         cap_mask: &Tensor,
     ) -> Result<Tensor> {
+        let (mut unified, ctx) = self.forward_pre_main(x, t, cap_feats, cap_mask)?;
+        for layer in &self.layers {
+            unified = layer.forward(
+                &unified,
+                Some(&ctx.unified_attn_mask),
+                &ctx.unified_cos,
+                &ctx.unified_sin,
+                Some(&ctx.adaln_input),
+            )?;
+        }
+        self.velocity_out(&unified, &ctx)
+    }
+
+    /// The **pre-main** forward (DiT phases 1–10): timestep embed, patchify + embed the image, embed
+    /// the caption, run the noise + context refiners, and concatenate `[image, text]` into the unified
+    /// hidden state fed to the main layers. Returns `(unified, ctx)` where `ctx` ([`MainContext`]) holds
+    /// the constant RoPE/mask/AdaLN tensors the main layers + final layer consume.
+    ///
+    /// The trainer's gradient-checkpointing path runs this **retained** (its graph kept live), so the
+    /// refiner + embedder adapter `Var`s train through ordinary autograd; only the main `layers` stack
+    /// is checkpointed (see [`crate::training`]).
+    pub fn forward_pre_main(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+    ) -> Result<(Tensor, MainContext)> {
         let device = x.device();
         let (b, _c, f, h, w) = x.dims5()?;
         let patch_size = self.cfg.all_patch_size[0];
@@ -473,28 +524,55 @@ impl ZImageTransformer2DModel {
         let (unified_cos, unified_sin) = self.rope_embedder.forward(&unified_pos_ids)?;
         let unified_attn_mask = Tensor::cat(&[&x_attn_mask, &cap_attn_mask], 1)?;
 
-        // 11. Main transformer layers
-        let mut unified = unified;
-        for layer in &self.layers {
-            unified = layer.forward(
-                &unified,
-                Some(&unified_attn_mask),
-                &unified_cos,
-                &unified_sin,
-                Some(&adaln_input),
-            )?;
-        }
+        Ok((
+            unified,
+            MainContext {
+                adaln_input,
+                unified_cos,
+                unified_sin,
+                unified_attn_mask,
+                img_seq_len,
+                orig_size,
+            },
+        ))
+    }
 
-        // 12. Final layer (image portion only)
-        let x_out = unified.narrow(1, 0, img_seq_len)?;
-        let x_out = self.final_layer.forward(&x_out, &adaln_input)?;
+    /// One [`Segment`] per **main** transformer layer (DiT phase 11), each mapping `[unified] →
+    /// [unified]` using `ctx`'s constant RoPE/mask/AdaLN tensors. This is the Z-Image analog of the
+    /// SDXL UNet's `block_segments`: the bulk of the activation working set, fed to
+    /// [`checkpointed_backward`](candle_gen::train::gradient_checkpoint::checkpointed_backward) so each
+    /// layer is recomputed in the backward instead of retaining all of their activations at once. The
+    /// trainer appends a final `[unified] → [loss]` segment (the [`velocity_out`](Self::velocity_out)
+    /// head + the flow-match regression).
+    pub fn main_layer_segments<'a>(&'a self, ctx: &'a MainContext) -> Vec<Segment<'a>> {
+        self.layers
+            .iter()
+            .map(|layer| -> Segment<'a> {
+                Box::new(move |st: &[Tensor]| {
+                    Ok(vec![layer.forward(
+                        &st[0],
+                        Some(&ctx.unified_attn_mask),
+                        &ctx.unified_cos,
+                        &ctx.unified_sin,
+                        Some(&ctx.adaln_input),
+                    )?])
+                })
+            })
+            .collect()
+    }
 
-        // 13. Unpatchify
+    /// The **post-main** head (DiT phases 12–13): take the image-token portion of the unified hidden
+    /// state, apply the final AdaLN layer, and unpatchify back to the raw velocity `(B, C, F, H, W)`.
+    /// `unified_final` is the output of the last main layer; `ctx` is the [`MainContext`] from
+    /// [`forward_pre_main`](Self::forward_pre_main).
+    pub fn velocity_out(&self, unified_final: &Tensor, ctx: &MainContext) -> Result<Tensor> {
+        let x_out = unified_final.narrow(1, 0, ctx.img_seq_len)?;
+        let x_out = self.final_layer.forward(&x_out, &ctx.adaln_input)?;
         unpatchify(
             &x_out,
-            orig_size,
-            patch_size,
-            f_patch_size,
+            ctx.orig_size,
+            self.cfg.all_patch_size[0],
+            self.cfg.all_f_patch_size[0],
             self.cfg.in_channels,
         )
     }

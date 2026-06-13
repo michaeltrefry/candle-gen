@@ -95,11 +95,35 @@ fn accumulate(store: &mut GradStore, var: &Var, grad: &Tensor) -> CandleResult<(
 /// The returned `GradStore` is ready for [`clip_grad_norm`](super::optim::clip_grad_norm) and
 /// [`TrainOptimizer::step`](super::optim::TrainOptimizer::step) — exactly the store a monolithic
 /// `loss.backward()` would hand them, just built one segment at a time.
+///
+/// This is the cotangent-discarding thin wrapper over [`checkpointed_backward_with_input_grad`]; reach
+/// for that variant when the segment chain sits on top of a **retained upstream forward** whose
+/// trainable `Var`s need the input-boundary gradient (the Z-Image trainer's pre-main refiner stack).
 pub fn checkpointed_backward(
     segments: &[Segment],
     inputs: &[Tensor],
     trainable: &[Var],
 ) -> Result<(f32, GradStore)> {
+    let (loss, grads, _input_cot) =
+        checkpointed_backward_with_input_grad(segments, inputs, trainable)?;
+    Ok((loss, grads))
+}
+
+/// Like [`checkpointed_backward`], but **also** returns the cotangent at the input boundary —
+/// `dL/d inputsₖ`, one tensor per element of `inputs` — so a caller can continue the chain rule
+/// through a *retained* upstream forward whose trainable `Var`s live **outside** the segment chain.
+///
+/// This is what the Z-Image DiT trainer needs: it checkpoints only the main `layers` stack (the bulk
+/// of the activation working set) yet keeps the pre-main refiner/embedder forward retained so those
+/// adapters train via ordinary autograd. Given the returned `dL/d unified`, it forms the surrogate
+/// `s = Σₖ ⟨inputₖ_retained, cotₖ⟩` and `s.backward()` to fold the refiner/embedder grads in. The
+/// boundary cotangent is the *full* upstream gradient (frozen base **+** adapter — see the
+/// "Why the boundary inputs must be `Var`s" note above), so that surrogate is the exact chain rule.
+pub fn checkpointed_backward_with_input_grad(
+    segments: &[Segment],
+    inputs: &[Tensor],
+    trainable: &[Var],
+) -> Result<(f32, GradStore, Vec<Tensor>)> {
     if segments.is_empty() {
         return Err(CandleError::Msg(
             "checkpointed_backward: at least one segment is required".into(),
@@ -191,7 +215,9 @@ pub fn checkpointed_backward(
         // `out`, `grads`, `in_vars` drop here → this segment's recompute graph frees.
     }
 
-    Ok((loss, master))
+    // After the i=0 iteration, `cot` holds the cotangent at the input boundary (`dL/d inputsₖ`) — the
+    // hook a caller uses to continue the chain rule through a retained upstream forward.
+    Ok((loss, master, cot))
 }
 
 #[cfg(test)]
@@ -283,6 +309,61 @@ mod tests {
                     "grad mismatch for {name}: monolithic {gm:?} vs checkpointed {gc:?}"
                 );
             }
+        }
+    }
+
+    /// [`checkpointed_backward_with_input_grad`]'s returned input cotangent must equal the monolithic
+    /// `dL/d input` — the hook the Z-Image trainer uses to continue the chain rule into its retained
+    /// pre-main forward. The input here carries **no** `Var` of its own (it's a plain activation), so
+    /// the boundary cotangent must still be the full gradient (the leaf-`Var` wrapping inside the
+    /// harness keeps the frozen-base branch live).
+    #[test]
+    fn input_cotangent_matches_monolithic_input_grad() {
+        // x is a Var ONLY in the monolithic reference so we can read dL/dx; the checkpointed pass
+        // treats it as a plain input tensor and recovers the same gradient via the returned cotangent.
+        let x = var(&[1.0, -2.0, 0.5, 3.0], (1, 4));
+        let w0 = var(&[0.1, 0.2, -0.1, 0.0, 0.3, -0.2, 0.05, 0.4], (4, 2));
+        let w1 = var(&[0.5, -0.1, 0.2, 0.4], (2, 2));
+
+        // Monolithic: loss = sum((tanh(x·w0)·w1)²); read dL/dx.
+        let loss_mono = x
+            .as_tensor()
+            .matmul(w0.as_tensor())
+            .unwrap()
+            .tanh()
+            .unwrap()
+            .matmul(w1.as_tensor())
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        let g_mono = loss_mono.backward().unwrap();
+        let dldx_mono = grad_vec(&g_mono, &x);
+
+        // Checkpointed: two segments, recover dL/dx from the returned input cotangent.
+        let segments: Vec<Segment> = vec![
+            Box::new(|st: &[Tensor]| Ok(vec![st[0].matmul(w0.as_tensor())?.tanh()?])),
+            Box::new(|st: &[Tensor]| Ok(vec![st[0].matmul(w1.as_tensor())?.sqr()?.sum_all()?])),
+        ];
+        let (_loss, _grads, input_cot) = checkpointed_backward_with_input_grad(
+            &segments,
+            std::slice::from_ref(x.as_tensor()),
+            &[w0.clone(), w1.clone()],
+        )
+        .unwrap();
+        let dldx_ckpt = input_cot[0]
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        assert_eq!(dldx_mono.len(), dldx_ckpt.len());
+        for (a, b) in dldx_mono.iter().zip(dldx_ckpt.iter()) {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "input cotangent mismatch: monolithic {dldx_mono:?} vs checkpointed {dldx_ckpt:?}"
+            );
         }
     }
 

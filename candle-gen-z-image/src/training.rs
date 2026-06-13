@@ -33,16 +33,22 @@
 //! re-reads the current factor storage and `loss.backward()` attributes grads straight to the `Var`s,
 //! so the per-step body is forward → backward → clip → step, with no re-install.
 //!
-//! Gradient checkpointing (the MLX trainer's sc-4874 memory mitigation for Mac unified memory) is a
-//! follow-up here (**sc-5246**) — on CUDA an OOM is a catchable error, not the uncatchable SIGKILL
-//! that motivated it, and the dense path trains the distilled DiT fine on the Blackwell card. The
-//! `gradient_checkpointing` config flag is accepted but not yet honored until then.
+//! **Gradient checkpointing** (`config.gradient_checkpointing`, sc-5246 — the candle twin of the MLX
+//! trainer's sc-4874 split) routes the backward through [`checkpointed_backward_with_input_grad`]
+//! over the DiT's main `layers` stack ([`ZImageTransformer2DModel::main_layer_segments`]), recomputing
+//! each layer instead of retaining its activations — numerically the dense grads (the
+//! `dense_and_checkpoint_grads_match` gate asserts this), at the cost of one extra forward over the
+//! main stack. The pre-main refiner/embedder forward is run *retained*, so those adapters train via
+//! ordinary autograd and their grads are stitched in through the recovered `unified`-boundary
+//! cotangent (see [`compute_loss_grads`]). On CUDA an OOM is a catchable error (not the uncatchable
+//! Mac-unified-memory SIGKILL that forced the MLX work), so this is the lever for higher training
+//! resolutions / smaller cards rather than a correctness requirement.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_core::backprop::GradStore;
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::VarBuilder;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -56,6 +62,7 @@ use candle_gen::gen_core::train::{
 use candle_gen::gen_core::{self, LoadSpec, Modality, WeightsSource};
 use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
+use candle_gen::train::gradient_checkpoint::checkpointed_backward_with_input_grad;
 use candle_gen::train::lora::{
     build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraSet,
 };
@@ -177,14 +184,28 @@ fn sample_noise(shape: &[usize], seed: u64, device: &Device) -> Result<Tensor> {
 /// cached `(L, cap_feat_dim)` caption embedding. `prepare_inputs` adds the DiT's singleton frame axis
 /// and pads the caption to `SEQ_MULTI_OF` (the same call inference makes), so train and infer feed the
 /// DiT the identical tensor surface.
+///
+/// `use_checkpoint` selects the gradient-checkpointed backward over the dense `loss.backward()`. The
+/// Z-Image split (mirroring the MLX trainer): the **pre-main** forward
+/// ([`forward_pre_main`](ZImageTransformer2DModel::forward_pre_main) — embed + refiners) is run
+/// retained, so the refiner/embedder adapters train via ordinary autograd; only the main `layers`
+/// stack (the activation-memory bulk) is checkpointed via
+/// [`main_layer_segments`](ZImageTransformer2DModel::main_layer_segments) +
+/// [`checkpointed_backward_with_input_grad`], recomputing each layer in the backward. The returned
+/// boundary cotangent `dL/d unified` is then stitched back through the retained pre-main forward to
+/// fold in those adapters' grads. Both paths yield the same grads — the `tests` parity gate
+/// (`dense_and_checkpoint_grads_match`) pins this, exactly as the SDXL trainer does.
+#[allow(clippy::too_many_arguments)]
 fn compute_loss_grads(
     dit: &ZImageTransformer2DModel,
+    lora_vars: &[Var],
     x0: &Tensor,
     cap: &Tensor,
     sigma: f32,
     noise: &Tensor,
     mae: bool,
     compute_dtype: DType,
+    use_checkpoint: bool,
 ) -> Result<(f32, GradStore)> {
     let device = x0.device();
     let (x_t, target, timestep) = build_batch(x0, noise, sigma)?;
@@ -192,15 +213,60 @@ fn compute_loss_grads(
     let prepared = prepare_inputs(&x_t, std::slice::from_ref(cap), device)?;
     let cap_feats = prepared.cap_feats.to_dtype(compute_dtype)?;
     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-    // Raw DiT velocity, then negated to match the inference pipeline's `noise_pred.neg()`.
-    let v = dit
-        .forward(&prepared.latents, &t, &cap_feats, &prepared.cap_mask)?
-        .squeeze(2)? // drop the singleton frame axis: (1, 16, 1, h, w) -> (1, 16, h, w)
-        .neg()?;
-    let loss = velocity_loss(&v, &target, mae)?;
-    let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-    let grads = loss.backward()?;
-    Ok((loss_val, grads))
+
+    if use_checkpoint {
+        // Retain the pre-main forward (refiner/embedder adapters train via ordinary autograd); only
+        // the main `layers` stack is checkpointed (each layer recomputed in the backward).
+        let (unified, ctx) =
+            dit.forward_pre_main(&prepared.latents, &t, &cap_feats, &prepared.cap_mask)?;
+        let mut segs = dit.main_layer_segments(&ctx);
+        // Final segment: the post-main head + the negated-velocity flow-match regression -> [loss].
+        // (`squeeze(2)` drops the singleton frame axis: (1, 16, 1, h, w) -> (1, 16, h, w).)
+        let target_owned = target.clone();
+        let ctx_ref = &ctx;
+        segs.push(Box::new(move |st: &[Tensor]| {
+            let v = dit.velocity_out(&st[0], ctx_ref)?.squeeze(2)?.neg()?;
+            Ok(vec![velocity_loss(&v, &target_owned, mae)?])
+        }));
+        // Seed the checkpointed chain with the detached `unified` boundary, recovering its cotangent.
+        let unified_d = unified.detach();
+        let (loss_val, mut grads, input_cot) = checkpointed_backward_with_input_grad(
+            &segs,
+            std::slice::from_ref(&unified_d),
+            lora_vars,
+        )?;
+        drop(segs); // release the closures' borrows of `dit`/`ctx` before the stitch backward
+
+        // Continue the chain rule into the retained pre-main: `s = ⟨unified, dL/d unified⟩` then
+        // `s.backward()` delivers the refiner/embedder adapter grads (cotangent is a detached
+        // constant). The main-layer grads are already accumulated in `grads`; the two `Var` sets are
+        // disjoint (refiner blocks ≠ main blocks), so this is a union, not a sum — but accumulate
+        // defensively in case a future layout shares a factor across the boundary.
+        let cot = input_cot[0].to_dtype(DType::F32)?;
+        let surrogate = (unified.to_dtype(DType::F32)? * cot)?.sum_all()?;
+        let pre_grads = surrogate.backward()?;
+        for v in lora_vars {
+            if let Some(g) = pre_grads.get(v.as_tensor()) {
+                let merged = match grads.get(v.as_tensor()) {
+                    Some(prev) => (prev + g)?,
+                    None => g.clone(),
+                };
+                grads.insert(v.as_tensor(), merged);
+            }
+        }
+        Ok((loss_val, grads))
+    } else {
+        // Dense backward: one monolithic `loss.backward()` retains every layer's activations.
+        // Raw DiT velocity, then negated to match the inference pipeline's `noise_pred.neg()`.
+        let v = dit
+            .forward(&prepared.latents, &t, &cap_feats, &prepared.cap_mask)?
+            .squeeze(2)? // drop the singleton frame axis: (1, 16, 1, h, w) -> (1, 16, h, w)
+            .neg()?;
+        let loss = velocity_loss(&v, &target, mae)?;
+        let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+        let grads = loss.backward()?;
+        Ok((loss_val, grads))
+    }
 }
 
 /// Resolve the sorted `.safetensors` files in the snapshot component subdir `sub`.
@@ -517,6 +583,7 @@ impl ZImageTrainer {
                 device,
             )?,
         };
+        let use_checkpoint = cfg.gradient_checkpointing;
 
         // --- optimizer + schedule ---
         let mae = matches!(cfg.loss_type.to_ascii_lowercase().as_str(), "mae" | "l1");
@@ -557,8 +624,17 @@ impl ZImageTrainer {
                 cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
                 device,
             )?;
-            let (loss, grads) =
-                compute_loss_grads(&dit, x0, cap, sigma, &noise, mae, compute_dtype)?;
+            let (loss, grads) = compute_loss_grads(
+                &dit,
+                &lora_set.vars,
+                x0,
+                cap,
+                sigma,
+                &noise,
+                mae,
+                compute_dtype,
+                use_checkpoint,
+            )?;
             last_loss = loss;
             steps_run = step;
             accumulate_grads(&mut accumulated, grads, &lora_set.vars)?;
@@ -695,8 +771,18 @@ mod tests {
         let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
         let noise = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
 
-        let (loss, grads) =
-            compute_loss_grads(&dit, &x0, &cap, 0.5, &noise, false, DType::F32).unwrap();
+        let (loss, grads) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &cap,
+            0.5,
+            &noise,
+            false,
+            DType::F32,
+            false,
+        )
+        .unwrap();
         assert!(loss.is_finite(), "loss must be finite, got {loss}");
         for (i, v) in set.vars.iter().enumerate() {
             let g = grads
@@ -721,6 +807,98 @@ mod tests {
         );
     }
 
+    /// The correctness gate for the `gradient_checkpointing` lever: the checkpointed backward must
+    /// reproduce the dense `loss.backward()` grads (mod float reassociation) over the tiny DiT with
+    /// nonzero LoRA factors. The tiny config adapts BOTH refiner and main-layer blocks, so this
+    /// comparison spans the two distinct checkpoint paths — the **retained** pre-main refiner/embedder
+    /// adapters (grads stitched in through the recovered `unified`-boundary cotangent) AND the
+    /// **checkpointed** main `layers` (grads from the segmented VJP). A break in either path surfaces
+    /// here as a missing or mismatched grad. Mirrors the SDXL trainer's `dense_and_checkpoint_grads_match`.
+    #[test]
+    fn dense_and_checkpoint_grads_match() {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let (mut dit, cfg) = tiny_dit(vb);
+        let suffixes: Vec<String> = Z_IMAGE_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
+        let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
+        // Move B off zero so both A and B grads are nonzero (a no-op-init adapter zeros A's grad).
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+        // Every projection in both refiner blocks AND the main layer is adapted, so the per-var
+        // comparison below necessarily spans the retained (refiner) and checkpointed (main) paths.
+        let expected_targets = 4 * (cfg.n_refiner_layers * 2 + cfg.n_layers);
+        assert_eq!(
+            set.vars.len(),
+            expected_targets * 2,
+            "two factors per target"
+        );
+
+        let x0 = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
+        let noise = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
+
+        let (loss_d, g_d) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &cap,
+            0.5,
+            &noise,
+            false,
+            DType::F32,
+            false,
+        )
+        .unwrap();
+        let (loss_c, g_c) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &cap,
+            0.5,
+            &noise,
+            false,
+            DType::F32,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            (loss_d - loss_c).abs() < 1e-4,
+            "loss: dense {loss_d} vs checkpoint {loss_c}"
+        );
+        let grad_vec = |g: &GradStore, v: &Var| {
+            g.get(v.as_tensor())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let mut saw_nonzero = false;
+        for (idx, v) in set.vars.iter().enumerate() {
+            assert!(
+                g_d.get(v.as_tensor()).is_some() && g_c.get(v.as_tensor()).is_some(),
+                "var {idx} missing a gradient (dense or checkpoint)"
+            );
+            let a = grad_vec(&g_d, v);
+            let b = grad_vec(&g_c, v);
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert!(
+                    (x - y).abs() < 1e-4,
+                    "grad mismatch for var {idx} (dense {x} vs checkpoint {y})"
+                );
+                if x.abs() > 1e-6 {
+                    saw_nonzero = true;
+                }
+            }
+        }
+        assert!(saw_nonzero, "expected nonzero adapter grads to compare");
+    }
+
     /// One optimizer step over the tiny DiT lowers (or holds) the loss on the same fixed batch — the
     /// step actually descends the flow-match objective, end to end through the harness.
     #[test]
@@ -740,19 +918,49 @@ mod tests {
         let noise = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
 
         let mut opt = TrainOptimizer::from_config("adamw", set.vars.clone(), 1e-2, 0.0).unwrap();
-        let (loss0, grads) =
-            compute_loss_grads(&dit, &x0, &cap, 0.5, &noise, false, DType::F32).unwrap();
+        let (loss0, grads) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &cap,
+            0.5,
+            &noise,
+            false,
+            DType::F32,
+            false,
+        )
+        .unwrap();
         // A few steps on the same batch should reduce the loss (over-fit a single sample).
         let mut grads = grads;
         for _ in 0..5 {
             clip_grad_norm(&mut grads, &set.vars, 1.0).unwrap();
             opt.step(&grads).unwrap();
-            let (_l, g) =
-                compute_loss_grads(&dit, &x0, &cap, 0.5, &noise, false, DType::F32).unwrap();
+            let (_l, g) = compute_loss_grads(
+                &dit,
+                &set.vars,
+                &x0,
+                &cap,
+                0.5,
+                &noise,
+                false,
+                DType::F32,
+                false,
+            )
+            .unwrap();
             grads = g;
         }
-        let (loss1, _) =
-            compute_loss_grads(&dit, &x0, &cap, 0.5, &noise, false, DType::F32).unwrap();
+        let (loss1, _) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &cap,
+            0.5,
+            &noise,
+            false,
+            DType::F32,
+            false,
+        )
+        .unwrap();
         assert!(
             loss1 < loss0,
             "5 steps on a fixed batch should lower the loss: {loss0} -> {loss1}"

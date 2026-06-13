@@ -22,6 +22,9 @@
 //!    — every trained target merges, nothing is skipped — and a full `generate` with the adapter
 //!    renders a finite, correctly-sized image on the GPU.
 //!  - **launch-portable determinism**: the same seed produces the same adapter, run to run.
+//!  - **gradient checkpointing** (sc-5246): the same LoRA recipe with `gradient_checkpointing = true`
+//!    converges + reloads + renders on the GPU — the memory-bounded backward runs end-to-end (the
+//!    bit-exact dense-vs-checkpoint grad parity is the f32 `dense_and_checkpoint_grads_match` unit gate).
 //!
 //! **On "parity vs torch/MLX":** cross-framework *numeric* parity is explicitly NOT a goal (different
 //! autograd, RNG algorithms, and the deterministic CPU-seeded noise/σ of sc-3673). What IS guaranteed
@@ -84,7 +87,7 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
 /// ~25 GB and OOM during caching alongside the f32 text encoder; bf16 is also the trainer's default.)
 /// The trainable adapter factors / loss / grads / optimizer state stay f32 regardless (master
 /// weights), so the convergence + determinism signals are not bf16-noisy at the parameter level.
-fn config(network_type: NetworkType, steps: u32) -> TrainingConfig {
+fn config(network_type: NetworkType, steps: u32, grad_ckpt: bool) -> TrainingConfig {
     TrainingConfig {
         rank: 8,
         alpha: 8.0,
@@ -96,6 +99,7 @@ fn config(network_type: NetworkType, steps: u32) -> TrainingConfig {
         network_type,
         decompose_factor: -1,
         train_dtype: "bf16".to_string(),
+        gradient_checkpointing: grad_ckpt,
         ..Default::default()
     }
 }
@@ -105,8 +109,15 @@ struct RunOut {
     adapter_path: PathBuf,
 }
 
-/// Train through the registry and collect the per-step losses + the adapter path.
-fn run(tmp: &Path, file_name: &str, network_type: NetworkType, steps: u32) -> RunOut {
+/// Train through the registry and collect the per-step losses + the adapter path. `grad_ckpt` selects
+/// the gradient-checkpointed backward (sc-5246) over the dense one.
+fn run(
+    tmp: &Path,
+    file_name: &str,
+    network_type: NetworkType,
+    steps: u32,
+    grad_ckpt: bool,
+) -> RunOut {
     let items = make_dataset(tmp);
     // Reference the provider crate so its `inventory::submit!` trainer registration is linked in.
     assert_eq!(candle_gen_z_image::MODEL_ID, "z_image_turbo");
@@ -119,7 +130,7 @@ fn run(tmp: &Path, file_name: &str, network_type: NetworkType, steps: u32) -> Ru
 
     let req = TrainingRequest {
         items,
-        config: config(network_type, steps),
+        config: config(network_type, steps, grad_ckpt),
         output_dir: tmp.join("out"),
         file_name: file_name.to_string(),
         trigger_words: vec![],
@@ -218,7 +229,7 @@ fn assert_reloads(adapter_path: &Path, kind: AdapterKind, n_targets: usize) {
 #[ignore = "needs real Z-Image weights + a CUDA GPU; run with --features cuda --release --ignored"]
 fn z_image_trainer_lora_trains_reloads_and_renders() {
     let tmp = std::env::temp_dir().join("candle_zimage_trainer_lora_e2e");
-    let out = run(&tmp, "swatch_lora.safetensors", NetworkType::Lora, 64);
+    let out = run(&tmp, "swatch_lora.safetensors", NetworkType::Lora, 64, false);
     assert_converged("zimage-lora", &out.losses);
 
     let meta = read_meta(&out.adapter_path);
@@ -243,6 +254,47 @@ fn z_image_trainer_lora_trains_reloads_and_renders() {
     println!("[zimage-lora] e2e OK — {n_targets} targets reload + merge, render finite");
 }
 
+/// Gradient checkpointing (sc-5246): the **same** LoRA recipe with `gradient_checkpointing = true`
+/// must still converge, reload, and render on real CUDA weights — proving the memory-bounded backward
+/// (retained pre-main refiners + checkpointed main `layers` + the stitched boundary cotangent) runs
+/// end-to-end on the GPU and descends the flow-match objective, not just on the CPU parity gate. (The
+/// adapter is NOT asserted bit-identical to the dense run: on bf16 CUDA the recompute + stitch reorder
+/// the reductions, so they agree numerically — the f32 `dense_and_checkpoint_grads_match` unit gate —
+/// but need not match bit-for-bit. Run-to-run determinism within the checkpoint path still holds.)
+#[test]
+#[ignore = "needs real Z-Image weights + a CUDA GPU; run with --features cuda --release --ignored"]
+fn z_image_trainer_gradient_checkpointing_trains_and_reloads() {
+    let tmp = std::env::temp_dir().join("candle_zimage_trainer_ckpt_e2e");
+    let out = run(&tmp, "swatch_ckpt.safetensors", NetworkType::Lora, 64, true);
+    assert_converged("zimage-ckpt", &out.losses);
+
+    let tensors =
+        candle_gen::candle_core::safetensors::load(&out.adapter_path, &Device::Cpu).unwrap();
+    let n_targets = tensors
+        .keys()
+        .filter(|k| k.ends_with(".lora_A.weight"))
+        .count();
+    assert!(n_targets > 0, "checkpointed adapter should contain LoRA factors");
+    // The checkpointed backward must reach BOTH the retained pre-main refiners and the checkpointed
+    // main layers — assert the adapter carries a refiner key AND a main-layer key.
+    assert!(
+        tensors
+            .keys()
+            .any(|k| k.contains("refiner") && k.ends_with(".attention.to_q.lora_A.weight")),
+        "checkpointed adapter should carry refiner attention keys (the retained pre-main path)"
+    );
+    assert!(
+        tensors
+            .keys()
+            .any(|k| k.starts_with("layers.") && k.ends_with(".attention.to_q.lora_A.weight")),
+        "checkpointed adapter should carry main-layer attention keys (the checkpointed path)"
+    );
+
+    assert_reloads(&out.adapter_path, AdapterKind::Lora, n_targets);
+    render_finite_with_adapter(&out.adapter_path, AdapterKind::Lora);
+    println!("[zimage-ckpt] e2e OK — gradient-checkpointed train converges, {n_targets} targets reload + render");
+}
+
 /// LoKr: trains + converges, writes a LoKr adapter (with `decomposeFactor`), and reloads.
 #[test]
 #[ignore = "needs real Z-Image weights + a CUDA GPU; run with --features cuda --release --ignored"]
@@ -250,7 +302,7 @@ fn z_image_trainer_lokr_trains_and_reloads() {
     let tmp = std::env::temp_dir().join("candle_zimage_trainer_lokr_e2e");
     // 128 steps: the LoKr Kronecker reparam descends slower than LoRA at the same lr/rank, so it needs
     // more steps to show a clear median fall on this tiny over-fit task.
-    let out = run(&tmp, "swatch_lokr.safetensors", NetworkType::Lokr, 128);
+    let out = run(&tmp, "swatch_lokr.safetensors", NetworkType::Lokr, 128, false);
     assert_converged("zimage-lokr", &out.losses);
 
     let meta = read_meta(&out.adapter_path);
@@ -276,12 +328,14 @@ fn z_image_trainer_same_seed_is_reproducible() {
         "det_a.safetensors",
         NetworkType::Lora,
         6,
+        false,
     );
     let b = run(
         &std::env::temp_dir().join("candle_zimage_trainer_det_b"),
         "det_b.safetensors",
         NetworkType::Lora,
         6,
+        false,
     );
     assert_eq!(
         a.losses, b.losses,
