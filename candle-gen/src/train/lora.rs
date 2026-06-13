@@ -552,6 +552,76 @@ pub fn reconstruct_lokr_delta(
     Ok((delta * eff)?)
 }
 
+/// Fuse a **conv-layer** LoRA pair into a single conv-weight delta in the trained-file **NCHW**
+/// `[out, in, kH, kW]` layout (sc-5225) — the conv analog of [`reconstruct_lora_delta`]. Community SDXL
+/// LoRAs adapt convs (resnet `conv1`/`conv2`/`conv_shortcut`, the down/up-samplers, `conv_in`/`conv_out`)
+/// by decomposing a conv into a spatial `down` (`lora_down`, `[rank, in, kH, kW]`) followed by a 1×1
+/// `up` (`lora_up`, `[out, rank, 1, 1]`); the fused weight is the composition of those two convs:
+///   `δ[o, i, y, x] = Σ_r up[o, r] · down[r, i, y, x]`,
+/// which is exactly `up[out, rank] · down[rank, in·kH·kW]` reshaped back to `[out, in, kH, kW]` —
+/// bit-identical to PEFT/diffusers' `Conv2d` LoRA fusion, uniform across 1×1 and k×k kernels — then
+/// scaled by `(alpha/rank)·scale`. Computed in **f32** (the candle SDXL merge path is f32-everywhere,
+/// matching [`reconstruct_lora_delta`]); the caller folds it into the conv weight (`W += δ`).
+///
+/// Unlike mlx-gen's `conv_lora_delta` (which returns NCHW and transposes to NHWC at the merge site,
+/// because mlx stores conv weights NHWC), candle convs are already NCHW (`candle_nn::Conv2d`), so the
+/// returned delta merges into the diffusers `{path}.weight` tensor with no transpose. A non-4-D factor
+/// (a malformed conv LoRA) is a typed error rather than a panic on the kernel-dim reshape.
+pub fn conv_lora_delta(
+    down: &Tensor,
+    up: &Tensor,
+    alpha: f32,
+    rank: f32,
+    scale: f32,
+) -> Result<Tensor> {
+    let (ds, us) = (down.dims(), up.dims());
+    if ds.len() != 4 || us.len() != 4 {
+        return Err(CandleError::Msg(format!(
+            "conv LoRA: expected 4-D factors (down [rank,in,kH,kW], up [out,rank,1,1]), got down \
+             {ds:?} up {us:?}"
+        )));
+    }
+    if us[1] != ds[0] {
+        return Err(CandleError::Msg(format!(
+            "conv LoRA: rank mismatch between factors — down[0]={} but up[1]={} (down {ds:?} up {us:?})",
+            ds[0], us[1]
+        )));
+    }
+    let (r, cin, kh, kw) = (ds[0], ds[1], ds[2], ds[3]);
+    let out = us[0];
+    let down2 = down.to_dtype(DType::F32)?.reshape((r, cin * kh * kw))?; // [rank, in·kH·kW]
+    let up2 = up.to_dtype(DType::F32)?.reshape((out, r))?; // [out, rank]
+    let ba = up2.matmul(&down2)?; // [out, in·kH·kW]
+    let eff = (alpha as f64 / rank as f64) * scale as f64;
+    Ok((ba * eff)?.reshape((out, cin, kh, kw))?)
+}
+
+/// Reconstruct a **LoHa** (LyCORIS Hadamard-product) weight delta `ΔW = scale · ((w1_a·w1_b) ⊙
+/// (w2_a·w2_b))` as an `[out, in]` **f32** tensor (sc-5225). Third-party LoHa decomposes a delta as the
+/// elementwise product of TWO low-rank products (vs LoKr's Kronecker). `w1_a`/`w2_a` are `[out, rank]`,
+/// `w1_b`/`w2_b` are `[rank, in]`; `scale` is the fully-effective multiplier (the lycoris `alpha/rank`
+/// times the caller's per-adapter strength). Mirrors LyCORIS `LohaModule.get_weight` / `HadaWeight`
+/// (`w1d=hada_w1_b, w1u=hada_w1_a`, so the product is `(hada_w1_a·hada_w1_b) ⊙ (hada_w2_a·hada_w2_b)`).
+///
+/// **Linear-only**: pass 2-D factors. The conv/tucker LoHa form (lycoris `use_cp`, `hada_t1`/`hada_t2`)
+/// is out of the candle SDXL adapter surface — like third-party LoKr, LoHa merges only into the
+/// attention/proj Linears (the conv surface is LoRA-only), so a conv-shaped LoHa is surfaced as skipped.
+pub fn reconstruct_loha_delta(
+    w1_a: &Tensor,
+    w1_b: &Tensor,
+    w2_a: &Tensor,
+    w2_b: &Tensor,
+    scale: f32,
+    base_shape: (usize, usize),
+) -> Result<Tensor> {
+    let f32d = |t: &Tensor| t.to_dtype(DType::F32);
+    let m1 = f32d(w1_a)?.matmul(&f32d(w1_b)?)?; // [out, rank]·[rank, in] → [out, in]
+    let m2 = f32d(w2_a)?.matmul(&f32d(w2_b)?)?;
+    let (out_f, in_f) = base_shape;
+    let delta = (m1 * m2)?.reshape((out_f, in_f))?;
+    Ok((delta * scale as f64)?)
+}
+
 /// Collect a target's factor tensors as CPU/f32 `(key, tensor)` save entries under `prefix`.
 fn factor_entries(set: &LoraSet, prefix: &str) -> Result<Vec<(String, Tensor)>> {
     let mut out = Vec::with_capacity(set.targets.len() * 3);
@@ -954,5 +1024,82 @@ mod tests {
         assert!(path_matches("a.b.attn1.to_out.0", "to_out.0"));
         assert!(!path_matches("a.b.attn1.to_qx", "to_q"));
         assert!(path_matches("to_q", "to_q"));
+    }
+
+    /// sc-5225: a 1×1 conv LoRA (rank 2, in 2, out 2). `down`/`up` are `[*, *, 1, 1]`; the fused delta
+    /// is `Σ_r up[o,r]·down[r,i]`, scaled by `alpha/rank`. Hand-computed independently (mirrors mlx):
+    ///   down2 = [[1,2],[3,4]] (rank,in); up2 = [[5,6],[7,8]] (out,rank)
+    ///   δ[0,0]=5·1+6·3=23  δ[0,1]=5·2+6·4=34  δ[1,0]=7·1+8·3=31  δ[1,1]=7·2+8·4=46
+    ///   eff = alpha/rank = 4/2 = 2 → [[46,68],[62,92]].
+    #[test]
+    fn conv_lora_delta_one_by_one_matches_hand_fold() {
+        let dev = Device::Cpu;
+        let down = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (2, 2, 1, 1), &dev).unwrap();
+        let up = Tensor::from_vec(vec![5.0f32, 6.0, 7.0, 8.0], (2, 2, 1, 1), &dev).unwrap();
+        let delta = conv_lora_delta(&down, &up, 4.0, 2.0, 1.0).unwrap();
+        assert_eq!(delta.dims(), &[2, 2, 1, 1]);
+        let got = delta.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(got, vec![46.0, 68.0, 62.0, 92.0]);
+    }
+
+    /// sc-5225: a k×k (here 2×2) conv LoRA with rank 1 reduces to `δ[o,i,y,x] = up[o]·down[0,i,y,x]` —
+    /// proving the spatial kernel is preserved (not collapsed). in=1, out=2.
+    ///   down[0,0,:,:] = [[1,2],[3,4]]; up = [10, 20]
+    ///   δ[0] = 10·[1,2,3,4] = [10,20,30,40];  δ[1] = 20·[...] = [20,40,60,80].
+    /// The user scale composes multiplicatively (scale 0 ⇒ a zero delta ⇒ no-op merge).
+    #[test]
+    fn conv_lora_delta_kxk_rank1_broadcasts_spatial_kernel() {
+        let dev = Device::Cpu;
+        let down = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (1, 1, 2, 2), &dev).unwrap();
+        let up = Tensor::from_vec(vec![10.0f32, 20.0], (2, 1, 1, 1), &dev).unwrap();
+        let delta = conv_lora_delta(&down, &up, 1.0, 1.0, 1.0).unwrap();
+        assert_eq!(delta.dims(), &[2, 1, 2, 2]);
+        let got = delta.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(got, vec![10.0, 20.0, 30.0, 40.0, 20.0, 40.0, 60.0, 80.0]);
+        let zero = conv_lora_delta(&down, &up, 1.0, 1.0, 0.0).unwrap();
+        let zmax = zero
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(zmax, 0.0, "scale 0 must give a zero conv delta");
+    }
+
+    /// A malformed conv LoRA with 2-D factors must surface a typed error, not panic on the kernel-dim
+    /// reshape; a rank mismatch between the factors is rejected too (mirrors mlx-gen's F-006).
+    #[test]
+    fn conv_lora_delta_rejects_non_4d_or_mismatched_rank() {
+        let dev = Device::Cpu;
+        let down2d = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (2, 2), &dev).unwrap();
+        let up = Tensor::from_vec(vec![10.0f32, 20.0], (2, 1, 1, 1), &dev).unwrap();
+        let err = conv_lora_delta(&down2d, &up, 1.0, 1.0, 1.0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("4-D factors"), "got: {err}");
+
+        let down = Tensor::from_vec(vec![1.0f32, 2.0], (1, 1, 1, 2), &dev).unwrap(); // rank 1
+        let up_bad = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (2, 2, 1, 1), &dev).unwrap(); // rank 2
+        let err = conv_lora_delta(&down, &up_bad, 1.0, 1.0, 1.0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rank mismatch"), "got: {err}");
+    }
+
+    /// sc-5225: the LoHa delta is `((w1_a·w1_b) ⊙ (w2_a·w2_b))·scale`. Hand-computed on a 2×2 base,
+    /// rank 1: w1_a=[1;2], w1_b=[3,4] ⇒ m1=[[3,4],[6,8]]; w2_a=[1;0], w2_b=[5,6] ⇒ m2=[[5,6],[0,0]];
+    /// m1⊙m2=[[15,24],[0,0]]; scale 0.5 ⇒ [[7.5,12],[0,0]].
+    #[test]
+    fn reconstruct_loha_delta_matches_hand_fold() {
+        let dev = Device::Cpu;
+        let w1a = Tensor::from_vec(vec![1.0f32, 2.0], (2, 1), &dev).unwrap();
+        let w1b = Tensor::from_vec(vec![3.0f32, 4.0], (1, 2), &dev).unwrap();
+        let w2a = Tensor::from_vec(vec![1.0f32, 0.0], (2, 1), &dev).unwrap();
+        let w2b = Tensor::from_vec(vec![5.0f32, 6.0], (1, 2), &dev).unwrap();
+        let delta = reconstruct_loha_delta(&w1a, &w1b, &w2a, &w2b, 0.5, (2, 2)).unwrap();
+        assert_eq!(delta.dims(), &[2, 2]);
+        let got = delta.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(got, vec![7.5, 12.0, 0.0, 0.0]);
     }
 }
