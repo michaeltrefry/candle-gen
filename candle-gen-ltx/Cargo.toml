@@ -1,0 +1,33 @@
+[package]
+name = "candle-gen-ltx"
+version = "0.0.0"
+edition = "2021"
+description = "LTX-2.3 (distilled 22B) text-to-video provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-ltx."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "video", "ltx", "inference"]
+categories = ["science"]
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+inventory = { workspace = true }
+# LTX-2.3 has NO candle-transformers reference: the AVTransformer3DModel video DiT, the
+# CausalVideoAutoencoder temporal VAE, the Gemma-3-12B text encoder + per-token-RMS aggregation +
+# 8-layer learnable-register connector, and the rectified-flow distilled scheduler are all written
+# here on candle-core/candle-nn (candle ships no conv3d — see `conv3d`). First slice is txt2video,
+# video-only (the audio stack, 2-stage latent upsampler, I2V, prompt-enhance, LoRA, and fp8/quant
+# paths are deferred to follow-up Shortcut stories).
+tokenizers = { workspace = true }
+# Deterministic CPU-seeded initial noise (sc-3673 parity).
+rand = { workspace = true }
+rand_distr = { workspace = true }
+
+[features]
+default = []
+metal = ["candle-gen/metal"]
+cuda = ["candle-gen/cuda"]
+flash-attn = ["candle-gen/flash-attn"]
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "95cd5c692b974ecaafa57c0af437f085b052e260" }

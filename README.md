@@ -84,6 +84,23 @@ calls the identical `Generator` / registry API regardless of which tensor backen
 > (sm_120): real 512² cat-walking clip + conformance suite pass; UMT5 / DiT / VAE forward passes are
 > **bit-exact** vs diffusers.
 >
+> **LTX-2.3 (distilled 22B) txt2video** is the sixth model-family expansion (epic 3692, sc-3698) — the
+> heaviest port: a **Gemma-3-12B** text encoder (48-layer GQA, alternating local/global RoPE, q/k-norm;
+> all 49 hidden states extracted) feeding a **per-token-RMS aggregation** (3840×49 → 188160) → text
+> projection → an 8-layer **learnable-register connector** (128 registers replace the left-pad), then
+> the 48-layer **`AVTransformer3DModel`** video DiT (**split 3-D RoPE** with per-head float64 freqs,
+> per-head **2·sigmoid gated** attention, adaLN-single 9-row modulation, prompt-adaLN text conditioning),
+> and the **`CausalVideoAutoencoder`** temporal VAE (latent 128-ch, patch 4, 8× temporal / 32× spatial;
+> pixel-norm; depth-to-space upsampling). Single flat 22B safetensors bundles DiT + VAE + projection +
+> connector; the Gemma encoder is a separate snapshot (`LTX_GEMMA_DIR`). Since candle ships **no conv3d**,
+> the VAE causal Conv3d is summed conv2d taps with frame-replication temporal pad
+> (`candle-gen-ltx/src/conv3d.rs`). **Rectified-flow** distilled scheduler (fixed 8-step σ schedule, no
+> CFG — guidance is distilled in). DiT + connector + projection + Gemma run **bf16** (22B+12B doesn't fit
+> f32 on one 96 GB GPU), the VAE **f32**, attention/norms upcast to f32. txt2video-only first slice — the
+> **audio stack** (audio-VAE + vocoder + AV-joint DiT), the 2-stage latent upsampler, I2V conditioning,
+> prompt-enhance, LoRA/IC-LoRA, and fp8/quant are deferred. **GPU-verified** on RTX PRO 6000 (sm_120):
+> real cat-walking clip renders coherently on the first visual try.
+>
 > **candle pinned to git main (post-0.10.2)** — REQUIRED for Blackwell sm_120. The crates.io 0.10.2
 > release throws `CUDA_ERROR_INVALID_PTX` at the first candle-kernels kernel whenever
 > candle-transformers is linked (SDXL + Z-Image both; plain candle-core works). The git rev clears it
@@ -101,6 +118,7 @@ candle-gen/                 # workspace root
   candle-gen-flux2/         # FLUX.2-klein-9B provider crate: from-scratch MMDiT + Qwen3 + AutoencoderKL-Flux2
   candle-gen-qwen-image/    # Qwen-Image provider crate: from-scratch 60-layer MMDiT + Qwen2.5-VL + causal-Conv3d VAE
   candle-gen-wan/           # Wan2.2 TI2V-5B video provider crate: WanTransformer3DModel + UMT5-XXL + temporal AutoencoderKLWan (from-scratch conv3d)
+  candle-gen-ltx/           # LTX-2.3 (distilled 22B) video provider crate: AVTransformer3DModel DiT + Gemma-3-12B encoder + connector + CausalVideoAutoencoder (from-scratch conv3d)
   scripts/
     check-gen-core-skew.sh  # version-skew gate: fails if >1 sceneworks-gen-core resolves
     check-cuda.ps1          # local cuda gate: vcvars + cargo build/test --features cuda (run pre-push)

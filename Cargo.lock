@@ -244,6 +244,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-ltx"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "image",
+ "inventory",
+ "rand",
+ "rand_distr",
+ "sceneworks-gen-core-testkit",
+ "tokenizers 0.22.2",
+]
+
+[[package]]
 name = "candle-gen-qwen-image"
 version = "0.0.0"
 dependencies = [
