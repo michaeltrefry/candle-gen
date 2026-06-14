@@ -1,0 +1,35 @@
+[package]
+name = "candle-gen-prompt-refine"
+version = "0.0.0"
+edition = "2021"
+description = "Prompt-refinement instruction LLM (Llama-3.2-3B-Instruct) provider for candle-gen — implements the gen-core TextLlm contract off-Mac (Windows/CUDA). Retires the worker's prompt_refine.py."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "llama", "llm", "inference"]
+categories = ["science"]
+
+[dependencies]
+# Core crate — re-exports gen_core + candle, so this provider links exactly one gen-core / candle
+# build (single resolution; see scripts/check-gen-core-skew.sh).
+candle-gen = { path = "../candle-gen" }
+# Link-time self-registration into gen-core's TextLlm registry (the `inventory::submit!` below).
+inventory = { workspace = true }
+# Llama-3.2 is fully supported here (rope-scaling auto from config.json) + the LogitsProcessor
+# sampling loop. Backend features pass through from this crate's features so it shares candle-gen's
+# exact candle build.
+candle-transformers = { workspace = true }
+# Parse the snapshot's `config.json` into candle-transformers' `LlamaConfig`.
+serde_json = { workspace = true }
+
+[features]
+default = []
+metal = ["candle-gen/metal", "candle-transformers/metal"]
+cuda = ["candle-gen/cuda", "candle-transformers/cuda"]
+flash-attn = ["candle-gen/flash-attn", "candle-transformers/flash-attn"]
+
+[dev-dependencies]
+# gen-core conformance suite (sc-4481): drives this provider through the public TextLlm contract
+# (validate / progress / typed cancellation / registry). Pinned to the SAME gen-core rev the
+# workspace pins. Used by tests/conformance.rs (#[ignore]d — it runs a real generate, so it needs a
+# Llama-3.2-3B snapshot + a device).
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "af190c73c155cc6c43d1586833f0f128c109f455" }
