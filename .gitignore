@@ -30,3 +30,7 @@ dist-*/
 # Example smoke-driver outputs (txt2img example writes these at the repo root)
 *_smoke.png
 *_smoke.meta.txt
+
+# Smoke-example output artifacts (examples/sensenova-*.rs write to CWD)
+/sensenova-interleave-*.png
+/sensenova-out.png
