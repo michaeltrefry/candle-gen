@@ -234,6 +234,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-face"
+version = "0.0.0"
+dependencies = [
+ "candle-core",
+ "candle-gen",
+ "candle-nn",
+]
+
+[[package]]
 name = "candle-gen-flux"
 version = "0.0.0"
 dependencies = [
@@ -2494,7 +2503,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-gen-core"
 version = "0.1.0"
-source = "git+https://github.com/michaeltrefry/mlx-gen?rev=d3ec5e5e97ba3c0e71a49a001f2b8a975451bb76#d3ec5e5e97ba3c0e71a49a001f2b8a975451bb76"
+source = "git+https://github.com/michaeltrefry/mlx-gen?rev=3e421ece7dcfb20f2899811be37ec48f9abc45f7#3e421ece7dcfb20f2899811be37ec48f9abc45f7"
 dependencies = [
  "inventory",
  "safetensors 0.4.5",
@@ -2506,7 +2515,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-gen-core-testkit"
 version = "0.1.0"
-source = "git+https://github.com/michaeltrefry/mlx-gen?rev=d3ec5e5e97ba3c0e71a49a001f2b8a975451bb76#d3ec5e5e97ba3c0e71a49a001f2b8a975451bb76"
+source = "git+https://github.com/michaeltrefry/mlx-gen?rev=3e421ece7dcfb20f2899811be37ec48f9abc45f7#3e421ece7dcfb20f2899811be37ec48f9abc45f7"
 dependencies = [
  "sceneworks-gen-core",
 ]
