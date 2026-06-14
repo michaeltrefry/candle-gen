@@ -1,0 +1,44 @@
+[package]
+name = "candle-gen-sensenova"
+version = "0.0.0"
+edition = "2021"
+description = "SenseNova-U1 (NEO-Unify: dual-path Qwen3 MoT backbone + flow-matching image head) provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-sensenova."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "diffusion", "sensenova", "inference"]
+categories = ["science"]
+
+[dependencies]
+# Core crate — re-exports gen_core + candle, so this provider links exactly one gen-core / candle
+# build (single resolution; see scripts/check-gen-core-skew.sh).
+candle-gen = { path = "../candle-gen" }
+# Link-time self-registration into gen-core's model registry (the `inventory::submit!`).
+inventory = { workspace = true }
+# Qwen2/3 byte-level BPE tokenizer with the NEO-Unify added tokens. The fast `tokenizer.json` is
+# loaded from the snapshot (materialized by SenseNova's `tools/build_sensenova_tokenizer.py`,
+# mirroring the mlx provider); this crate builds the neo1_0 prompt strings itself.
+tokenizers = { workspace = true }
+# `config.json` parsing (the `neo_chat` layout) — same `serde_json::Value` convention as the other
+# providers (no serde derive).
+serde_json = { workspace = true }
+# Deterministic CPU-seeded initial noise (sc-3673 parity) — NOT candle's CUDA `randn`.
+rand = { workspace = true }
+rand_distr = { workspace = true }
+
+[features]
+# Pass the backend selection through to the core crate so a downstream `--features metal`/`cuda` on
+# this provider crate selects the matching candle backend everywhere.
+default = []
+metal = ["candle-gen/metal"]
+cuda = ["candle-gen/cuda"]
+flash-attn = ["candle-gen/flash-attn"]
+
+[dev-dependencies]
+# `examples/sensenova-txt2img.rs` smoke driver only — encode the produced `gen_core::Image` (RGB8) to
+# PNG so a real GPU run can be eyeballed. Not a library dependency (the worker owns asset writes).
+image = { version = "0.25", default-features = false, features = ["png"] }
+# gen-core conformance suite (sc-4481): drives this provider through the public Generator contract
+# (cancel / progress / seed-determinism / capability honesty). Pinned to the SAME gen-core rev the
+# workspace pins so it shares one contract build. Used by tests/conformance.rs (cuda-gated,
+# #[ignore]d — it runs a real generate, so it needs weights + GPU).
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "af190c73c155cc6c43d1586833f0f128c109f455" }

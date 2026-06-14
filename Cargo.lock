@@ -362,6 +362,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-sensenova"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "image",
+ "inventory",
+ "rand",
+ "rand_distr",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "tokenizers 0.22.2",
+]
+
+[[package]]
 name = "candle-gen-wan"
 version = "0.0.0"
 dependencies = [
