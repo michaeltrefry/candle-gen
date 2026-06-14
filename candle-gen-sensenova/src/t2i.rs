@@ -448,8 +448,11 @@ impl T2iModel {
     /// ImageNet-normalise a source RGB image `[3, H, W]` (f32 in `[0, 1]`) and channel-first patchify
     /// to `[grid_h·grid_w, 3·ps²]` for the understanding vision embedder. Returns the patches and the
     /// `(grid_h, grid_w)` patch grid. `H`/`W` must be multiples of `patch·merge` (use
-    /// [`smart_resize`] upstream). Mirrors the reference `load_image_native` (ToTensor + Normalize) +
-    /// `preprocess_pixel_values`.
+    /// [`smart_resize`] upstream). The input may live on any device — it is moved to the model's
+    /// device first (the worker builds VQA / interleave inputs on CPU; candle treats every
+    /// `Device::new_cuda(0)` handle as distinct, so mixing a foreign-device input with the model's
+    /// tensors would otherwise error). Mirrors the reference `load_image_native` (ToTensor +
+    /// Normalize) + `preprocess_pixel_values`.
     pub fn preprocess_image(&self, rgb: &Tensor) -> CResult<(Tensor, (usize, usize))> {
         let (c, h, w) = rgb.dims3()?;
         if c != 3 {
@@ -463,6 +466,10 @@ impl T2iModel {
                 "sensenova: source image H/W must be multiples of {cell}, got {h}x{w}"
             )));
         }
+        // Relocate to the model's device + dtype (a no-op for the on-device append path).
+        let rgb = rgb
+            .to_device(&self.device)?
+            .to_dtype(candle_gen::candle_core::DType::F32)?;
         let mean = Tensor::from_vec(vec![0.485f32, 0.456, 0.406], (3, 1, 1), &self.device)?;
         let std = Tensor::from_vec(vec![0.229f32, 0.224, 0.225], (3, 1, 1), &self.device)?;
         let norm = rgb.broadcast_sub(&mean)?.broadcast_div(&std)?;
