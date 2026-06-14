@@ -26,14 +26,16 @@ use std::path::Path;
 
 use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::{Linear, Module, VarBuilder};
+use rand::distr::Uniform;
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::{CandleError, Result};
 
-/// PEFT gaussian-init standard deviation for the LoRA `A` / LoKr `w1` factor (diffusers/PEFT
-/// `init_lora_weights="gaussian"` and LyCORIS `init_weights` both use 0.02). The second leg (`B`, or
-/// the LoKr `w2`/`w2_b`) starts at zero, so the adapter is the identity at step 0.
+/// PEFT gaussian-init standard deviation for the **LoRA** `A` factor (diffusers/PEFT
+/// `init_lora_weights="gaussian"` uses 0.02); the LoRA `B` leg starts at zero, so the LoRA is the
+/// identity at step 0. (LoKr no longer uses this — sc-5179 moved its init to PEFT's zero-`w1` /
+/// kaiming-`w2` `reset_adapter_parameters`; see [`build_lokr_targets`].)
 const INIT_STD: f32 = 0.02;
 
 /// The SDXL default LoRA target suffixes — the attention projections (matches the torch
@@ -354,6 +356,19 @@ fn zero_var(rows: usize, cols: usize, device: &Device) -> Result<Var> {
     )?)?)
 }
 
+/// Deterministic kaiming-uniform factor init matching `torch.nn.init.kaiming_uniform_(a=√5)`:
+/// `U(±1/√fan_in)` with `fan_in = cols` (gain `√(2/(1+5)) = 1/√3`, bound `√3·gain/√fan_in = 1/√fan_in`).
+/// Same seeded-CPU-`StdRng` portability as [`gaussian_var`] (sc-5179, the LoKr second-factor init).
+fn kaiming_uniform_var(rows: usize, cols: usize, rng: &mut StdRng, device: &Device) -> Result<Var> {
+    let bound = 1.0f32 / (cols as f32).sqrt();
+    // `bound > 0` always (cols ≥ 1), so the range is well-formed; `new_inclusive` only errs on an
+    // empty/NaN range.
+    let dist = Uniform::new_inclusive(-bound, bound).expect("valid kaiming-uniform bounds");
+    let data: Vec<f32> = (0..rows * cols).map(|_| dist.sample(rng)).collect();
+    let t = Tensor::from_vec(data, (rows, cols), &Device::Cpu)?.to_device(device)?;
+    Ok(Var::from_tensor(&t)?)
+}
+
 /// Install LoRA adapters on `host` for every adaptable projection whose path matches one of
 /// `target_suffixes`. `A ~ N(0, 0.02²)` `[rank, in]`, `B = 0` `[out, rank]` (identity at step 0).
 /// Factors are f32 on `device`; init is seeded by `seed` for reproducibility.
@@ -406,11 +421,16 @@ pub fn build_lora_targets(
     })
 }
 
-/// Install LoKr adapters on `host` for every matching projection. The weight `[out,in]` factors as
-/// `kron(w1[out_a,in_a], w2[out_b,in_b])`; `w2` is low-ranked to `rank` when `rank < min(out_b,in_b)`.
-/// `w1 ~ N(0,0.02)`; the second leg is zero-init (`w2` full, or `w2_b` low-rank) so the initial delta
-/// is exactly 0. `decompose_factor` (`-1` = auto) is the block-split knob. Mirrors the MLX
-/// `build_lokr_targets` (init + key layout); the residual is reconstructed at f32 (SDXL path).
+/// Install LoKr adapters on `host` for every matching projection, matching **PEFT
+/// `LoKrConfig(init_weights=True)`'s `reset_adapter_parameters`** (sc-5179) so a Python LoKr learning
+/// rate transfers. The weight `[out,in]` factors as `kron(w1[out_a,in_a], w2[out_b,in_b])`; `w2` is
+/// low-ranked to `rank` when `rank < max(out_b,in_b)/2` (PEFT's `use_w2`). The **first** factor `w1` is
+/// **zero-init**; the **second** factor `w2` (full, or both `w2_a`/`w2_b` low-rank) is **kaiming-uniform
+/// `a=√5`** ⇒ `U(±1/√fan_in)`. The zeroed factor is `w1`, so the initial delta `kron(0, w2)·scale = 0`.
+/// `decompose_factor` (`-1` = auto) is the block-split knob. Mirrors the MLX `build_lokr_targets`
+/// (sc-5179); the residual is reconstructed at f32 (SDXL path). NOTE: replaced the prior `w1 ~ N(0,0.02)`
+/// / zeroed-`w2` init (opposite zeroed factor + a fixed ~4-5× smaller scale), which forced a ~10× higher,
+/// non-transferable LoKr lr; the save/round-trip format is unchanged so prior adapters still load.
 pub fn build_lokr_targets(
     host: &mut dyn LoraHost,
     target_suffixes: &[String],
@@ -437,14 +457,16 @@ pub fn build_lokr_targets(
         let (out_a, out_b) = factorization(out_f, decompose_factor);
         let (in_a, in_b) = factorization(in_f, decompose_factor);
 
-        let w1 = gaussian_var(out_a, in_a, INIT_STD, &mut rng, device)?;
+        // w1 = zeros [out_a, in_a] — the zeroed factor, so the initial delta is exactly 0 (PEFT).
+        let w1 = zero_var(out_a, in_a, device)?;
         vars.push(w1.clone());
         let mut factors: Vec<(&'static str, Var)> = vec![("lokr_w1", w1.clone())];
 
-        let runtime_w2 = if r < out_b.min(in_b) {
-            // Low-rank w2 = w2_a @ w2_b; w2_b zero-init ⇒ delta starts at 0.
-            let w2a = gaussian_var(out_b, r, INIT_STD, &mut rng, device)?;
-            let w2b = zero_var(r, in_b, device)?;
+        // PEFT `use_w2 = not(r < max(out_b,in_b)/2)`: low-rank w2 = w2_a @ w2_b only below half the
+        // larger factor dim, else a full w2. Both factors are kaiming-init (the delta is held at 0 by w1).
+        let runtime_w2 = if (r as f32) < (out_b.max(in_b) as f32) / 2.0 {
+            let w2a = kaiming_uniform_var(out_b, r, &mut rng, device)?; // fan_in = r
+            let w2b = kaiming_uniform_var(r, in_b, &mut rng, device)?; // fan_in = in_b
             vars.push(w2a.clone());
             vars.push(w2b.clone());
             factors.push(("lokr_w2_a", w2a.clone()));
@@ -454,8 +476,7 @@ pub fn build_lokr_targets(
                 b: w2b.as_tensor().clone(),
             }
         } else {
-            // Full w2, zero-init.
-            let w2 = zero_var(out_b, in_b, device)?;
+            let w2 = kaiming_uniform_var(out_b, in_b, &mut rng, device)?; // fan_in = in_b
             vars.push(w2.clone());
             factors.push(("lokr_w2", w2.clone()));
             LokrW2::Full(w2.as_tensor().clone())
@@ -851,6 +872,73 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert_eq!(y, vec![3.0, 5.0]);
+    }
+
+    /// sc-5179 — the native LoKr init must match PEFT `LoKrConfig(init_weights=True)`'s
+    /// `reset_adapter_parameters` (w1 zero-init, w2 kaiming-uniform `a=√5`), mirroring the MLX
+    /// `build_lokr_init_matches_peft_reset_adapter_parameters`, so a Python LoKr lr transfers.
+    #[test]
+    fn build_lokr_init_matches_peft_reset_adapter_parameters() {
+        struct OneHost(LoraLinear);
+        impl LoraHost for OneHost {
+            fn visit_lora_mut(
+                &mut self,
+                f: &mut dyn FnMut(&mut LoraLinear) -> Result<()>,
+            ) -> Result<()> {
+                f(&mut self.0)
+            }
+        }
+        // out=64 → fac(-1)=(8,8); in=48 → (6,8). out_b = in_b = 8. rank 3 < max(8,8)/2 = 4 → low-rank.
+        let w = Tensor::zeros((64, 48), DType::F32, &Device::Cpu).unwrap();
+        let lin = LoraLinear::from_linear(Linear::new(w, None), 48, 64, "w".into());
+        let mut host = OneHost(lin);
+        let set =
+            build_lokr_targets(&mut host, &["w".to_string()], 3, 3.0, -1, 7, &Device::Cpu).unwrap();
+        assert_eq!(set.targets.len(), 1);
+        let factors = &set.targets[0].factors;
+        let get = |name: &str| {
+            factors
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.as_tensor().clone())
+        };
+        let maxabs = |t: &Tensor| {
+            t.abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+        };
+
+        // w1 is the ZEROED factor (PEFT), shape [out_a=8, in_a=6].
+        let w1 = get("lokr_w1").expect("lokr_w1");
+        assert_eq!(w1.dims(), &[8, 6]);
+        assert_eq!(
+            maxabs(&w1),
+            0.0,
+            "w1 must be zero-init (PEFT), not N(0,0.02)"
+        );
+
+        // w2 is low-rank kaiming: no full w2; w2_a [8,3] bound 1/√3, w2_b [3,8] bound 1/√8.
+        assert!(
+            get("lokr_w2").is_none(),
+            "rank 3 < max(8,8)/2 → low-rank w2"
+        );
+        let w2a = get("lokr_w2_a").expect("lokr_w2_a");
+        let w2b = get("lokr_w2_b").expect("lokr_w2_b");
+        let bound_a = 1.0f32 / 3f32.sqrt(); // ≈ 0.577
+        let bound_b = 1.0f32 / 8f32.sqrt(); // ≈ 0.354
+        assert!(
+            maxabs(&w2a) <= bound_a + 1e-6 && maxabs(&w2a) > bound_a * 0.3,
+            "w2_a must be kaiming U(±1/√rank): max {} vs bound {bound_a}",
+            maxabs(&w2a)
+        );
+        assert!(
+            maxabs(&w2b) <= bound_b + 1e-6 && maxabs(&w2b) > bound_b * 0.3,
+            "w2_b must be kaiming U(±1/√in_b): max {} vs bound {bound_b}",
+            maxabs(&w2b)
+        );
     }
 
     /// LoKr residual on a 1×1 base: out=in=1 factor as (1,1)⊗(1,1); ΔW = scale·(w1·w2). base 0,
