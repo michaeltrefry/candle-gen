@@ -32,4 +32,4 @@ flash-attn = ["candle-gen/flash-attn", "candle-transformers/flash-attn"]
 # (validate / progress / typed cancellation / registry). Pinned to the SAME gen-core rev the
 # workspace pins. Used by tests/conformance.rs (#[ignore]d — it runs a real generate, so it needs a
 # Llama-3.2-3B snapshot + a device).
-sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "af190c73c155cc6c43d1586833f0f128c109f455" }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "db08076c1195f4a648ad336252f680e62d04716b" }

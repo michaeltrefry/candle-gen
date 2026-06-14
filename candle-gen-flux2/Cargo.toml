@@ -42,4 +42,4 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # gen-core conformance suite (sc-4481): drives this provider through the public Generator contract.
 # Pinned to the SAME gen-core rev the workspace pins (e9c569c2). Used by tests/conformance.rs
 # (cuda-gated, #[ignore]d — it runs a real generate, so it needs weights + GPU).
-sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "af190c73c155cc6c43d1586833f0f128c109f455" }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "db08076c1195f4a648ad336252f680e62d04716b" }
