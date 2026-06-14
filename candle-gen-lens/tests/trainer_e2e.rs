@@ -4,12 +4,14 @@
 //! flow-match (no-negation) objective with the gpt-oss text front-end.
 //!
 //! `#[ignore]`d + `cfg(feature = "cuda")` — needs the real Lens snapshot (the HF cache, or
-//! `LENS_BASE_SNAPSHOT`, including the ~40 GB gpt-oss encoder) and a CUDA GPU. On the Windows/Blackwell
-//! box (v143 vcvars + CUDA on PATH):
+//! `LENS_BASE_SNAPSHOT`, including the ~40 GB gpt-oss encoder) and a CUDA GPU. **Run serially**
+//! (`--test-threads=1`): each test loads the ~40 GB encoder (the determinism test, two runs), so the
+//! cargo-default parallel runner would try to hold several at once and OOM even a 96 GB card. On the
+//! Windows/Blackwell box (v143 vcvars + CUDA on PATH):
 //!
 //! ```text
 //! set LENS_BASE_SNAPSHOT=C:\Users\…\models--microsoft--Lens\snapshots\<hash>
-//! cargo test -p candle-gen-lens --features cuda --release --test trainer_e2e -- --ignored --nocapture
+//! cargo test -p candle-gen-lens --features cuda --release --test trainer_e2e -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! What it proves:
