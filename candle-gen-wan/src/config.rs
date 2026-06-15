@@ -221,6 +221,52 @@ pub const I2V_14B_GUIDANCE_HIGH: f32 = 3.5;
 /// Resolution cap for I2V (and the 5B): the long edge × short edge must fit `704·1280`.
 pub const MAX_AREA_14B: usize = 704 * 1280;
 
+// ===========================================================================================
+// Wan-VACE (Wan2.1-VACE-14B) — controllable video (replace_person / extend / bridge)
+// ===========================================================================================
+
+/// Registry id for the Wan-VACE controllable-video model. Matches the `mlx-gen-wan` `wan_vace`
+/// descriptor so a consumer resolves the same engine across backends. VACE is **mode-agnostic** at
+/// the engine boundary (diffusers `WanVACEPipeline`): the worker builds the per-mode control video +
+/// mask (replace_person / extend / bridge) and passes one `ControlClip`; the provider VAE-encodes the
+/// 96-channel control latent and runs the CFG VACE denoise.
+pub const MODEL_ID_VACE: &str = "wan_vace";
+
+/// VACE defaults (Wan2.1-VACE-14B: UniPC, flow-shift 5.0, guidance 5.0, 50 steps, 16 fps). The worker
+/// overrides steps / guidance / shift / fps per request.
+pub const DEFAULT_STEPS_VACE: u32 = 50;
+pub const DEFAULT_GUIDANCE_VACE: f32 = 5.0;
+pub const VACE_FLOW_SHIFT: f64 = 5.0;
+pub const DEFAULT_FPS_VACE: u32 = 16;
+pub const DEFAULT_FRAMES_VACE: u32 = 81;
+
+/// `WanVACETransformer3DModel` config: the dimension-parametric Wan DiT ([`TransformerConfig`]) plus the
+/// two VACE-only fields. The base dims are the Wan2.1-14B preset (z16 VAE, stride 4×8×8, dim 5120, 40
+/// layers); the noisy latent enters the patch embedding as 16 channels (VACE conditioning rides the
+/// separate control path, **not** a channel-concat like I2V). Mirrors `mlx-gen-wan`'s `WanVaceConfig`.
+#[derive(Clone, Debug)]
+pub struct WanVaceConfig {
+    /// The base Wan DiT dims (dim, heads, layers, ffn, patch, eps, rope …) — Wan2.1-14B.
+    pub base: TransformerConfig,
+    /// Which main-block indices receive a VACE control hint (diffusers default
+    /// `[0, 5, 10, 15, 20, 25, 30, 35]`; must include 0 so `vace_blocks.0` carries `proj_in`).
+    pub vace_layers: Vec<usize>,
+    /// The control-latent channel count (diffusers default 96 = 32 video latent + 64 mask unfold).
+    pub vace_in_channels: usize,
+}
+
+impl WanVaceConfig {
+    /// Wan2.1-VACE-14B defaults (the real checkpoint: 40 layers, dim 5120, 8 vace blocks, 96 control
+    /// channels). The base preset is the 14B T2V DiT (in/out 16) — VACE adds the control path on top.
+    pub fn vace_14b() -> Self {
+        Self {
+            base: TransformerConfig::t2v_14b(),
+            vace_layers: vec![0, 5, 10, 15, 20, 25, 30, 35],
+            vace_in_channels: 96,
+        }
+    }
+}
+
 /// `UMT5EncoderModel` (`google/umt5-xxl`) dims.
 #[derive(Clone, Copy, Debug)]
 pub struct TextEncoderConfig {

@@ -411,7 +411,7 @@ fn i2v_reference(req: &GenerationRequest) -> Option<&Image> {
 /// Preprocess an I2V conditioning [`Image`] to `[1, 3, 1, height, width]` f32 in `[-1, 1]`: a cover-fit
 /// resize (`scale = max(W/iw, H/ih)`) + center-crop to the target, then `px/255·2 − 1`. Uses **bilinear**
 /// resampling (the reference's PIL-exact LANCZOS, for bit-exact MLX parity, is a follow-up — sc-5174).
-fn preprocess_i2v_image(
+pub(crate) fn preprocess_i2v_image(
     image: &Image,
     width: u32,
     height: u32,

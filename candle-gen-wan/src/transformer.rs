@@ -128,7 +128,7 @@ impl Ffn {
     }
 }
 
-struct Block {
+pub(crate) struct Block {
     scale_shift_table: Tensor, // [1,6,dim] f32
     attn1: Attention,
     norm2_w: Tensor, // affine cross-attn norm
@@ -139,7 +139,7 @@ struct Block {
 }
 
 impl Block {
-    fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
             scale_shift_table: vb
                 .get((1, 6, cfg.dim), "scale_shift_table")?
@@ -157,7 +157,7 @@ impl Block {
     }
 
     /// `hidden`: `[B,S,dim]` (bf16); `temb6`: `[B,6,dim]` (f32); `context`: `[B,S_ctx,dim]` (bf16).
-    fn forward(
+    pub(crate) fn forward(
         &self,
         hidden: &Tensor,
         temb6: &Tensor,
