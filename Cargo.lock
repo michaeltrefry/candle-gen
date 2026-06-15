@@ -396,6 +396,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-svd"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "image",
+ "inventory",
+ "rand",
+ "rand_distr",
+ "sceneworks-gen-core-testkit",
+]
+
+[[package]]
 name = "candle-gen-wan"
 version = "0.0.0"
 dependencies = [
