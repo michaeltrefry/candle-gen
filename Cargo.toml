@@ -33,7 +33,11 @@ resolver = "2"
 # gen-core delta is `train.rs` +39 additive lines (new `TrainingConfig` sample_* fields with
 # defaults + a `TrainingProgress::Sample` variant) — candle-gen has no trainers, so no surface
 # change; this is purely the alignment the worker's candle lane needs to resolve ONE gen-core rev.
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "24c89c90476279a4e47533202111ca19e40a46d5" }
+# Bumped `24c89c9` -> `40063d5` (sc-5491, epic 5480): the worker's mlx-gen pin moved again
+# (mlx-gen #460 smokes + #461 SCAIL-2 Q4 + #462 sc-5451 SCAIL-2 inference LoRA), so re-pin in lockstep
+# to keep the worker's `--features backend-candle` lane on ONE gen-core rev. gen-core is BYTE-IDENTICAL
+# `24c89c9` -> `40063d5` (the range is pure mlx-gen-scail2 Rust); zero candle surface change.
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "40063d565ed0827e4383cd4392841a0f1a733c12" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels
