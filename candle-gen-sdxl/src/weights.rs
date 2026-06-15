@@ -25,10 +25,20 @@ impl Weights {
         let raw = cst::load(path, device)?;
         let mut map = HashMap::with_capacity(raw.len());
         for (k, v) in raw {
-            let v = if v.dtype() == dtype {
-                v
-            } else {
+            // Only re-cast FLOATING tensors to the compute dtype. Integer buffers — e.g. the CLIP
+            // image encoder's I64 `position_ids` (`h94/IP-Adapter` `models/image_encoder`) — are left
+            // as-is: casting an int index buffer to f16 is meaningless, and on CUDA (sm_120) the
+            // int→f16 cast kernel isn't compiled, so `to_dtype` there fails with
+            // `DriverError(CUDA_ERROR_NOT_FOUND, "named symbol not found")` (sc-5488). The consumers
+            // here only `require()` the float weights, so the untouched buffer is simply never read.
+            let is_float = matches!(
+                v.dtype(),
+                DType::F16 | DType::BF16 | DType::F32 | DType::F64
+            );
+            let v = if is_float && v.dtype() != dtype {
                 v.to_dtype(dtype)?
+            } else {
+                v
             };
             map.insert(k, v);
         }

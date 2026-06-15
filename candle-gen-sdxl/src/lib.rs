@@ -47,7 +47,12 @@ pub use adapters::{merge_adapters, MergeReport};
 // IP-Adapter (sc-5491, epic 5480): the perceiver `Resampler` (`image_proj.*` → image/identity tokens)
 // + the decoupled cross-attn K/V pairs (`ip_adapter.*`), the candle twin of `mlx-gen-sdxl::ip_adapter`.
 // Built here (not in the InstantID glue crate) so the SDXL IP-Adapter-Plus path (sc-5488) reuses them.
+// sc-5488 adds the CLIP-ViT image preprocessing + the `IpImageEncoder` (CLIP image encoder → Resampler).
 pub mod ip_adapter;
+// CLIP ViT vision tower (sc-5488) — the IP-Adapter image encoder (ViT-H/14 for SDXL, ViT-L/14-336 for
+// Kolors), the one net-new model the general IP-Adapter port needs (candle-gen had only the text CLIP).
+pub mod vision_encoder;
+pub use vision_encoder::{ClipVisionEncoder, VisionConfig};
 // A small safetensors key→Tensor map for the IP-Adapter / ControlNet loads (non-VarBuilder weights).
 pub mod weights;
 
@@ -85,6 +90,19 @@ pub use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 // The vendored UNet itself, re-exported so the `candle-gen-instantid` glue can hold one + drive its
 // InstantID surface (install_ip_adapter / set_ip_context / forward_instantid via the denoise loop).
 pub use unet::UNet2DConditionModel;
+
+// SDXL IP-Adapter-Plus reference-image provider (sc-5488, epic 5480) — the [`ip_adapter`] +
+// [`denoise`] stack composed without a face embedder / ControlNet: CLIP ViT-H image tokens → pure-IP
+// denoise. The reference-conditioning sibling of the InstantID glue crate, but for plain SDXL/RealVisXL.
+pub mod ip_provider;
+pub use ip_provider::{
+    IpAdapterSdxl, IpAdapterSdxlPaths, IpAdapterSdxlRequest, DEFAULT_IP_ADAPTER_SCALE,
+};
+
+/// SDXL IP-Adapter-Plus real-weight GPU validation (sc-5488) — env-driven, `#[ignore]`d integration
+/// test (the analog of the InstantID Phase-5 harness).
+#[cfg(test)]
+mod ip_validate;
 
 // Vendored, training-adapted SDXL UNet + VAE-encode stack (sc-5165) — used by the native LoRA/LoKr
 // trainer below. Inference continues to use the stock candle-transformers UNet via `pipeline`; the

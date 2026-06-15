@@ -14,12 +14,15 @@
 //! unlike the conv face/UNet models — there is NO NHWC↔NCHW transpose: the Tencent weight layout ports
 //! 1:1 onto `candle_nn::Linear` ( `[out, in]` weights, `x @ Wᵀ` ).
 
-use candle_core::{DType, Tensor, D};
+use candle_core::{DType, Device, Tensor, D};
 use candle_nn::ops::softmax;
 use candle_nn::{LayerNorm, Linear, Module};
 
+use candle_gen::gen_core::imageops::resize_bicubic_u8;
+use candle_gen::gen_core::Image;
 use candle_gen::{CandleError, Result};
 
+use crate::vision_encoder::ClipVisionEncoder;
 use crate::weights::Weights;
 
 /// LayerNorm epsilon — the Tencent Resampler's `nn.LayerNorm` default (matches mlx-gen-sdxl).
@@ -314,6 +317,95 @@ pub fn load_ip_kv_pairs(w: &Weights) -> Result<Vec<(Tensor, Tensor)>> {
         .collect()
 }
 
+/// CLIP ViT image preprocessing for IP-Adapter (`CLIPImageProcessor`): resize the shortest side to
+/// `size` (PIL bicubic, the shared [`resize_bicubic_u8`]), center-crop `size`×`size`, rescale
+/// `[0,255]→[0,1]`, normalize by the CLIP mean/std. Returns candle **NCHW** `[1, 3, size, size]` f32
+/// (vs the MLX port's NHWC). `size` is 224 for the ViT-H / ViT-L-224 towers, **336** for the Kolors
+/// ViT-L/14-336 tower.
+#[allow(clippy::excessive_precision)] // canonical CLIP mean/std (f32 rounds the last digit)
+pub fn preprocess_clip_image_sized(image: &Image, size: usize, device: &Device) -> Result<Tensor> {
+    const MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
+    const STD: [f32; 3] = [0.268_629_54, 0.261_302_58, 0.275_777_11];
+    let (iw, ih) = (image.width as usize, image.height as usize);
+    if image.pixels.len() != iw * ih * 3 {
+        return Err(CandleError::Msg(format!(
+            "ip-adapter image buffer {} != {iw}x{ih}x3",
+            image.pixels.len()
+        )));
+    }
+    if iw == 0 || ih == 0 {
+        return Err(CandleError::Msg(format!(
+            "ip-adapter reference image has a zero dimension ({iw}x{ih})"
+        )));
+    }
+    // Resize shortest side to `size` (bicubic), preserving aspect.
+    let scale = size as f64 / iw.min(ih) as f64;
+    let rw = ((iw as f64 * scale).round() as usize).max(size);
+    let rh = ((ih as f64 * scale).round() as usize).max(size);
+    let resized = resize_bicubic_u8(&image.pixels, ih, iw, rh, rw); // HWC f32 [0,255]
+                                                                    // Center-crop size×size, normalize, lay out CHW.
+    let top = (rh - size) / 2;
+    let left = (rw - size) / 2;
+    let mut out = vec![0f32; 3 * size * size];
+    for y in 0..size {
+        for x in 0..size {
+            for c in 0..3 {
+                let v = resized[((top + y) * rw + (left + x)) * 3 + c] / 255.0;
+                out[c * size * size + y * size + x] = (v - MEAN[c]) / STD[c];
+            }
+        }
+    }
+    Ok(Tensor::from_vec(out, (1, 3, size, size), device)?)
+}
+
+/// The IP-Adapter image-token source: the CLIP ViT image encoder + the [`Resampler`]. Produces the 16
+/// image tokens consumed by the UNet's decoupled cross-attention (`[1, num_queries, output_dim]` =
+/// 16×2048 for SDXL). The candle twin of `mlx-gen-sdxl::ip_adapter::IpImageEncoder`.
+///
+/// **CFG convention.** Unlike InstantID (whose uncond face row is `Resampler(zeros)`), the standard
+/// IP-Adapter uncond row is **literal zero tokens** ([`zeros_tokens`](Self::zeros_tokens)) — the
+/// reference `IPAdapter` zeros the *image embeds output*, not the Resampler input.
+pub struct IpImageEncoder {
+    encoder: ClipVisionEncoder,
+    resampler: Resampler,
+    /// The CLIP crop size the encoder was trained at (224 for ViT-H/ViT-L-224, 336 for ViT-L/14-336).
+    image_size: usize,
+}
+
+impl IpImageEncoder {
+    /// Compose a CLIP image encoder + Resampler at the given CLIP crop `image_size` (224 for
+    /// ViT-H/ViT-L-224, 336 for the Kolors ViT-L/14-336).
+    pub fn new(encoder: ClipVisionEncoder, resampler: Resampler, image_size: usize) -> Self {
+        Self {
+            encoder,
+            resampler,
+            image_size,
+        }
+    }
+
+    /// The resampler output token width (= UNet `cross_attention_dim`).
+    pub fn output_dim(&self) -> usize {
+        self.resampler.output_dim()
+    }
+
+    /// Reference image → `[1, num_queries, output_dim]` IP tokens (16×2048 for plus-vit-h), at the
+    /// resampler's weight dtype. CLIP preprocess → ViT penultimate → Resampler.
+    pub fn tokens(&self, image: &Image, device: &Device) -> Result<Tensor> {
+        let dtype = self.resampler.dtype();
+        let pixels =
+            preprocess_clip_image_sized(image, self.image_size, device)?.to_dtype(dtype)?;
+        let penultimate = self.encoder.penultimate(&pixels)?;
+        self.resampler.forward(&penultimate)
+    }
+
+    /// Literal zero tokens matching [`tokens`](Self::tokens)'s shape/dtype — the CFG uncond row.
+    pub fn zeros_tokens(&self, device: &Device) -> Result<Tensor> {
+        let n = self.resampler.num_queries();
+        let d = self.resampler.output_dim();
+        Ok(Tensor::zeros((1, n, d), self.resampler.dtype(), device)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,5 +515,198 @@ mod tests {
     fn ip_kv_pairs_errors_when_absent() {
         let w = Weights::from_map(HashMap::new());
         assert!(load_ip_kv_pairs(&w).is_err());
+    }
+
+    /// `preprocess_clip_image_sized`: a 4×4 solid-color image → NCHW `[1,3,size,size]`, with the CLIP
+    /// `(v/255 − mean)/std` normalization applied per channel (so a constant input maps to a constant,
+    /// channel-specific value, regardless of the resize/crop).
+    #[test]
+    #[allow(clippy::excessive_precision)] // canonical CLIP mean/std (f32 rounds the last digit)
+    fn preprocess_clip_image_nchw_and_normalized() {
+        let dev = Device::Cpu;
+        // Solid mid-gray 4×4 RGB (128,128,128).
+        let img = Image {
+            width: 4,
+            height: 4,
+            pixels: vec![128u8; 4 * 4 * 3],
+        };
+        let t = preprocess_clip_image_sized(&img, 8, &dev).unwrap();
+        assert_eq!(t.dims(), &[1, 3, 8, 8]);
+        // A constant image stays constant after resize/crop; check the per-channel normalized value.
+        let v = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mean = [0.481_454_66f32, 0.457_827_5, 0.408_210_73];
+        let std = [0.268_629_54f32, 0.261_302_58, 0.275_777_11];
+        for (c, (&m, &s)) in mean.iter().zip(std.iter()).enumerate() {
+            let want = (128.0 / 255.0 - m) / s;
+            let got = v[c * 64]; // first pixel of channel c
+            assert!((got - want).abs() < 1e-3, "channel {c}: {got} vs {want}");
+        }
+        // A buffer that doesn't match the dims errors.
+        let bad = Image {
+            width: 4,
+            height: 4,
+            pixels: vec![0u8; 8],
+        };
+        assert!(preprocess_clip_image_sized(&bad, 8, &dev).is_err());
+    }
+
+    /// A tiny CLIP-vision checkpoint matching a tiny [`crate::vision_encoder::VisionConfig`].
+    fn tiny_vision_weights(
+        cfg: &crate::vision_encoder::VisionConfig,
+        dev: &Device,
+    ) -> HashMap<String, Tensor> {
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        let p = "vision_model";
+        m.insert(
+            format!("{p}.embeddings.patch_embedding.weight"),
+            Tensor::randn(
+                0f32,
+                1f32,
+                (cfg.hidden, cfg.num_channels, cfg.patch, cfg.patch),
+                dev,
+            )
+            .unwrap(),
+        );
+        m.insert(
+            format!("{p}.embeddings.class_embedding"),
+            randn1(cfg.hidden, dev),
+        );
+        m.insert(
+            format!("{p}.embeddings.position_embedding.weight"),
+            randn2(cfg.num_positions(), cfg.hidden, dev),
+        );
+        m.insert(format!("{p}.pre_layrnorm.weight"), randn1(cfg.hidden, dev));
+        m.insert(format!("{p}.pre_layrnorm.bias"), randn1(cfg.hidden, dev));
+        for i in 0..cfg.num_layers {
+            let l = format!("{p}.encoder.layers.{i}");
+            for ln in ["layer_norm1", "layer_norm2"] {
+                m.insert(format!("{l}.{ln}.weight"), randn1(cfg.hidden, dev));
+                m.insert(format!("{l}.{ln}.bias"), randn1(cfg.hidden, dev));
+            }
+            for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+                m.insert(
+                    format!("{l}.self_attn.{proj}.weight"),
+                    randn2(cfg.hidden, cfg.hidden, dev),
+                );
+                m.insert(
+                    format!("{l}.self_attn.{proj}.bias"),
+                    randn1(cfg.hidden, dev),
+                );
+            }
+            m.insert(
+                format!("{l}.mlp.fc1.weight"),
+                randn2(cfg.hidden * 4, cfg.hidden, dev),
+            );
+            m.insert(format!("{l}.mlp.fc1.bias"), randn1(cfg.hidden * 4, dev));
+            m.insert(
+                format!("{l}.mlp.fc2.weight"),
+                randn2(cfg.hidden, cfg.hidden * 4, dev),
+            );
+            m.insert(format!("{l}.mlp.fc2.bias"), randn1(cfg.hidden, dev));
+        }
+        m
+    }
+
+    /// A tiny IP-Adapter Resampler checkpoint (`image_proj.*`) for `cfg`.
+    fn tiny_resampler_weights(cfg: &ResamplerConfig, dev: &Device) -> HashMap<String, Tensor> {
+        let inner = cfg.heads * cfg.dim_head;
+        let p = "image_proj";
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        m.insert(
+            format!("{p}.latents"),
+            randn((1, cfg.num_queries, cfg.dim), dev),
+        );
+        m.insert(
+            format!("{p}.proj_in.weight"),
+            randn2(cfg.dim, cfg.embed_dim, dev),
+        );
+        m.insert(format!("{p}.proj_in.bias"), randn1(cfg.dim, dev));
+        m.insert(
+            format!("{p}.proj_out.weight"),
+            randn2(cfg.output_dim, cfg.dim, dev),
+        );
+        m.insert(format!("{p}.proj_out.bias"), randn1(cfg.output_dim, dev));
+        m.insert(format!("{p}.norm_out.weight"), randn1(cfg.output_dim, dev));
+        m.insert(format!("{p}.norm_out.bias"), randn1(cfg.output_dim, dev));
+        for i in 0..cfg.depth {
+            let a = format!("{p}.layers.{i}.0");
+            m.insert(format!("{a}.norm1.weight"), randn1(cfg.dim, dev));
+            m.insert(format!("{a}.norm1.bias"), randn1(cfg.dim, dev));
+            m.insert(format!("{a}.norm2.weight"), randn1(cfg.dim, dev));
+            m.insert(format!("{a}.norm2.bias"), randn1(cfg.dim, dev));
+            m.insert(format!("{a}.to_q.weight"), randn2(inner, cfg.dim, dev));
+            m.insert(format!("{a}.to_kv.weight"), randn2(2 * inner, cfg.dim, dev));
+            m.insert(format!("{a}.to_out.weight"), randn2(cfg.dim, inner, dev));
+            let f = format!("{p}.layers.{i}.1");
+            m.insert(format!("{f}.0.weight"), randn1(cfg.dim, dev));
+            m.insert(format!("{f}.0.bias"), randn1(cfg.dim, dev));
+            m.insert(format!("{f}.1.weight"), randn2(4 * cfg.dim, cfg.dim, dev));
+            m.insert(format!("{f}.3.weight"), randn2(cfg.dim, 4 * cfg.dim, dev));
+        }
+        m
+    }
+
+    /// `IpImageEncoder` end-to-end (tiny): a reference image → `[1, num_queries, output_dim]` IP
+    /// tokens (CLIP preprocess → ViT penultimate → Resampler), and `zeros_tokens` is the same-shaped
+    /// all-zero uncond row. The Resampler's `embed_dim` must equal the ViT `hidden`.
+    #[test]
+    fn ip_image_encoder_tokens_and_zeros() {
+        use crate::vision_encoder::{ClipVisionEncoder, VisionConfig};
+        let dev = Device::Cpu;
+        let vcfg = VisionConfig {
+            hidden: 16,
+            num_layers: 2,
+            num_heads: 2,
+            patch: 2,
+            image_size: 4,
+            num_channels: 3,
+            quick_gelu: false,
+        };
+        let rcfg = ResamplerConfig {
+            dim: 8,
+            depth: 2,
+            heads: 2,
+            dim_head: 4,
+            num_queries: 4,
+            embed_dim: vcfg.hidden, // ViT penultimate width feeds proj_in
+            output_dim: 10,
+        };
+        let encoder = ClipVisionEncoder::from_weights(
+            &Weights::from_map(tiny_vision_weights(&vcfg, &dev)),
+            &vcfg,
+        )
+        .unwrap();
+        let resampler = Resampler::from_weights(
+            &Weights::from_map(tiny_resampler_weights(&rcfg, &dev)),
+            "image_proj",
+            &rcfg,
+        )
+        .unwrap();
+        let ip = IpImageEncoder::new(encoder, resampler, vcfg.image_size);
+
+        let img = Image {
+            width: 6,
+            height: 5,
+            pixels: vec![200u8; 6 * 5 * 3],
+        };
+        let tokens = ip.tokens(&img, &dev).unwrap();
+        assert_eq!(tokens.dims(), &[1, rcfg.num_queries, rcfg.output_dim]);
+        assert!(tokens
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|v| v.is_finite()));
+
+        let zeros = ip.zeros_tokens(&dev).unwrap();
+        assert_eq!(zeros.dims(), tokens.dims());
+        assert!(zeros
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|&v| v == 0.0));
     }
 }
