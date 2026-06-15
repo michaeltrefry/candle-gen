@@ -28,7 +28,12 @@ resolver = "2"
 # Bumped `d3ec5e5` -> `871d5cc` (sc-5490, epic 5480): the additive gen-core `FaceEmbedder` contract
 # (mlx-gen PR #458, merged to main) that `candle-gen-face` implements. The worker re-pins to MATCH when
 # it wires the candle InstantID/PuLID providers (sc-5491/5492); until then candle-gen leads this rev.
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "871d5ccb41b2d3dea1daea55d10e9c3144d78ad1" }
+# Bumped `871d5cc` -> `24c89c9` (sc-5491, epic 5480): catch up to the worker's mlx-gen pin, which
+# overtook candle-gen when mlx-gen #459 (sc-5637 training-preview samples) landed on main. The ONLY
+# gen-core delta is `train.rs` +39 additive lines (new `TrainingConfig` sample_* fields with
+# defaults + a `TrainingProgress::Sample` variant) — candle-gen has no trainers, so no surface
+# change; this is purely the alignment the worker's candle lane needs to resolve ONE gen-core rev.
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "24c89c90476279a4e47533202111ca19e40a46d5" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels
