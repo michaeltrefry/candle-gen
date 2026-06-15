@@ -30,6 +30,10 @@ pub mod model;
 pub mod openpose;
 pub mod restore;
 
+/// Phase 5 real-weight GPU validation (sc-5491) — env-driven, `#[ignore]`d integration test.
+#[cfg(test)]
+mod validate;
+
 pub use kps::{draw_kps, letterbox, view_angle_kps, ANGLE_SET_ORDER, VIEW_ANGLE_KPS};
 pub use model::{
     InstantId, InstantIdPaths, InstantIdRequest, DEFAULT_CONTROLNET_SCALE, DEFAULT_IP_SCALE,

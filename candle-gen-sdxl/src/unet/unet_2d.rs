@@ -661,9 +661,10 @@ impl UNet2DConditionModel {
         )
     }
 
-    /// Install the IP-Adapter decoupled K/V `pairs` into the cross-attentions in the diffusers attn
-    /// order (down → mid → up) — 70 pairs for SDXL. Errors on a count mismatch (too few or too many)
-    /// rather than silently leaving cross-attentions un-/over-installed.
+    /// Install the IP-Adapter decoupled K/V `pairs` into the cross-attentions in the diffusers
+    /// `attn_processors` order (down → up → mid; see [`visit_cross_attn_mut`](Self::visit_cross_attn_mut))
+    /// — 70 pairs for SDXL. Errors on a count mismatch (too few or too many) rather than silently
+    /// leaving cross-attentions un-/over-installed.
     pub fn install_ip_adapter(&mut self, pairs: Vec<(Tensor, Tensor)>) -> Result<()> {
         let mut pairs = pairs.into_iter();
         self.visit_cross_attn_mut(&mut |xa| match pairs.next() {
@@ -693,9 +694,14 @@ impl UNet2DConditionModel {
         })
     }
 
-    /// Walk every cross-attention (`attn2`) in diffusers attn order — down blocks, then mid, then up —
-    /// applying `f`. Drives [`install_ip_adapter`](Self::install_ip_adapter) (ordered pair consume) and
-    /// [`set_ip_context`](Self::set_ip_context) (same tokens everywhere).
+    /// Walk every cross-attention (`attn2`) in diffusers `attn_processors` order — **down blocks, then
+    /// up blocks, then mid last** — applying `f`. This is NOT the forward order (down → mid → up): the
+    /// diffusers `attn_processors` dict follows `named_children` *registration* order, and the UNet
+    /// assigns `down_blocks`, `up_blocks`, then `mid_block`, so the mid-block cross-attns come last. The
+    /// saved `ip_adapter.{n}` indices number the pairs in exactly this order, so
+    /// [`install_ip_adapter`](Self::install_ip_adapter) (ordered pair consume) MUST match it or a
+    /// wrong-dim K/V pair lands on a block (a 640-dim pair on a 1280-dim block → matmul shape mismatch).
+    /// [`set_ip_context`](Self::set_ip_context) sets the same tokens everywhere, so it is order-agnostic.
     fn visit_cross_attn_mut(
         &mut self,
         f: &mut dyn FnMut(&mut CrossAttention) -> Result<()>,
@@ -705,12 +711,12 @@ impl UNet2DConditionModel {
                 b.visit_cross_attn_mut(f)?;
             }
         }
-        self.mid_block.visit_cross_attn_mut(f)?;
         for ub in self.up_blocks.iter_mut() {
             if let UNetUpBlock::CrossAttn(b) = ub {
                 b.visit_cross_attn_mut(f)?;
             }
         }
+        self.mid_block.visit_cross_attn_mut(f)?;
         Ok(())
     }
 }

@@ -155,39 +155,45 @@ impl SdxlConditioner {
         } else {
             vec![prompt]
         };
-        let rows_l: Vec<Vec<u32>> = texts
-            .iter()
-            .map(|t| self.tokenize(&self.tok_l, &self.cfg_l, t))
-            .collect::<Result<_>>()?;
-        let rows_g: Vec<Vec<u32>> = texts
-            .iter()
-            .map(|t| self.tokenize(&self.tok_g, &self.cfg_g, t))
-            .collect::<Result<_>>()?;
 
-        let ids_l = Tensor::new(flatten(&rows_l), &self.device)?
-            .reshape((rows_l.len(), self.cfg_l.max_position_embeddings))?;
-        let ids_g = Tensor::new(flatten(&rows_g), &self.device)?
-            .reshape((rows_g.len(), self.cfg_g.max_position_embeddings))?;
+        // Encode **one row at a time** (batch 1) and stack along the batch dim afterwards — NOT a single
+        // batched-2 CLIP forward. candle-transformers' stock CLIP builds its causal attention mask as
+        // `[B, S, S]` and `broadcast_add`s it onto the per-head scores `[B, H, S, S]`; that only aligns
+        // when `B == 1` (the mask's batch dim broadcasts against the head dim). At `B >= 2` it panics
+        // (`shape mismatch in broadcast_add, lhs [2, H, 77, 77], rhs [2, 77, 77]`). The stock SD pipeline
+        // dodges this by running uncond/cond as separate passes, so do the same here.
+        let mut penult_rows: Vec<Tensor> = Vec::with_capacity(texts.len());
+        let mut pooled_rows: Vec<Tensor> = Vec::with_capacity(texts.len());
+        for text in &texts {
+            let row_l = self.tokenize(&self.tok_l, &self.cfg_l, text)?;
+            let row_g = self.tokenize(&self.tok_g, &self.cfg_g, text)?;
+            let ids_l = Tensor::new(row_l.as_slice(), &self.device)?
+                .reshape((1, self.cfg_l.max_position_embeddings))?;
+            let ids_g = Tensor::new(row_g.as_slice(), &self.device)?
+                .reshape((1, self.cfg_g.max_position_embeddings))?;
 
-        // Penultimate hidden (`hidden_states[-2]`, pre-final-norm) from each encoder; the bigG `.0` is
-        // its final-norm hidden (for the pooled head). `usize::MAX` = the plain causal mask (no padding
-        // truncation), matching the txt2img path.
-        let (_final_l, penult_l) =
-            self.clip_l
-                .forward_until_encoder_layer(&ids_l, usize::MAX, -2)?;
-        let (final_g, penult_g) =
-            self.clip_g
-                .forward_until_encoder_layer(&ids_g, usize::MAX, -2)?;
-        let conditioning = Tensor::cat(&[&penult_l, &penult_g], D::Minus1)?; // [B, 77, 2048]
-        let pooled = pool_eos(&final_g, &rows_g, &self.text_projection)?; // [B, 1280]
+            // Penultimate hidden (`hidden_states[-2]`, pre-final-norm) from each encoder; the bigG `.0`
+            // is its final-norm hidden (for the pooled head). `usize::MAX` = the plain causal mask (no
+            // padding truncation), matching the txt2img path.
+            let (_final_l, penult_l) =
+                self.clip_l
+                    .forward_until_encoder_layer(&ids_l, usize::MAX, -2)?;
+            let (final_g, penult_g) =
+                self.clip_g
+                    .forward_until_encoder_layer(&ids_g, usize::MAX, -2)?;
+            penult_rows.push(Tensor::cat(&[&penult_l, &penult_g], D::Minus1)?); // [1, 77, 2048]
+                                                                                // pool the single-row bigG final hidden at its EOS, then project → [1, 1280].
+            pooled_rows.push(pool_eos(
+                &final_g,
+                std::slice::from_ref(&row_g),
+                &self.text_projection,
+            )?);
+        }
+
+        let conditioning = Tensor::cat(&penult_rows, 0)?; // [B, 77, 2048]
+        let pooled = Tensor::cat(&pooled_rows, 0)?; // [B, 1280]
         Ok((conditioning, pooled))
     }
-}
-
-/// Flatten rows of token ids into a single `i64`-friendly `u32` buffer (candle `Tensor::new` over a
-/// slice + `reshape`). The rows are equal length (all padded to `max_position_embeddings`).
-fn flatten(rows: &[Vec<u32>]) -> Vec<u32> {
-    rows.iter().flatten().copied().collect()
 }
 
 #[cfg(test)]
