@@ -64,9 +64,10 @@ impl Weights {
         self.map.keys()
     }
 
-    /// Build directly from an in-memory map (tests construct synthetic weights without a file).
-    #[cfg(test)]
-    pub(crate) fn from_map(map: HashMap<String, Tensor>) -> Self {
+    /// Build directly from an in-memory map — tests (including cross-crate ones, e.g. the FLUX
+    /// IP-Adapter image-encoder fixtures, sc-5872) construct synthetic weights without a file, and a
+    /// caller can assemble a checkpoint programmatically.
+    pub fn from_map(map: HashMap<String, Tensor>) -> Self {
         Self { map }
     }
 }

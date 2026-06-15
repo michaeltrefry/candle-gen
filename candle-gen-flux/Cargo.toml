@@ -18,6 +18,18 @@ inventory = { workspace = true }
 # black-forest-labs checkpoint layout directly; `t5` (T5-XXL) and `clip` (CLIP-L) are the dual text
 # encoders. Backend features are passed through below so it shares candle-gen's exact candle build.
 candle-transformers = { workspace = true }
+# Reused IP-Adapter infrastructure (sc-5872): the CLIP ViT image tower (`ClipVisionEncoder` /
+# `VisionConfig::vit_l_14`), the safetensors key→Tensor `Weights` loader (with the I64-passthrough cast
+# fix), and `preprocess_clip_image_sized` (the shared CLIP image preprocessing). Backend features are
+# forwarded below so flux + sdxl share ONE candle build (the single-rev skew gate).
+candle-gen-sdxl = { path = "../candle-gen-sdxl" }
+# candle-transformers' `flux::model::Flux` exposes no per-double-block IP-injection seam (all fields
+# private), so sc-5872 vendors + forks the FLUX DiT (`ip_dit.rs`) to add the XLabs decoupled-cross-attn
+# K/V seam — exactly the "vendor the model to get a seam" move candle-gen-sdxl made for the UNet. Direct
+# candle-core/candle-nn deps (same workspace pin as candle-transformers, no dup) let the fork copy the
+# upstream model verbatim. The stock txt2img path keeps using candle-transformers' `Flux` untouched.
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
 # Prompt tokenization for the dual encoders. FLUX has no chat template (plain encode), so this uses
 # the HF `tokenizers` runtime directly (the candle reference path), NOT gen-core's chat-template
 # `TextTokenizer` — the T5 `tokenizer.json` comes from the snapshot, CLIP's is vendored (see below).
@@ -33,9 +45,13 @@ serde_json = "1"
 # Pass the backend selection through to the core crate AND candle-transformers so a downstream
 # `--features metal`/`cuda` on this provider crate selects the matching candle backend everywhere.
 default = []
-metal = ["candle-gen/metal", "candle-transformers/metal"]
-cuda = ["candle-gen/cuda", "candle-transformers/cuda"]
-flash-attn = ["candle-gen/flash-attn", "candle-transformers/flash-attn"]
+metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-sdxl/metal"]
+cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-sdxl/cuda"]
+flash-attn = [
+    "candle-gen/flash-attn",
+    "candle-transformers/flash-attn",
+    "candle-gen-sdxl/flash-attn",
+]
 
 [dev-dependencies]
 # `examples/flux-txt2img.rs` smoke driver only — encode the produced `gen_core::Image` (RGB8) to PNG so a

@@ -28,6 +28,22 @@
 
 mod pipeline;
 
+// XLabs FLUX IP-Adapter (sc-5872, epic 5480) — reference-image (identity) conditioning. `ip_dit` is the
+// forked FLUX DiT carrying the per-double-block decoupled-cross-attn seam (the stock candle-transformers
+// `Flux` has none); `ip_adapter` is the XLabs projector + K/V weights; `ip_image_encoder` is the pooled
+// CLIP-ViT-L tower; `ip_provider` composes them into the bespoke reference stream the worker drives
+// directly (not gen-core-registered — the `flux1_*` descriptors stay txt2img-only).
+pub mod ip_adapter;
+mod ip_dit;
+pub mod ip_image_encoder;
+pub mod ip_provider;
+pub use ip_provider::{IpAdapterFlux, IpAdapterFluxPaths, IpAdapterFluxRequest, DEFAULT_IP_SCALE};
+
+/// FLUX XLabs IP-Adapter real-weight GPU validation (sc-5872) — env-driven, `#[ignore]`d integration
+/// test (the analog of the SDXL/Kolors IP-Adapter Phase-5 harnesses).
+#[cfg(test)]
+mod ip_validate;
+
 use std::path::PathBuf;
 use std::sync::Mutex;
 

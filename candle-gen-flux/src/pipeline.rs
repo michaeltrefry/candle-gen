@@ -197,40 +197,15 @@ impl Pipeline {
         comps: &Components,
         prompt: &str,
     ) -> Result<(Tensor, Tensor)> {
-        // T5 sequence.
-        let t5_tok = Tokenizer::from_file(self.root.join("tokenizer_2/tokenizer.json"))
-            .map_err(|e| CandleError::Msg(format!("flux: load T5 tokenizer: {e}")))?;
-        let mut t5_ids: Vec<u32> = t5_tok
-            .encode(prompt, true)
-            .map_err(|e| CandleError::Msg(format!("flux: T5 tokenize: {e}")))?
-            .get_ids()
-            .to_vec();
-        // Pad/truncate to the variant's fixed T5 length (256 schnell / 512 dev). FLUX attends every
-        // position (no T5 mask), so the padded length is parity-critical, not a perf knob.
-        t5_ids.resize(self.variant.t5_max_len(), T5_PAD_TOKEN_ID);
-        let t5_input = Tensor::new(t5_ids.as_slice(), &self.device)?.unsqueeze(0)?;
-        let t5_emb = {
-            let mut t5 = comps.t5.lock().expect("flux T5 mutex poisoned");
-            t5.forward(&t5_input)?
-        }
-        .to_dtype(self.dtype)?;
-
-        // CLIP pooled vector.
-        const CLIP_TOKENIZER_JSON: &[u8] = include_bytes!("../assets/clip_tokenizer.json");
-        let clip_tok = Tokenizer::from_bytes(CLIP_TOKENIZER_JSON)
-            .map_err(|e| CandleError::Msg(format!("flux: load vendored CLIP tokenizer: {e}")))?;
-        let clip_ids: Vec<u32> = clip_tok
-            .encode(prompt, true)
-            .map_err(|e| CandleError::Msg(format!("flux: CLIP tokenize: {e}")))?
-            .get_ids()
-            .to_vec();
-        if clip_ids.is_empty() {
-            return Err(CandleError::Msg("flux: empty CLIP tokenization".into()));
-        }
-        let clip_input = Tensor::new(clip_ids.as_slice(), &self.device)?.unsqueeze(0)?;
-        let clip_emb = comps.clip.forward(&clip_input)?.to_dtype(self.dtype)?;
-
-        Ok((t5_emb, clip_emb))
+        encode_text(
+            self.variant,
+            &self.root,
+            &self.device,
+            self.dtype,
+            &comps.clip,
+            &comps.t5,
+            prompt,
+        )
     }
 
     /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring
@@ -358,21 +333,84 @@ impl Pipeline {
         height: usize,
         width: usize,
     ) -> Result<Image> {
-        let latents = unpack(latents, height, width)?;
-        let decoded = vae.decode(&latents)?.to_dtype(DType::F32)?; // (1, 3, H, W) in [-1, 1]
-        let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
-        let img = img.i(0)?.to_device(&Device::Cpu)?;
-        let (c, h, w) = img.dims3()?;
-        if c != 3 {
-            return Err(CandleError::Msg(format!("expected 3 channels, got {c}")));
-        }
-        let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
-        Ok(Image {
-            width: w as u32,
-            height: h as u32,
-            pixels,
-        })
+        decode_latents(vae, latents, height, width)
     }
+}
+
+/// Encode `prompt` into FLUX's two conditioning tensors for `variant`: the T5 sequence `(1, L, 4096)`
+/// and the CLIP pooled vector `(1, 768)`, both at `dtype`. Shared by the txt2img
+/// [`Pipeline::text_embeddings`] and the IP-Adapter provider ([`crate::ip_provider`]) so the two never
+/// drift on the parity-critical tokenization (T5 padded to the variant length; the vendored CLIP
+/// tokenizer). `t5` is locked only for the once-per-request encode.
+pub(crate) fn encode_text(
+    variant: Variant,
+    root: &Path,
+    device: &Device,
+    dtype: DType,
+    clip: &ClipTextTransformer,
+    t5: &Mutex<T5EncoderModel>,
+    prompt: &str,
+) -> Result<(Tensor, Tensor)> {
+    // T5 sequence.
+    let t5_tok = Tokenizer::from_file(root.join("tokenizer_2/tokenizer.json"))
+        .map_err(|e| CandleError::Msg(format!("flux: load T5 tokenizer: {e}")))?;
+    let mut t5_ids: Vec<u32> = t5_tok
+        .encode(prompt, true)
+        .map_err(|e| CandleError::Msg(format!("flux: T5 tokenize: {e}")))?
+        .get_ids()
+        .to_vec();
+    // Pad/truncate to the variant's fixed T5 length (256 schnell / 512 dev). FLUX attends every
+    // position (no T5 mask), so the padded length is parity-critical, not a perf knob.
+    t5_ids.resize(variant.t5_max_len(), T5_PAD_TOKEN_ID);
+    let t5_input = Tensor::new(t5_ids.as_slice(), device)?.unsqueeze(0)?;
+    let t5_emb = {
+        let mut t5 = t5.lock().expect("flux T5 mutex poisoned");
+        t5.forward(&t5_input)?
+    }
+    .to_dtype(dtype)?;
+
+    // CLIP pooled vector.
+    const CLIP_TOKENIZER_JSON: &[u8] = include_bytes!("../assets/clip_tokenizer.json");
+    let clip_tok = Tokenizer::from_bytes(CLIP_TOKENIZER_JSON)
+        .map_err(|e| CandleError::Msg(format!("flux: load vendored CLIP tokenizer: {e}")))?;
+    let clip_ids: Vec<u32> = clip_tok
+        .encode(prompt, true)
+        .map_err(|e| CandleError::Msg(format!("flux: CLIP tokenize: {e}")))?
+        .get_ids()
+        .to_vec();
+    if clip_ids.is_empty() {
+        return Err(CandleError::Msg("flux: empty CLIP tokenization".into()));
+    }
+    let clip_input = Tensor::new(clip_ids.as_slice(), device)?.unsqueeze(0)?;
+    let clip_emb = clip.forward(&clip_input)?.to_dtype(dtype)?;
+
+    Ok((t5_emb, clip_emb))
+}
+
+/// Unpack the denoised latents `(1, h·w, 64)` back to `(1, 16, H/8, W/8)`, VAE-decode to an RGB8
+/// [`Image`]. Shared by the txt2img [`Pipeline::decode`] and the IP-Adapter provider. The AutoEncoder
+/// applies its own `(z / scale) + shift` un-scale inside `decode`; the `[-1, 1]` output is mapped to
+/// `[0, 255]` u8.
+pub(crate) fn decode_latents(
+    vae: &AutoEncoder,
+    latents: &Tensor,
+    height: usize,
+    width: usize,
+) -> Result<Image> {
+    let latents = unpack(latents, height, width)?;
+    let decoded = vae.decode(&latents)?.to_dtype(DType::F32)?; // (1, 3, H, W) in [-1, 1]
+    let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
+    let img = img.i(0)?.to_device(&Device::Cpu)?;
+    let (c, h, w) = img.dims3()?;
+    if c != 3 {
+        return Err(CandleError::Msg(format!("expected 3 channels, got {c}")));
+    }
+    let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
+    Ok(Image {
+        width: w as u32,
+        height: h as u32,
+        pixels,
+    })
 }
 
 /// The per-image seed within a batch: image `index` of a `count`-image request renders at
@@ -385,7 +423,7 @@ pub(crate) fn image_seed(base_seed: u64, index: u32) -> u64 {
 
 /// The fixed CLIP-L (openai/clip-vit-large-patch14) text config FLUX uses — identical across
 /// schnell/dev. Mirrors the candle `flux` example's hardcoded `ClipTextConfig`.
-fn clip_config() -> ClipTextConfig {
+pub(crate) fn clip_config() -> ClipTextConfig {
     ClipTextConfig {
         vocab_size: 49408,
         projection_dim: 768,
@@ -400,7 +438,7 @@ fn clip_config() -> ClipTextConfig {
 }
 
 /// The FLUX DiT config for `variant` — schnell and dev differ only in `guidance_embed`.
-fn flux_config(variant: Variant) -> FluxConfig {
+pub(crate) fn flux_config(variant: Variant) -> FluxConfig {
     if variant.is_dev() {
         FluxConfig::dev()
     } else {
@@ -410,7 +448,7 @@ fn flux_config(variant: Variant) -> FluxConfig {
 
 /// The FLUX AutoEncoder config for `variant` (the scale/shift factors are identical across variants;
 /// the variant arm mirrors the candle example's per-model selection).
-fn ae_config(variant: Variant) -> AeConfig {
+pub(crate) fn ae_config(variant: Variant) -> AeConfig {
     if variant.is_dev() {
         AeConfig::dev()
     } else {

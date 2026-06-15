@@ -246,7 +246,10 @@ dependencies = [
 name = "candle-gen-flux"
 version = "0.0.0"
 dependencies = [
+ "candle-core",
  "candle-gen",
+ "candle-gen-sdxl",
+ "candle-nn",
  "candle-transformers",
  "image",
  "inventory",

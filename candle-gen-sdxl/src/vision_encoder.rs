@@ -277,6 +277,21 @@ impl ClipVisionEncoder {
         Ok(x)
     }
 
+    /// The **last** hidden state `[B, num_positions, hidden]` — HF's `last_hidden_state` (the full
+    /// encoder output, before `post_layernorm` / `visual_projection`). Runs *all* `num_layers` encoder
+    /// layers, unlike [`penultimate`](Self::penultimate). This is what the classic (non-"plus")
+    /// IP-Adapter image embedding needs: the consumer takes the class token (position 0) of this output,
+    /// applies `post_layernorm`, then `visual_projection` to get the pooled `image_embeds` (the
+    /// projection head lives in the consumer — e.g. the XLabs FLUX IP-Adapter's `FluxIpImageEncoder` —
+    /// not in this tower, sc-5872).
+    pub fn last_hidden(&self, pixel_values: &Tensor) -> Result<Tensor> {
+        let mut x = self.embed(pixel_values)?;
+        for layer in &self.layers {
+            x = layer.forward(&x)?;
+        }
+        Ok(x)
+    }
+
     /// The compute dtype (the patch-embedding weight's dtype).
     pub fn dtype(&self) -> DType {
         self.patch_embedding.dtype()
@@ -391,6 +406,42 @@ mod tests {
         assert_eq!(out.dims(), &[2, cfg.num_positions(), cfg.hidden]);
         let vals = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(vals.iter().all(|v| v.is_finite()), "penultimate not finite");
+    }
+
+    /// `last_hidden` runs the full tower (one more layer than `penultimate`) to a finite
+    /// `[B, num_positions, hidden]`, and differs from `penultimate` (the extra layer transforms the
+    /// state) — the XLabs FLUX IP-Adapter's pooled-embedding path (sc-5872).
+    #[test]
+    fn last_hidden_runs_full_tower() {
+        let dev = Device::Cpu;
+        let cfg = VisionConfig {
+            hidden: 32,
+            num_layers: 3,
+            num_heads: 4,
+            patch: 2,
+            image_size: 8,
+            num_channels: 3,
+            quick_gelu: true, // ViT-L uses quick-gelu (XLabs FLUX tower)
+        };
+        let w = tiny_weights(&cfg, &dev);
+        let enc = ClipVisionEncoder::from_weights(&w, &cfg).unwrap();
+        let px = Tensor::randn(0f32, 1f32, (1, 3, 8, 8), &dev).unwrap();
+        let last = enc.last_hidden(&px).unwrap();
+        assert_eq!(last.dims(), &[1, cfg.num_positions(), cfg.hidden]);
+        let lv = last.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(lv.iter().all(|v| v.is_finite()), "last_hidden not finite");
+        // The final encoder layer actually transforms the state, so last != penultimate.
+        let penult = enc.penultimate(&px).unwrap();
+        let pv = penult.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let max_diff = lv
+            .iter()
+            .zip(&pv)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "last_hidden should differ from penultimate"
+        );
     }
 
     /// The quick-gelu variant also forwards to a finite penultimate (exercises the `x·sigmoid(1.702x)`
