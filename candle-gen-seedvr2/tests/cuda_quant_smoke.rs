@@ -151,7 +151,11 @@ fn cuda_quant_near_lossless() {
         assert!(
             corr_dense > min_corr,
             "{label} not {} vs fp16 (corr={corr_dense:.4} ≤ {min_corr})",
-            if quant == Quant::Q8 { "near-lossless" } else { "coherent" }
+            if quant == Quant::Q8 {
+                "near-lossless"
+            } else {
+                "coherent"
+            }
         );
         assert!(
             ge_q > ge_base,
@@ -188,7 +192,10 @@ fn cuda_7b_upscale_smoke() {
 
     let mn = out_f.iter().cloned().fold(f32::INFINITY, f32::min);
     let mx = out_f.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    assert!(mx > mn, "7B output is constant (degenerate): min={mn} max={mx}");
+    assert!(
+        mx > mn,
+        "7B output is constant (degenerate): min={mn} max={mx}"
+    );
 
     let base = imageops::resize_bicubic_u8(&lr.pixels, src, src, tgt, tgt);
     let corr = pearson(&out_f, &base);
