@@ -2558,7 +2558,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-gen-core"
 version = "0.1.0"
-source = "git+https://github.com/michaeltrefry/mlx-gen?rev=aeb471bdb79efa8c23573e7ae43d34d30acac3b4#aeb471bdb79efa8c23573e7ae43d34d30acac3b4"
+source = "git+https://github.com/michaeltrefry/mlx-gen?rev=3714e7b29c1e2016a3453295cfdf9fc48a6f9128#3714e7b29c1e2016a3453295cfdf9fc48a6f9128"
 dependencies = [
  "inventory",
  "safetensors 0.4.5",
@@ -2570,7 +2570,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-gen-core-testkit"
 version = "0.1.0"
-source = "git+https://github.com/michaeltrefry/mlx-gen?rev=aeb471bdb79efa8c23573e7ae43d34d30acac3b4#aeb471bdb79efa8c23573e7ae43d34d30acac3b4"
+source = "git+https://github.com/michaeltrefry/mlx-gen?rev=3714e7b29c1e2016a3453295cfdf9fc48a6f9128#3714e7b29c1e2016a3453295cfdf9fc48a6f9128"
 dependencies = [
  "sceneworks-gen-core",
 ]
