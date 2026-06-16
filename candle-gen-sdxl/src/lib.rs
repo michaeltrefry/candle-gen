@@ -106,6 +106,20 @@ pub use ip_provider::{
 #[cfg(test)]
 mod ip_validate;
 
+// SDXL img2img / inpaint / outpaint edit provider (sc-6037, epic 5480) — pixel-conditioned editing,
+// the candle twin of the `mlx-gen-sdxl` edit path and the provider half that unblocks the worker
+// img2img/edit/inpaint routing (sc-5487). Reuses the IP/InstantID denoise stack with the IP branch
+// inert (no install) + the deterministic VAE moments-encoder init + a per-step inpaint mask blend.
+pub mod edit_provider;
+pub use edit_provider::{
+    SdxlEdit, SdxlEditPaths, SdxlEditRequest, DEFAULT_EDIT_STRENGTH, DEFAULT_INPAINT_STRENGTH,
+};
+
+/// SDXL edit (img2img / inpaint / outpaint) real-weight GPU validation (sc-6037) — env-driven,
+/// `#[ignore]`d integration test (the analog of the IP-Adapter Phase-5 harness).
+#[cfg(test)]
+mod edit_validate;
+
 // Vendored, training-adapted SDXL UNet + VAE-encode stack (sc-5165) — used by the native LoRA/LoKr
 // trainer below. Inference continues to use the stock candle-transformers UNet via `pipeline`; the
 // vendored copy retains some unused upstream surface (decoder blocks, the additional-residuals

@@ -156,6 +156,19 @@ impl EulerAncestralSampler {
         Ok(noise.affine(self.prior_scale(), 0.0)?)
     }
 
+    /// Re-noise a clean latent `x` to the schedule time `t`: `(x + noise·σ(t)) · rsqrt(σ(t)²+1)` — the
+    /// img2img / inpaint init-noising (the mlx `add_noise`). For img2img the caller noises the
+    /// VAE-encoded source to `start_time = max_time·strength`; the inpaint blend re-noises the *clean*
+    /// init to each step's `t_prev`. `noise` is unit-normal (the caller's seeded stream) and is cast to
+    /// `x`'s dtype so an f16 latent stays f16. At `t = 0`, `σ = 0`, so this returns `x` unchanged (the
+    /// clean init) — the final-step inpaint blend then pins the kept region to the source exactly.
+    pub fn add_noise(&self, x: &Tensor, noise: &Tensor, t: f64) -> Result<Tensor> {
+        let sigma = self.sigma(t);
+        let renorm = 1.0 / (sigma * sigma + 1.0).sqrt();
+        let noised = (x + noise.affine(sigma, 0.0)?.to_dtype(x.dtype())?)?;
+        Ok(noised.affine(renorm, 0.0)?)
+    }
+
     /// One denoise step from `x_t` (at time `t`) to `x_{t_prev}`. Euler-ancestral when
     /// `self.ancestral` — the caller-supplied unit-normal `noise` (drawn from the loop's seeded RNG)
     /// is scaled by `σ_up`; plain Euler otherwise (`noise` unused). All scalar schedule math is host
@@ -297,6 +310,54 @@ mod tests {
         }
         // σ_last/sqrt(σ_last²+1) is just under 1 (σ_last ≫ 1).
         assert!(s.prior_scale() < 1.0 && s.prior_scale() > 0.99);
+    }
+
+    /// `add_noise(x, noise, t)` = `(x + noise·σ(t))·rsqrt(σ(t)²+1)`: at `t = 0` (σ = 0) it returns `x`
+    /// unchanged (the img2img-at-strength-0 / inpaint final-step pin), and at a mid-schedule `t` it
+    /// matches the host scalar and actually changes `x`.
+    #[test]
+    fn add_noise_zero_t_identity_and_mid_t_noises() {
+        let s = EulerAncestralSampler::sdxl();
+        let dev = Device::Cpu;
+        let x = Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &dev).unwrap();
+        let noise = Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &dev).unwrap();
+        let xv = x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let nv = noise.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        // t = 0 ⇒ σ = 0 ⇒ identity (the kept-region pin at the final inpaint step).
+        let a0 = s
+            .add_noise(&x, &noise, 0.0)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (g, w) in a0.iter().zip(xv.iter()) {
+            assert!(
+                (g - w).abs() < 1e-6,
+                "add_noise at t=0 must be identity: {g} vs {w}"
+            );
+        }
+
+        // Mid-schedule: matches the host scalar and differs from x.
+        let t = 600.0;
+        let sigma = s.sigma(t);
+        let renorm = 1.0 / (sigma * sigma + 1.0).sqrt();
+        let got = s
+            .add_noise(&x, &noise, t)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for ((g, &xi), &ni) in got.iter().zip(xv.iter()).zip(nv.iter()) {
+            let want = ((xi as f64 + ni as f64 * sigma) * renorm) as f32;
+            assert!((g - want).abs() < 1e-4, "add_noise off: {g} vs {want}");
+        }
+        assert!(
+            got.iter().zip(xv.iter()).any(|(g, x)| (g - x).abs() > 1e-3),
+            "a mid-schedule add_noise must change x"
+        );
     }
 
     /// The ancestral `step` matches the host-f64 reference for a mid-schedule step (σ_up > 0, so the

@@ -18,8 +18,10 @@ use candle_transformers::models::stable_diffusion::StableDiffusionConfig;
 use candle_gen::gen_core::WeightsSource;
 use candle_gen::{CandleError, Result};
 
-use crate::pipeline::{hf_get, snapshot_file, VAE_FIX_FILE, VAE_FIX_REPO};
-use crate::unet::{sdxl_unet_config, ControlNet, ControlNetConfig, UNet2DConditionModel};
+use crate::pipeline::{hf_get, snapshot_file, VAE_FIX_FILE, VAE_FIX_REPO, VAE_SCALE};
+use crate::unet::{
+    sdxl_unet_config, ControlNet, ControlNetConfig, UNet2DConditionModel, VaeMomentsEncoder,
+};
 
 /// SDXL `add_embedding` dims (diffusers `unet/config.json`): `addition_time_embed_dim = 256`,
 /// `projection_class_embeddings_input_dim = 2816` (pooled 1280 + 6·256). The InstantID UNet needs the
@@ -50,6 +52,18 @@ pub fn load_instantid_unet(
 pub fn load_sdxl_vae(device: &Device, dtype: DType) -> Result<AutoEncoderKL> {
     let config = StableDiffusionConfig::sdxl(None, None, None);
     Ok(config.build_vae(hf_get(VAE_FIX_REPO, VAE_FIX_FILE)?, device, dtype)?)
+}
+
+/// Load the **deterministic VAE moments-encoder** for the SDXL edit path (sc-6037) — the encode
+/// counterpart of [`load_sdxl_vae`], built from the SAME f16-stable VAE checkpoint
+/// (`madebyollin/sdxl-vae-fp16-fix`). candle's stock `AutoEncoderKL` exposes only `decode` plus a
+/// device-RNG `sample` (non-portable; the very thing sc-3673 banned), so [`VaeMomentsEncoder`]
+/// (vendored for the trainer, sc-5165) is reused to take the clean latent **mean** × [`VAE_SCALE`]
+/// (0.13025) — the launch-portable img2img/inpaint init latent (no sampling, no device RNG).
+pub fn load_sdxl_vae_encoder(device: &Device, dtype: DType) -> Result<VaeMomentsEncoder> {
+    let vae_file = hf_get(VAE_FIX_REPO, VAE_FIX_FILE)?;
+    let vs = unsafe { VarBuilder::from_mmaped_safetensors(&[vae_file], dtype, device)? };
+    Ok(VaeMomentsEncoder::new(vs, VAE_SCALE)?)
 }
 
 /// Load a stock diffusers SDXL `ControlNetModel` (the InstantID IdentityNet, or the OpenPose CN for
