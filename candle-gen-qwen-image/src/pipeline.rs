@@ -47,6 +47,21 @@ pub fn unpack_latents(packed: &Tensor, width: u32, height: u32) -> Result<Tensor
         .contiguous()
 }
 
+/// Pack a VAE latent `[1, 16, H/8, W/8]` → the packed token sequence `[1, seq, 64]` (the 2×2 patchify;
+/// the inverse of [`unpack_latents`]). Used to feed a VAE-encoded control image to the ControlNet
+/// branch (sc-5489) in the same packed space the noise lives in.
+pub fn pack_latents(latent: &Tensor, width: u32, height: u32) -> Result<Tensor> {
+    let (lat_h, lat_w) = latent_dims(width, height);
+    let c = LATENT_CHANNELS;
+    let p = PATCH;
+    // [1, 16, h/8, w/8] -> [1, 16, lat_h, 2, lat_w, 2] -> [1, lat_h, lat_w, 16, 2, 2] -> [1, seq, 64]
+    latent
+        .reshape((1, c, lat_h, p, lat_w, p))?
+        .permute((0, 2, 4, 1, 3, 5))?
+        .contiguous()?
+        .reshape((1, lat_h * lat_w, c * p * p))
+}
+
 /// The Qwen-Image sigma schedule (length `steps + 1`, descending to 0): a linspace `1 → 1/n` warped
 /// by an image-area-driven exponential μ shift, then rescaled so the terminal one-minus-σ hits
 /// `1 − 0.02`, then a trailing `0.0`.
@@ -130,6 +145,19 @@ mod tests {
         let packed = create_noise(1, 256, 256, &Device::Cpu).unwrap();
         let un = unpack_latents(&packed, 256, 256).unwrap();
         assert_eq!(un.dims(), &[1, 16, 32, 32]); // H/8 = 256/8
+    }
+
+    #[test]
+    fn pack_is_unpack_inverse() {
+        // pack(unpack(x)) == x: the control encode-path packing must round-trip the noise packing.
+        let packed = create_noise(3, 256, 384, &Device::Cpu).unwrap();
+        let latent = unpack_latents(&packed, 256, 384).unwrap();
+        assert_eq!(latent.dims(), &[1, 16, 48, 32]); // (H/8, W/8) = (384/8, 256/8)
+        let repacked = pack_latents(&latent, 256, 384).unwrap();
+        assert_eq!(repacked.dims(), packed.dims());
+        let a = packed.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = repacked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(a, b, "pack∘unpack must be identity");
     }
 
     #[test]

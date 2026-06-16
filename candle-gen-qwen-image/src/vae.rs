@@ -282,3 +282,142 @@ impl QwenVae {
         self.conv_out.forward(&h)
     }
 }
+
+/// A spatial 2× **down**sample (the encoder's `down_blocks.{i}.resample.1`): an asymmetric pad
+/// (bottom/right by 1) then a stride-2 3×3 conv — the fork's `Resample3d` downsample (the temporal
+/// `time_conv` is unused for a single image, like the decoder upsampler). The `resample.1` weight is a
+/// native 2-D conv on disk (`[C, C, 3, 3]`), so it loads directly (no causal-3d depth-tap reduction).
+struct Downsampler {
+    conv: Conv2d,
+}
+
+impl Downsampler {
+    fn new(channels: usize, vb: VarBuilder) -> Result<Self> {
+        let r = vb.pp("resample").pp("1");
+        let w = r.get((channels, channels, 3, 3), "weight")?.contiguous()?;
+        let b = r.get(channels, "bias")?;
+        Ok(Self {
+            conv: Conv2d::new(
+                w,
+                Some(b),
+                Conv2dConfig {
+                    padding: 0,
+                    stride: 2,
+                    ..Default::default()
+                },
+            ),
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // Asymmetric pad: H bottom +1, W right +1 (NCHW dims 2, 3), then valid stride-2 conv.
+        let x = x.pad_with_zeros(2, 0, 1)?.pad_with_zeros(3, 0, 1)?;
+        self.conv.forward(&x)
+    }
+}
+
+/// One encoder `down_blocks.{i}` module — the flat diffusers list mixes resnets and downsamplers.
+enum DownModule {
+    Res(Resnet),
+    Down(Downsampler),
+}
+
+impl DownModule {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            DownModule::Res(r) => r.forward(x),
+            DownModule::Down(d) => d.forward(x),
+        }
+    }
+}
+
+/// The Qwen-Image **VAE encoder** (sc-5489): image → scaled 16-ch latent, the inverse of
+/// [`QwenVae::decode`]. Needed by the ControlNet path (the pose skeleton is VAE-encoded + packed before
+/// the control branch sees it). The on-disk `encoder.down_blocks` is a **flat** list of 11 modules —
+/// `[res, res, ↓, res(+sc), res, ↓, res(+sc), res, ↓, res, res]` (3 spatial downsamples → /8, channels
+/// 96→192→384) — unlike the nested decoder `up_blocks`. Reuses the decoder's [`Resnet`]/[`MidAttention`]/
+/// [`ChanNorm`]/`causal_conv2d`. Loaded separately from [`QwenVae`] so the txt2img path stays decode-only.
+pub struct QwenVaeEncoder {
+    conv_in: Conv2d,
+    down: Vec<DownModule>,
+    mid_resnet0: Resnet,
+    mid_attn: MidAttention,
+    mid_resnet1: Resnet,
+    norm_out: ChanNorm,
+    conv_out: Conv2d,
+    quant_conv: Conv2d,
+    mean: Tensor, // [1,16,1,1]
+    std: Tensor,  // [1,16,1,1]
+}
+
+impl QwenVaeEncoder {
+    pub fn new(vb: VarBuilder) -> Result<Self> {
+        let device = vb.device();
+        let mean = Tensor::from_vec(LATENTS_MEAN.to_vec(), (1, 16, 1, 1), device)?;
+        let std = Tensor::from_vec(LATENTS_STD.to_vec(), (1, 16, 1, 1), device)?;
+        let quant_conv = causal_conv2d(32, 32, 1, 0, vb.pp("quant_conv"))?;
+
+        let enc = vb.pp("encoder");
+        let conv_in = causal_conv2d(3, 96, 3, 1, enc.pp("conv_in"))?;
+        // (is_downsample, in_c, out_c) per flat `down_blocks` index (read from the checkpoint shapes).
+        let schedule: [(bool, usize, usize); 11] = [
+            (false, 96, 96),
+            (false, 96, 96),
+            (true, 96, 96),
+            (false, 96, 192),
+            (false, 192, 192),
+            (true, 192, 192),
+            (false, 192, 384),
+            (false, 384, 384),
+            (true, 384, 384),
+            (false, 384, 384),
+            (false, 384, 384),
+        ];
+        let mut down = Vec::with_capacity(schedule.len());
+        for (i, &(is_down, in_c, out_c)) in schedule.iter().enumerate() {
+            let dvb = enc.pp("down_blocks").pp(i);
+            if is_down {
+                down.push(DownModule::Down(Downsampler::new(in_c, dvb)?));
+            } else {
+                down.push(DownModule::Res(Resnet::new(in_c, out_c, dvb)?));
+            }
+        }
+
+        let mid = enc.pp("mid_block");
+        let mid_resnet0 = Resnet::new(384, 384, mid.pp("resnets").pp("0"))?;
+        let mid_attn = MidAttention::new(384, mid.pp("attentions").pp("0"))?;
+        let mid_resnet1 = Resnet::new(384, 384, mid.pp("resnets").pp("1"))?;
+        let norm_out = ChanNorm::new(384, enc.pp("norm_out"), "gamma")?;
+        let conv_out = causal_conv2d(384, 32, 3, 1, enc.pp("conv_out"))?;
+
+        Ok(Self {
+            conv_in,
+            down,
+            mid_resnet0,
+            mid_attn,
+            mid_resnet1,
+            norm_out,
+            conv_out,
+            quant_conv,
+            mean,
+            std,
+        })
+    }
+
+    /// Encode an image `[1, 3, H, W]` in `[-1, 1]` (NCHW) → the scaled 16-ch latent `[1, 16, H/8, W/8]`
+    /// (the `(z − mean)/std` normalization the DiT consumes — inverse of `decode`'s `z·std + mean`).
+    pub fn encode(&self, image: &Tensor) -> Result<Tensor> {
+        let mut h = self.conv_in.forward(&image.to_dtype(DType::F32)?)?;
+        for m in &self.down {
+            h = m.forward(&h)?;
+        }
+        h = self.mid_resnet0.forward(&h)?;
+        h = self.mid_attn.forward(&h)?;
+        h = self.mid_resnet1.forward(&h)?;
+        let h = self.norm_out.forward(&h)?.silu()?;
+        let h = self.conv_out.forward(&h)?; // [1, 32, H/8, W/8]
+        let e = self.quant_conv.forward(&h)?; // [1, 32, H/8, W/8]
+        let e16 = e.narrow(1, 0, 16)?; // keep the mean (first 16 of 32)
+        e16.broadcast_sub(&self.mean)?.broadcast_div(&self.std)
+    }
+}

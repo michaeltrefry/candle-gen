@@ -355,6 +355,35 @@ impl QwenTransformer {
         lat_h: usize,
         lat_w: usize,
     ) -> Result<Tensor> {
+        // The plain path is `forward_control` with no residuals — byte-identical (the match below is
+        // inert when `residuals = None`), so the txt2img parity path has a single source of truth.
+        self.forward_control(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            lat_h,
+            lat_w,
+            None,
+            0.0,
+        )
+    }
+
+    /// [`forward`] with optional ControlNet residual injection (sc-5489): after base block `i` the
+    /// residual `residuals[i / interval]` (pre-scaled by `control_scale`) is added to the image stream,
+    /// where `interval = ceil(num_blocks / num_residuals)` (60 base blocks, 5 control residuals →
+    /// interval 12) — the diffusers `QwenImageTransformer2DModel` `index_block // interval_control`
+    /// pattern. `residuals = None` (or empty) is byte-identical to the plain forward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_control(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        timestep: f32,
+        lat_h: usize,
+        lat_w: usize,
+        residuals: Option<&[Tensor]>,
+        control_scale: f32,
+    ) -> Result<Tensor> {
         let temb = self
             .time_embed
             .forward(timestep, &self.device, self.dtype)?;
@@ -366,15 +395,127 @@ impl QwenTransformer {
         let (img_cos, img_sin) = self.rope.img_cos_sin(lat_h, lat_w, &self.device)?;
         let (txt_cos, txt_sin) = self.rope.txt_cos_sin(txt_seq, lat_h, lat_w, &self.device)?;
 
-        for block in &self.blocks {
+        // Treat an empty slice as "no control" so the group index can't underflow. Pre-scale the (few)
+        // control residuals once, before the 60-block loop.
+        let residuals = residuals.filter(|r| !r.is_empty());
+        let interval = residuals.map(|r| self.blocks.len().div_ceil(r.len().max(1)));
+        let scaled: Option<Vec<Tensor>> = match residuals {
+            Some(res) => Some(
+                res.iter()
+                    .map(|r| r * control_scale as f64)
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            None => None,
+        };
+
+        for (i, block) in self.blocks.iter().enumerate() {
+            let (e, h) = block.forward(
+                &hidden, &encoder, &temb, &img_cos, &img_sin, &txt_cos, &txt_sin,
+            )?;
+            encoder = e;
+            // After each base block, add the pre-scaled control residual for this block's group:
+            // diffusers `hidden_states = hidden_states + controlnet_block_samples[i // interval]`.
+            hidden = match (&scaled, interval) {
+                (Some(res), Some(interval)) => {
+                    let idx = (i / interval).min(res.len() - 1);
+                    (h + &res[idx])?
+                }
+                _ => h,
+            };
+        }
+
+        let hidden = self.norm_out.forward(&hidden, &temb)?;
+        self.proj_out.forward(&hidden)
+    }
+}
+
+/// The Qwen-Image **ControlNet-Union** control transformer (sc-5489) — the candle port of the InstantX
+/// `Qwen-Image-ControlNet-Union` `QwenImageControlNetModel`. A small (5-block) partial copy of the base
+/// MMDiT with its own input projections + a zero-init `controlnet_x_embedder` that adds the packed
+/// VAE-encoded control image to `img_in(x)`; each block's output is projected by a zero-init
+/// `controlnet_blocks[i]` into a residual. The residuals are injected into the frozen base transformer
+/// at `interval = ceil(60/5) = 12` (see [`QwenTransformer::forward_control`]). The block math is the
+/// **same** [`Block`] as the base (identical on-disk keys), so the loader reuses it.
+pub struct QwenControlNet {
+    img_in: Linear,
+    txt_norm: RmsNorm,
+    txt_in: Linear,
+    time_embed: TimeEmbed,
+    /// Zero-init projection of the packed control latent (`64 → inner`), added to `img_in(x)`.
+    x_embedder: Linear,
+    blocks: Vec<Block>,
+    /// Zero-init per-block residual projections (`inner → inner`).
+    controlnet_blocks: Vec<Linear>,
+    rope: QwenRope,
+    device: Device,
+    dtype: DType,
+}
+
+impl QwenControlNet {
+    /// Load the control branch (`num_layers` blocks — 5 for the InstantX Union) from its single-file
+    /// checkpoint (the base block keys + `controlnet_x_embedder` + `controlnet_blocks.{i}`).
+    pub fn new(cfg: &TransformerConfig, num_layers: usize, vb: VarBuilder) -> Result<Self> {
+        let inner = cfg.inner_dim();
+        let mut blocks = Vec::with_capacity(num_layers);
+        let mut controlnet_blocks = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            blocks.push(Block::new(cfg, vb.pp("transformer_blocks").pp(i))?);
+            controlnet_blocks.push(linear(inner, inner, vb.pp("controlnet_blocks").pp(i))?);
+        }
+        Ok(Self {
+            img_in: linear(cfg.in_channels, inner, vb.pp("img_in"))?,
+            txt_norm: rms_norm(cfg.joint_attention_dim, cfg.eps, vb.pp("txt_norm"))?,
+            txt_in: linear(cfg.joint_attention_dim, inner, vb.pp("txt_in"))?,
+            time_embed: TimeEmbed::new(cfg, vb.pp("time_text_embed"))?,
+            x_embedder: linear(cfg.in_channels, inner, vb.pp("controlnet_x_embedder"))?,
+            blocks,
+            controlnet_blocks,
+            rope: QwenRope::new(cfg),
+            device: vb.device().clone(),
+            dtype: vb.dtype(),
+        })
+    }
+
+    /// The number of control residuals (= control layers); drives the base injection interval.
+    pub fn num_residuals(&self) -> usize {
+        self.controlnet_blocks.len()
+    }
+
+    /// Run the control branch → the per-block residuals (pre-scale), one per control layer.
+    /// `hidden_states`: the current packed noise latents `[1, seq, 64]`; `control_cond`: the packed
+    /// VAE-encoded control image `[1, seq, 64]` (constant across steps); `encoder_hidden_states`: text
+    /// `[1, txt_seq, 3584]`; `timestep`: the same raw sigma the base forward uses.
+    pub fn forward(
+        &self,
+        hidden_states: &Tensor,
+        control_cond: &Tensor,
+        encoder_hidden_states: &Tensor,
+        timestep: f32,
+        lat_h: usize,
+        lat_w: usize,
+    ) -> Result<Vec<Tensor>> {
+        let temb = self
+            .time_embed
+            .forward(timestep, &self.device, self.dtype)?;
+        // diffusers `hidden_states = self.img_in(x) + self.controlnet_x_embedder(controlnet_cond)`.
+        let mut hidden =
+            (self.img_in.forward(hidden_states)? + self.x_embedder.forward(control_cond)?)?;
+        let encoder = self.txt_norm.forward(encoder_hidden_states)?;
+        let mut encoder = self.txt_in.forward(&encoder)?;
+
+        let txt_seq = encoder.dim(1)?;
+        let (img_cos, img_sin) = self.rope.img_cos_sin(lat_h, lat_w, &self.device)?;
+        let (txt_cos, txt_sin) = self.rope.txt_cos_sin(txt_seq, lat_h, lat_w, &self.device)?;
+
+        let mut residuals = Vec::with_capacity(self.blocks.len());
+        for (block, cn) in self.blocks.iter().zip(&self.controlnet_blocks) {
             let (e, h) = block.forward(
                 &hidden, &encoder, &temb, &img_cos, &img_sin, &txt_cos, &txt_sin,
             )?;
             encoder = e;
             hidden = h;
+            residuals.push(cn.forward(&hidden)?);
         }
-
-        let hidden = self.norm_out.forward(&hidden, &temb)?;
-        self.proj_out.forward(&hidden)
+        Ok(residuals)
     }
 }

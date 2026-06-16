@@ -19,11 +19,22 @@
 //! / LoRA / quantization surface is **deferred** and rejected. `backend = "candle"`, `mac_only = false`.
 
 pub mod config;
+// Qwen-Image ControlNet (strict pose) — the candle reference-pose lane (sc-5489, epic 5480). The pose
+// skeleton is VAE-encoded + packed and fed to the InstantX control branch, whose per-block residuals
+// inject into the frozen base MMDiT. A bespoke provider the worker drives directly (the registered
+// `qwen_image` descriptor stays txt2img-only).
+pub mod control;
 pub mod pipeline;
 pub mod rope;
 pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
+
+pub use control::{QwenControl, QwenControlPaths, QwenControlRequest, DEFAULT_CONTROL_SCALE};
+
+/// Qwen-Image ControlNet (strict-pose) real-weight GPU validation (sc-5489) — env-driven, `#[ignore]`d.
+#[cfg(test)]
+mod control_validate;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
