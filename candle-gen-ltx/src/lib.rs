@@ -101,26 +101,50 @@ impl Pipeline {
         }
     }
 
-    /// The single LTX-2.3 checkpoint file in `root` (the distilled 22B model, not a LoRA/upscaler).
+    /// The single full **dense bf16** LTX-2.3 checkpoint in `root` — the 22B model bundling DiT + VAE +
+    /// audio-VAE + vocoder + projection (not a LoRA / upscaler / fp8 variant). Handles both the base
+    /// `Lightricks/LTX-2.3` (`ltx-2.3-22b-distilled*.safetensors`) and full-model fine-tunes whose file
+    /// is named differently (e.g. the eros merge's `10Eros_v1_bf16.safetensors`, sc-5495): the snapshot
+    /// may carry several `.safetensors` (bf16 + fp8 variants), so prefer `distilled`, then a `bf16`
+    /// dense file, then the largest remaining — fp8/mixed are skipped (candle loads the bf16 weights).
     fn ltx_checkpoint(&self) -> CResult<PathBuf> {
+        let lname = |p: &Path| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase()
+        };
         let mut cands: Vec<PathBuf> = std::fs::read_dir(&self.root)
             .map_err(|e| CandleError::Msg(format!("ltx: read snapshot dir: {e}")))?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
-                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let name = lname(p);
                 name.ends_with(".safetensors")
-                    && name.contains("distilled")
                     && !name.contains("lora")
                     && !name.contains("upscaler")
+                    && !name.contains("fp8")
+                    && !name.contains("mixed")
             })
             .collect();
         cands.sort();
-        cands.into_iter().next().ok_or_else(|| {
-            CandleError::Msg(format!(
-                "ltx: no `ltx-2.3-*-distilled.safetensors` in {} (expected an LTX-2.3 snapshot)",
+        if cands.is_empty() {
+            return Err(CandleError::Msg(format!(
+                "ltx: no dense LTX-2.3 `.safetensors` checkpoint in {} (expected e.g. \
+                 `ltx-2.3-22b-distilled.safetensors` or a `*_bf16.safetensors` full-model fine-tune)",
                 self.root.display()
-            ))
-        })
+            )));
+        }
+        if let Some(p) = cands.iter().find(|p| lname(p).contains("distilled")) {
+            return Ok(p.clone());
+        }
+        if let Some(p) = cands.iter().find(|p| lname(p).contains("bf16")) {
+            return Ok(p.clone());
+        }
+        // No name hint — the full dense model dwarfs any aux file, so take the largest.
+        Ok(cands
+            .into_iter()
+            .max_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .expect("cands non-empty"))
     }
 
     /// The Gemma-3-12B encoder snapshot dir (`LTX_GEMMA_DIR`, or `<root>/text_encoder`).
@@ -440,6 +464,49 @@ mod tests {
         assert_eq!(g.descriptor().family, "ltx");
         assert_eq!(g.descriptor().backend, "candle");
         assert_eq!(g.descriptor().modality, Modality::Video);
+    }
+
+    #[test]
+    fn ltx_checkpoint_selects_base_distilled_and_eros_bf16() {
+        // Helper: a temp dir seeded with `files`, then `ltx_checkpoint()`'s chosen file name.
+        let pick = |tag: &str, files: &[&str]| -> String {
+            let dir = std::env::temp_dir().join(format!("ltx_ckpt_{tag}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in files {
+                std::fs::write(dir.join(f), b"x").unwrap();
+            }
+            let pipe = Pipeline::load(&dir, &Device::Cpu);
+            let got = pipe.ltx_checkpoint().unwrap();
+            let name = got.file_name().unwrap().to_str().unwrap().to_owned();
+            std::fs::remove_dir_all(&dir).unwrap();
+            name
+        };
+        // Base `Lightricks/LTX-2.3`: the distilled file wins over dev / lora / upscaler.
+        assert_eq!(
+            pick(
+                "base",
+                &[
+                    "ltx-2.3-22b-dev.safetensors",
+                    "ltx-2.3-22b-distilled.safetensors",
+                    "ltx-2.3-22b-distilled-lora-384.safetensors",
+                    "ltx-2.3-spatial-upscaler-x2.safetensors",
+                ],
+            ),
+            "ltx-2.3-22b-distilled.safetensors"
+        );
+        // Eros merge: the dense `_bf16` file wins; the fp8 / mixed variants are skipped.
+        assert_eq!(
+            pick(
+                "eros",
+                &[
+                    "10Eros_v1_bf16.safetensors",
+                    "10Eros_v1-fp8mixed_learned.safetensors",
+                    "10Eros_v1_fp8_transformer.safetensors",
+                ],
+            ),
+            "10Eros_v1_bf16.safetensors"
+        );
     }
 
     #[test]
