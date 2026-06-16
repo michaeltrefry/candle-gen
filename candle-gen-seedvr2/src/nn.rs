@@ -5,10 +5,18 @@
 use candle_gen::candle_core::{DType, Result, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 
-/// `[out,in]`-weight dense layer: `y = x·Wᵀ (+ b)`. Handles 2-D and batched `x`.
+/// `[out,in]`-weight dense layer: `y = x·Wᵀ (+ b)`. Flattens all leading dims into one 2-D GEMM and
+/// reshapes back — candle's `matmul` rejects the non-contiguous broadcasted rhs that `broadcast_matmul`
+/// produces for a high-rank `x` (e.g. the 5-D patchified tokens), and the flattened GEMM is faster.
 pub fn linear(x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
     let wt = w.t()?.contiguous()?; // [in, out]
-    let y = x.broadcast_matmul(&wt)?;
+    let (in_dim, out_dim) = (wt.dim(0)?, wt.dim(1)?);
+    let dims = x.dims().to_vec();
+    let lead: usize = dims[..dims.len() - 1].iter().product();
+    let y = x.contiguous()?.reshape((lead, in_dim))?.matmul(&wt)?; // [lead, out]
+    let mut out_shape = dims[..dims.len() - 1].to_vec();
+    out_shape.push(out_dim);
+    let y = y.reshape(out_shape)?;
     match b {
         Some(b) => y.broadcast_add(b),
         None => Ok(y),
