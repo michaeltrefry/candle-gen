@@ -390,6 +390,7 @@ name = "candle-gen-seedvr2"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "image",
  "inventory",
  "rand",
  "rand_distr",
