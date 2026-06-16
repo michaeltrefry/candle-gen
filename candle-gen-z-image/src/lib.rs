@@ -26,7 +26,19 @@ mod dit;
 mod pipeline;
 mod training;
 
+// Fun-ControlNet (strict-pose) provider (sc-5489, epic 5480) — VACE-style dual-injection control on
+// the vendored DiT (`alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1`). Invoked directly by the
+// worker (a bespoke pose stream), not gen-core-registered — the `z_image_turbo` descriptor stays
+// txt2img-only.
+pub mod control;
+
+// Z-Image Fun-ControlNet real-weight GPU validation (sc-5489) — env-driven, `#[ignore]`d integration
+// test (with-control vs no-control pixel diff + mid-denoise cancel).
+#[cfg(test)]
+mod control_validate;
+
 pub use adapters::{merge_adapters, MergeReport};
+pub use control::{ZImageControl, ZImageControlPaths, ZImageControlRequest, DEFAULT_CONTROL_SCALE};
 
 use std::path::PathBuf;
 use std::sync::Mutex;

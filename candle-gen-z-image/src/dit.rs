@@ -306,22 +306,27 @@ impl ZImageTransformerBlock {
 /// `ZImageTransformer2DModel`. Built from the *same* `transformer/` safetensors keys (the reuse +
 /// the unchanged sub-module paths guarantee key parity), so it loads the real weights unchanged and,
 /// with no adapter installed, reproduces the stock forward bit-for-bit (`parity_tests`).
+// Fields are `pub(crate)` so the VACE-style ControlNet wrapper ([`crate::control`], a sibling module)
+// can run the dual-injection forward: it interleaves the base `noise_refiner` / `layers` loops with a
+// parallel control stack (control hints added after specific base blocks), which the single `forward`
+// can't express, so it re-walks the embed → refiner → main phases reading these directly. None of this
+// widening changes the txt2img/training paths (same module-internal reads).
 #[derive(Debug, Clone)]
 pub struct ZImageTransformer2DModel {
-    t_embedder: TimestepEmbedder,
-    cap_embedder_norm: RmsNorm,
-    cap_embedder_linear: candle_nn::Linear,
-    x_embedder: candle_nn::Linear,
-    final_layer: FinalLayer,
+    pub(crate) t_embedder: TimestepEmbedder,
+    pub(crate) cap_embedder_norm: RmsNorm,
+    pub(crate) cap_embedder_linear: candle_nn::Linear,
+    pub(crate) x_embedder: candle_nn::Linear,
+    pub(crate) final_layer: FinalLayer,
     #[allow(dead_code)]
     x_pad_token: Tensor,
     #[allow(dead_code)]
     cap_pad_token: Tensor,
-    noise_refiner: Vec<ZImageTransformerBlock>,
-    context_refiner: Vec<ZImageTransformerBlock>,
-    layers: Vec<ZImageTransformerBlock>,
-    rope_embedder: RopeEmbedder,
-    cfg: Config,
+    pub(crate) noise_refiner: Vec<ZImageTransformerBlock>,
+    pub(crate) context_refiner: Vec<ZImageTransformerBlock>,
+    pub(crate) layers: Vec<ZImageTransformerBlock>,
+    pub(crate) rope_embedder: RopeEmbedder,
+    pub(crate) cfg: Config,
 }
 
 /// The constant side tensors the **main** transformer layers and the final layer consume, produced
