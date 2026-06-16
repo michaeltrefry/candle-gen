@@ -31,10 +31,21 @@ mod unet;
 // Invoked directly by the worker (a bespoke reference stream), not gen-core-registered.
 pub mod ip_provider;
 
+// ControlNet (strict-pose) provider (sc-5489, epic 5480) — a rendered OpenPose skeleton drives the
+// `Kwai-Kolors/Kolors-ControlNet-Pose` SDXL-family `ControlNetModel`, whose per-block residuals are
+// added into the vendored SDXL UNet (no IP installed). Invoked directly by the worker (a bespoke pose
+// stream), not gen-core-registered.
+pub mod control;
+
 // Kolors IP-Adapter-Plus real-weight GPU validation (sc-5488) — env-driven, `#[ignore]`d integration
 // test (the Kolors sibling of the SDXL IP-Adapter Phase-5 harness).
 #[cfg(test)]
 mod ip_validate;
+
+// Kolors ControlNet (strict-pose) real-weight GPU validation (sc-5489) — env-driven, `#[ignore]`d
+// integration test (with-control vs no-control pixel diff + mid-denoise cancel).
+#[cfg(test)]
+mod control_validate;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -47,6 +58,7 @@ use candle_gen::gen_core::{
 };
 
 pub use config::{descriptor, MODEL_ID, SIZE_MULTIPLE};
+pub use control::{KolorsControl, KolorsControlPaths, KolorsControlRequest, DEFAULT_CONTROL_SCALE};
 pub use ip_provider::{
     IpAdapterKolors, IpAdapterKolorsPaths, IpAdapterKolorsRequest, DEFAULT_IP_ADAPTER_SCALE,
 };

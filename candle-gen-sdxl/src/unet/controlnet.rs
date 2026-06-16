@@ -91,6 +91,24 @@ impl ControlNetConfig {
             cond_block_out_channels: vec![16, 32, 96, 256],
         }
     }
+
+    /// The **Kolors** ControlNet config (`Kwai-Kolors/Kolors-ControlNet-*`, sc-5489). Kolors is an
+    /// SDXL-family UNet, so the down/mid geometry + the conditioning-embedding conv stack are identical
+    /// to SDXL; the one delta is the `add_embedding` projection input — `projection_class_embeddings_
+    /// input_dim = 5632` (the ChatGLM3 pooled **4096** + `time_ids_len`·`addition_time_embed_dim`
+    /// (6·256) = 1536), vs SDXL's 2816 (pooled 1280). The Kolors `ControlNetModel` ALSO ships its own
+    /// `encoder_hid_proj` (4096→2048) — loaded + applied by the `candle-gen-kolors` control provider, NOT
+    /// here, since [`ControlNet::forward`] takes the cross-attention `encoder_x` already projected (the
+    /// branch stays a generic primitive, exactly as for the SDXL/InstantID `encoder_x`).
+    pub fn kolors() -> Self {
+        Self {
+            unet: sdxl_unet_config(),
+            addition_time_embed_dim: 256,
+            projection_class_embeddings_input_dim: 5632,
+            conditioning_channels: 3,
+            cond_block_out_channels: vec![16, 32, 96, 256],
+        }
+    }
 }
 
 /// `ControlNetConditioningEmbedding`: `conv_in(cond_ch→16) → SiLU → [block → SiLU]×6 → conv_out
@@ -511,6 +529,23 @@ mod tests {
             conditioning_channels: 3,
             cond_block_out_channels: vec![16, 32, 96, 256],
         }
+    }
+
+    #[test]
+    fn kolors_config_differs_from_sdxl_only_in_add_embedding_input() {
+        let sdxl = ControlNetConfig::sdxl();
+        let kolors = ControlNetConfig::kolors();
+        // The one Kolors delta: the `add_embedding` projection input is 5632 (ChatGLM3 pooled 4096 +
+        // 6·256) vs SDXL's 2816 (pooled 1280 + 6·256). The down/mid geometry + cond-embed convs match.
+        assert_eq!(sdxl.projection_class_embeddings_input_dim, 2816);
+        assert_eq!(kolors.projection_class_embeddings_input_dim, 4096 + 6 * 256);
+        assert_eq!(kolors.addition_time_embed_dim, sdxl.addition_time_embed_dim);
+        assert_eq!(kolors.conditioning_channels, sdxl.conditioning_channels);
+        assert_eq!(kolors.cond_block_out_channels, sdxl.cond_block_out_channels);
+        assert_eq!(
+            residual_channels(&kolors.unet),
+            residual_channels(&sdxl.unet)
+        );
     }
 
     #[test]
