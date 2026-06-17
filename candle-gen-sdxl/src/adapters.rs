@@ -136,7 +136,8 @@ fn build_kohya_table(base: &HashMap<String, Tensor>) -> BTreeMap<String, String>
 }
 
 /// Map one LoRA key to `(diffusers_dotted_path, role)`, or `None` if outside the UNet merge surface.
-/// kohya (`lora_unet_<flat>…`) resolves the flattened stem via `table`; PEFT (`base_model.model.unet.`)
+/// kohya (`lora_unet_<flat>…`) resolves the flattened stem via `table` — directly for a diffusers-named
+/// stem, or via an original-SD/A1111 → diffusers translation (sc-6051); PEFT (`base_model.model.unet.`)
 /// and bare dotted paths resolve directly.
 fn classify_lora_key(key: &str, table: &BTreeMap<String, String>) -> Option<(String, Role)> {
     if let Some(rem) = key.strip_prefix(KOHYA_PREFIX) {
@@ -146,7 +147,7 @@ fn classify_lora_key(key: &str, table: &BTreeMap<String, String>) -> Option<(Str
             (".alpha", Role::Alpha),
         ] {
             if let Some(stem) = rem.strip_suffix(suf) {
-                return table.get(stem).map(|d| (d.clone(), role));
+                return wmeta::resolve_kohya_stem(stem, table).map(|d| (d, role));
             }
         }
         return None;
@@ -176,7 +177,7 @@ fn classify_lokr_key(
         if let Some(stem) = key.strip_suffix(suf) {
             let factor = &suf[1..]; // drop the leading '.'
             return if let Some(flat) = stem.strip_prefix(KOHYA_PREFIX) {
-                table.get(flat).map(|d| (d.clone(), factor))
+                wmeta::resolve_kohya_stem(flat, table).map(|d| (d, factor))
             } else {
                 Some((
                     stem.strip_prefix(PEFT_PREFIX).unwrap_or(stem).to_string(),
@@ -655,7 +656,8 @@ pub fn merge_adapters(
         return Err(CandleError::Msg(format!(
             "sdxl: no adapter target modules matched across {} file(s) — expected PEFT \
              `base_model.model.unet.<path>.lora_A/B.weight` or kohya `lora_unet_<flat>.lora_down/up.\
-             weight` (LoRA, incl. conv layers), `<module>.lokr_w1/w2` with networkType=lokr (LoKr), \
+             weight` with diffusers `down_blocks_*` or original-SD `input_blocks_*` block naming \
+             (LoRA, incl. conv layers), `<module>.lokr_w1/w2` with networkType=lokr (LoKr), \
              or untagged LyCORIS `lokr_*` / `hada_*` (third-party LoKr / LoHa)",
             specs.len()
         )));
@@ -734,6 +736,38 @@ mod tests {
             &table
         )
         .is_none());
+    }
+
+    /// sc-6051: an original-SD / A1111 kohya key (`lora_unet_input_blocks_4_1_…`) classifies onto the
+    /// same diffusers dotted path as its `down_blocks` twin, so civitai SDXL LoRAs merge in candle too.
+    #[test]
+    fn classify_lora_translates_original_sd_naming() {
+        // A table holding a real down_blocks.1 attention path (the diffusers twin of input_blocks.4.1).
+        let table: BTreeMap<String, String> =
+            ["down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_q"]
+                .into_iter()
+                .map(|p| (p.replace('.', "_"), p.to_string()))
+                .collect();
+        let (p, role) = classify_lora_key(
+            "lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q.lora_down.weight",
+            &table,
+        )
+        .expect("original-SD input_blocks key should translate + resolve");
+        assert_eq!(
+            p,
+            "down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_q"
+        );
+        assert!(matches!(role, Role::Down));
+        // The LoKr classify path translates too (kohya-prefixed original-SD stem).
+        assert_eq!(
+            classify_lokr_key(
+                "lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q.lokr_w1",
+                &table,
+            )
+            .unwrap()
+            .0,
+            "down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_q"
+        );
     }
 
     /// PEFT LoRA merges into `W += (alpha/rank)·scale·B·A`; base+delta is exact in f32.
