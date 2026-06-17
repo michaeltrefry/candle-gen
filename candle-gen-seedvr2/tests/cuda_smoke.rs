@@ -43,6 +43,17 @@ fn synth_lr(side: usize) -> Image {
     }
 }
 
+/// Cosine similarity over two equal-length RGB8 pixel buffers.
+fn pixel_cosine(a: &[u8], b: &[u8]) -> f32 {
+    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += (*x as f64) * (*y as f64);
+        na += (*x as f64).powi(2);
+        nb += (*y as f64).powi(2);
+    }
+    (dot / (na.sqrt() * nb.sqrt()).max(1e-12)) as f32
+}
+
 /// Pearson correlation over two equal-length sequences.
 fn pearson(a: &[f32], b: &[f32]) -> f64 {
     let n = a.len() as f64;
@@ -142,4 +153,80 @@ fn cuda_upscale_smoke() {
         corr > 0.7,
         "upscale not structurally faithful to the LR (corr={corr:.4}) — likely a transcription bug"
     );
+}
+
+/// sc-6225: the **image** path ([`Seedvr2Pipeline::generate`]) must spatially tile when a single
+/// full-resolution pass would exceed the memory budget — previously it ran the whole frame in one
+/// pass with no budget check, so a large upscale tried a single oversized DiT/VAE allocation and
+/// CUDA-OOM'd (the off-Mac mirror of mlx-gen sc-6067). We drive the budget-injectable
+/// `generate_budgeted`: a huge ceiling → the one-pass still path; a tiny ceiling → forced
+/// over-budget → the feather-blended tiled path. Both must return the requested dims, and the tiled
+/// result must track the one-pass result (the tiler is the same parity-gated `run_frame_tiled`
+/// exercised by `cuda_video_hd_tiling_smoke`). Weight-gated; skips without the checkpoint.
+#[test]
+#[ignore = "needs SEEDVR2_CKPT weights + a CUDA build"]
+fn seedvr2_image_path_tiles_when_over_budget() {
+    let ckpt = match std::env::var("SEEDVR2_CKPT") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("SKIP: set SEEDVR2_CKPT to a numz/SeedVR2_comfyUI checkpoint dir");
+            return;
+        }
+    };
+    let dtype = match std::env::var("SEEDVR2_DTYPE").as_deref() {
+        Ok("bf16") => DType::BF16,
+        _ => DType::F32,
+    };
+    let device = candle_gen::default_device().expect("device");
+    let cfg = DitConfig::seedvr2_3b();
+    let pipe = Seedvr2Pipeline::load(&ckpt, DIT_FILE, &cfg, dtype, &device).expect("load pipeline");
+
+    // 512² target from a smooth LR gradient — large enough that the forced-tiny budget tiles it into
+    // an overlapping grid (tile floors well under 512 → a multi-tile grid over 512²).
+    let (w, h) = (512usize, 512usize);
+    let (lw, lh) = (160usize, 160usize);
+    let mut pixels = Vec::with_capacity(lw * lh * 3);
+    for y in 0..lh {
+        for x in 0..lw {
+            let g = ((x + y) * 255 / (lw + lh)) as u8;
+            pixels.push(g);
+            pixels.push(255 - g);
+            pixels.push(((x * 255) / lw) as u8);
+        }
+    }
+    let lr = Image {
+        width: lw as u32,
+        height: lh as u32,
+        pixels,
+    };
+
+    // Huge ceiling → one-pass still path; tiny ceiling → OverBudget → spatial-tiled path.
+    let single = pipe
+        .generate_budgeted(&lr, w, h, 7, 0.0, 1.0e9)
+        .expect("single-pass still path");
+    let tiled = pipe
+        .generate_budgeted(&lr, w, h, 7, 0.0, 1.0e-6)
+        .expect("spatial-tiled path");
+
+    assert_eq!(
+        (single.width, single.height),
+        (w as u32, h as u32),
+        "single-pass output dims"
+    );
+    assert_eq!(
+        (tiled.width, tiled.height),
+        (w as u32, h as u32),
+        "tiled output dims"
+    );
+    assert_eq!(
+        tiled.pixels.len(),
+        single.pixels.len(),
+        "buffer sizes match"
+    );
+
+    // The tiled result tracks the one-pass result closely (feather-blend; not bit-exact — the causal
+    // VAE sees different border padding per tile).
+    let cos = pixel_cosine(&tiled.pixels, &single.pixels);
+    eprintln!("[seedvr2-smoke] image-path tiled vs single-pass: cosine={cos:.6}");
+    assert!(cos > 0.95, "tiled image diverged from single-pass: {cos}");
 }
