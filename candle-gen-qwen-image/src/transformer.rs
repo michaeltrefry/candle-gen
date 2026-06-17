@@ -100,6 +100,66 @@ fn timestep_embedding(sigma: f32, dim: usize, device: &Device) -> Result<Tensor>
     Tensor::cat(&[&cos, &sin], D::Minus1)
 }
 
+/// Max elements in a single attention scores tensor `[B,H,Sq,Sk]` before [`attention`] chunks over the
+/// query rows. candle CUDA kernels index elements with **i32**, so a scores/probs tensor exceeding
+/// `i32::MAX` (~2.147B) silently corrupts its tail. The Qwen MMDiT runs ONE joint attention over the
+/// `[txt, noise(, ref)]` sequence (24 heads); the dual-latent edit path concatenates the reference
+/// latents after the noise, so its joint sequence grows fastest and at >~1024² (≳1280²) `H·Sq·Sk`
+/// exceeds the i32 limit → the trailing query rows get garbage attention → noise (sc-6217). 1.0B keeps
+/// each chunk well under the limit while leaving the txt2img / control sizes (≤ ~0.5B at 1024²) a single
+/// un-chunked pass, so those paths stay byte-identical.
+const ATTN_SCORES_BUDGET: usize = 1_000_000_000;
+
+/// SDPA over `[B,H,S,D]` q/k/v → `[B, S, H·D]`. scale = `head_dim^-0.5`. Chunks over the query rows when
+/// the full `[B,H,Sq,Sk]` scores tensor would exceed [`ATTN_SCORES_BUDGET`] (the candle CUDA i32-index
+/// limit). Each query row's softmax is over all keys and independent of the other rows, so the chunked
+/// result is numerically identical to the single pass — only the long edit/joint sequences trip it.
+fn attention(q: &Tensor, k: &Tensor, v: &Tensor, head_dim: usize) -> Result<Tensor> {
+    attention_budgeted(q, k, v, head_dim, ATTN_SCORES_BUDGET)
+}
+
+/// [`attention`] with an explicit per-block scores-element budget (so the chunking is unit-testable with
+/// a tiny budget that forces the chunked path on small tensors).
+fn attention_budgeted(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_dim: usize,
+    budget: usize,
+) -> Result<Tensor> {
+    let (b, h, s, d) = q.dims4()?;
+    let scale = (head_dim as f64).powf(-0.5);
+    let q = q.contiguous()?;
+    let k_t = k.transpose(2, 3)?.contiguous()?;
+    let v = v.contiguous()?;
+
+    // The largest query block whose `[B,H,block,S]` scores tensor stays within budget (the whole `S` for
+    // the txt2img sizes, so that path is the unchanged single matmul+softmax+matmul).
+    let block = if b * h * s * s <= budget {
+        s
+    } else {
+        (budget / (b * h * s)).max(1)
+    };
+
+    let o = if block >= s {
+        let scores = (q.matmul(&k_t)? * scale)?;
+        let probs = softmax_last_dim(&scores)?;
+        probs.matmul(&v)? // [B,H,S,D]
+    } else {
+        let mut blocks = Vec::new();
+        let mut start = 0;
+        while start < s {
+            let len = block.min(s - start);
+            let scores = (q.narrow(2, start, len)?.matmul(&k_t)? * scale)?;
+            let probs = softmax_last_dim(&scores)?;
+            blocks.push(probs.matmul(&v)?); // [B,H,len,D]
+            start += len;
+        }
+        Tensor::cat(&blocks, 2)? // [B,H,S,D]
+    };
+    o.transpose(1, 2)?.reshape((b, s, h * d))
+}
+
 /// Reshape `[B,S,inner]` → `[B,H,S,head_dim]`, applying per-head RMSNorm (over head_dim) for q/k.
 fn to_heads(x: &Tensor, heads: usize, head_dim: usize, norm: Option<&RmsNorm>) -> Result<Tensor> {
     let (b, s, _) = x.dims3()?;
@@ -233,12 +293,11 @@ impl JointAttention {
         let q = Tensor::cat(&[&tq, &iq], 2)?;
         let k = Tensor::cat(&[&tk, &ik], 2)?;
         let v = Tensor::cat(&[&tv, &iv], 2)?;
-        let scale = (hd as f64).powf(-0.5);
-        let scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
-        let probs = softmax_last_dim(&scores)?;
-        let o = probs.matmul(&v.contiguous()?)?; // [B,H,seq,hd]
-        let (b, _, seq, _) = o.dims4()?;
-        let o = o.transpose(1, 2)?.reshape((b, seq, h * hd))?;
+        // Chunk the joint attention over query rows when the [B,H,Sq,Sk] scores tensor would exceed the
+        // candle CUDA i32-index limit (long edit/joint sequences >~1024²); numerically identical to a
+        // single pass, and a no-op single pass for the txt2img / control sizes (sc-6217).
+        let o = attention(&q, &k, &v, hd)?; // [B, seq, h·hd]
+        let seq = o.dim(1)?;
         let txt_o = o.narrow(1, 0, txt_seq)?.contiguous()?;
         let img_o = o.narrow(1, txt_seq, seq - txt_seq)?.contiguous()?;
         Ok((
@@ -640,5 +699,33 @@ impl QwenControlNet {
             residuals.push(cn.forward(&hidden)?);
         }
         Ok(residuals)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunked_attention_matches_single_pass() {
+        // Per-query-row softmax is independent, so chunking over query rows (forced via a tiny budget)
+        // must match the single pass bit-for-bit — the guard for the i32-overflow fix (sc-6217).
+        let dev = Device::Cpu;
+        let (b, h, s, d) = (1usize, 2usize, 7usize, 4usize);
+        let q = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let k = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        // Huge budget → single pass; tiny budget (1) → chunked into single-row blocks.
+        let single = attention_budgeted(&q, &k, &v, d, usize::MAX).unwrap();
+        let chunked = attention_budgeted(&q, &k, &v, d, 1).unwrap();
+        assert_eq!(single.dims(), chunked.dims());
+        let a = single.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let c = chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (x, y) in a.iter().zip(&c) {
+            assert!(
+                (x - y).abs() < 1e-6,
+                "chunked attention diverged: {x} vs {y}"
+            );
+        }
     }
 }

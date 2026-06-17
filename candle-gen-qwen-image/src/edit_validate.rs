@@ -214,3 +214,50 @@ fn real_weight_edit() {
         "Qwen-Image-Edit validation PASS ✅ (eyeball the PPMs for reference-respecting edits)"
     );
 }
+
+/// sc-6217: a >1024² edit makes the joint `[txt, noise, ref]` sequence (24 heads) blow past candle's
+/// i32 attention-index limit in a single pass (at 1536² the scores tensor is ~8.2B > i32::MAX ~2.147B),
+/// which silently corrupts the trailing query rows → noise in the lower part of the image. The
+/// query-row chunking in `JointAttention` must keep the output coherent. This run would produce a
+/// corrupted/noisy tail WITHOUT the fix; with it the whole frame stays a coherent reference-respecting
+/// edit. Eyeball `qwen_edit_highres_1536.ppm` to confirm (the automated gates only catch NaN / flat).
+#[test]
+#[ignore = "real-weight GPU validation; set QWEN_EDIT_BASE/QWEN_EDIT_REF/QWEN_EDIT_OUT"]
+fn high_res_edit_avoids_i32_overflow() {
+    let out_dir = env_path("QWEN_EDIT_OUT");
+    std::fs::create_dir_all(&out_dir).ok();
+    let reference = read_ppm(&env_path("QWEN_EDIT_REF"));
+    let model = QwenEdit::load(&QwenEditPaths {
+        root: env_path("QWEN_EDIT_BASE"),
+    })
+    .expect("load QwenEdit");
+
+    let req = QwenEditRequest {
+        prompt: "turn it into a snowy winter landscape, heavy snowfall, cold blue tones".into(),
+        negative: "blurry, lowres, artifacts, watermark".into(),
+        width: 1536,
+        height: 1536,
+        steps: 20,
+        guidance: 4.0,
+        seed: 12345,
+        cancel: CancelFlag::new(),
+    };
+    let mut noop = |_p: Progress| {};
+
+    let t = std::time::Instant::now();
+    let out = model
+        .generate(&req, std::slice::from_ref(&reference), &mut noop)
+        .expect("generate 1536² edit");
+    let std = pixel_std(&out);
+    println!("[highres 1536²] {:?}, std {std:.2}", t.elapsed());
+    write_ppm(&out_dir.join("qwen_edit_highres_1536.ppm"), &out);
+
+    assert_eq!((out.width, out.height), (1536, 1536), "wrong output size");
+    assert!(
+        std.is_finite() && std > 5.0,
+        "1536² edit is NaN/degenerate (std {std:.2}) — i32 attention overflow not contained"
+    );
+    println!(
+        "sc-6217 high-res edit PASS ✅ (eyeball qwen_edit_highres_1536.ppm — no noisy bottom band)"
+    );
+}
