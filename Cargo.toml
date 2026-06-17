@@ -74,7 +74,15 @@ resolver = "2"
 # `7b89d45` -> `98592bb` (the delta is pure mlx-gen-seedvr2 Rust; mlx-rs unchanged 44929a0), so this is a
 # behavior-neutral alignment to the worker's actual mlx pin — candle builds nothing new. Closes the
 # sc-5905 catch-up for this rev and lets the sc-6217 worker re-pin resolve a single gen-core rev again.
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "98592bb0de7e76a99e9d944d19dd11f241e76d29" }
+#
+# Bumped `98592bb` -> `51a6792` (sc-6217 follow-up): the worker mlx pin advanced AGAIN `98592bb` ->
+# `51a6792` (mlx-gen #485 merge = the common descendant of sc-6067 SeedVR2 tiling + sc-6030 FLUX.2-dev
+# caption upsampling; surfaced by SceneWorks sc-6135 / #758) AFTER candle-gen #92 landed at `98592bb`,
+# re-opening the candle-lane rev skew. The gen-core delta `98592bb` -> `51a6792` is DOC-ONLY (the
+# sc-6030 `enhance_prompt` field comments — no contract / parity-snapshot change; mlx-rs unchanged
+# 44929a0), so this is again a behavior-neutral alignment to the worker's actual mlx pin — candle builds
+# nothing new. Keeps the sc-6217 worker re-pin (SceneWorks #759) resolving a SINGLE gen-core rev.
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "51a6792db3a1c94d23a9ae00e2414665b8c2c9f7" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels
