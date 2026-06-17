@@ -17,6 +17,11 @@ candle-gen = { path = "../candle-gen" }
 # candle-nn primitives — the same workspace pin candle-gen uses → one candle build (no skew).
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
+# The CLIP text tower's `tokenizer.json` (the shipped `facebook/sam3` lowercased word-BPE,
+# BOS 49406 / EOS 49407) — the HF Rust core `transformers` wraps, so ids match the reference
+# (sc-6241). Same workspace pin candle-gen-sdxl/kolors use; we drive it directly (no gen-core
+# tokenizer crate on the candle side).
+tokenizers = { workspace = true }
 
 [features]
 # Pass the backend selection through to the core crate so a downstream `--features cuda`/`metal`

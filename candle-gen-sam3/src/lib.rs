@@ -12,9 +12,12 @@
 //!
 //! ## Public API (a plain utility segmenter — not a generation-registry provider)
 //! Mirrors `mlx-gen-sam3`'s surface. Loaded incrementally as the slices land:
-//! * [`Sam3VisionEncoder`] — the shared PE ViT backbone + FPN neck (slice sc-6240; **this slice**).
-//! * `Sam3TextEncoder` / `Sam3Detector` / `Sam3MaskHead` / `Sam3ImageSegmenter` / `Sam3VideoModel` —
-//!   later slices (sc-6241…sc-6246).
+//! * [`Sam3VisionEncoder`] — the shared PE ViT backbone + FPN neck (slice sc-6240).
+//! * [`Sam3TextEncoder`] / [`Sam3Tokenizer`] — the CLIP-H text tower + `text_projection`
+//!   (1024→256) and the CLIP BPE tokenizer that produce the concept conditioning the DETR stack
+//!   consumes (slice sc-6241; **this slice**).
+//! * `Sam3Detector` / `Sam3MaskHead` / `Sam3ImageSegmenter` / `Sam3VideoModel` — later slices
+//!   (sc-6242…sc-6246).
 //!
 //! ## Layout note
 //! The MLX port runs NHWC and permutes the torch OIHW/IOHW conv kernels to MLX OHWI at load. candle's
@@ -25,8 +28,10 @@
 
 mod common;
 pub mod config;
+pub mod text;
 pub mod vision;
 
 pub use common::Weights;
 pub use config::{Sam3DetrConfig, Sam3GeometryConfig, Sam3TextConfig, Sam3VisionConfig};
+pub use text::{Sam3TextEncoder, Sam3Tokenizer};
 pub use vision::Sam3VisionEncoder;
