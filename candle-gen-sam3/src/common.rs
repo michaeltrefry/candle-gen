@@ -12,7 +12,7 @@ use std::path::Path;
 
 use candle_gen::candle_core::{safetensors, DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::softmax;
-use candle_gen::candle_nn::{LayerNorm, Module};
+use candle_gen::candle_nn::{GroupNorm, LayerNorm, Module};
 use candle_gen::{CandleError, Result};
 
 /// A loaded SAM3 weight map. Tensors are coerced to f32 on load — the parity oracle is f32 and SAM3
@@ -194,4 +194,29 @@ pub(crate) fn maxpool2d_nhwc(x: &Tensor, k: usize) -> Result<Tensor> {
     let xc = x.permute([0, 3, 1, 2])?.contiguous()?;
     let y = xc.max_pool2d(k)?;
     Ok(y.permute([0, 2, 3, 1])?.contiguous()?)
+}
+
+/// GroupNorm over an NHWC activation (the mask decoder runs channels-last). candle's [`GroupNorm`]
+/// normalizes channel-dim-1 (NCHW), so transpose NHWC→NCHW, normalize, transpose back. The channel
+/// count is read from the activation; `weight`/`bias` are the `[C]` affine params.
+pub(crate) fn group_norm_nhwc(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    num_groups: usize,
+    eps: f64,
+) -> Result<Tensor> {
+    let xc = x.permute([0, 3, 1, 2])?.contiguous()?; // NHWC → NCHW
+    let c = xc.dim(1)?;
+    let gn = GroupNorm::new(weight.clone(), bias.clone(), c, num_groups, eps)?;
+    Ok(gn.forward(&xc)?.permute([0, 2, 3, 1])?.contiguous()?) // NCHW → NHWC
+}
+
+/// Nearest-neighbour `factor`× upsample of an NHWC activation (the FPN pixel decoder's 2× upsample).
+/// candle's `upsample_nearest2d` works on the trailing two (NCHW H/W) dims, so transpose around it.
+pub(crate) fn upsample_nearest2d_nhwc(x: &Tensor, factor: usize) -> Result<Tensor> {
+    let xc = x.permute([0, 3, 1, 2])?.contiguous()?; // NHWC → NCHW
+    let (_, _, h, w) = xc.dims4()?;
+    let y = xc.upsample_nearest2d(h * factor, w * factor)?;
+    Ok(y.permute([0, 2, 3, 1])?.contiguous()?) // NCHW → NHWC
 }

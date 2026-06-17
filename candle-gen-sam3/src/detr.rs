@@ -99,7 +99,7 @@ pub(crate) struct Attn {
 }
 
 impl Attn {
-    fn from_weights(w: &Weights, prefix: &str, cfg: &Sam3DetrConfig) -> Result<Self> {
+    pub(crate) fn from_weights(w: &Weights, prefix: &str, cfg: &Sam3DetrConfig) -> Result<Self> {
         Self::from_dims(w, prefix, cfg.num_attention_heads, cfg.head_dim())
     }
 
