@@ -134,8 +134,26 @@ pub(crate) fn layer_norm(x: &Tensor, w: &Tensor, b: &Tensor, eps: f64) -> Result
 
 /// Scaled-dot-product attention, no mask. `q`/`k`/`v`: `[b, nh, seq, hd]` → `[b, nh, seq, hd]`.
 pub(crate) fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
+    sdpa_masked(q, k, v, scale, None)
+}
+
+/// Scaled-dot-product attention with an optional **additive** mask, broadcast onto the
+/// `[b, nh, seq_q, seq_k]` scores before softmax (`-1e9` at blocked positions, `0` elsewhere — the
+/// CLIP causal+key-padding convention). `q`/`k`/`v`: `[b, nh, seq, hd]`; `mask`: any shape that
+/// broadcasts to the scores (e.g. `[1, 1, seq_q, seq_k]`). Mirrors the reference / MLX
+/// `scaled_dot_product_attention(..., mask, None)`.
+pub(crate) fn sdpa_masked(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: Option<&Tensor>,
+) -> Result<Tensor> {
     let kt = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
-    let attn = (q.contiguous()?.matmul(&kt)? * scale)?; // [b, nh, seq, seq]
+    let mut attn = (q.contiguous()?.matmul(&kt)? * scale)?; // [b, nh, seq_q, seq_k]
+    if let Some(m) = mask {
+        attn = attn.broadcast_add(m)?;
+    }
     let attn = softmax(&attn, D::Minus1)?;
     Ok(attn.matmul(&v.contiguous()?)?)
 }
