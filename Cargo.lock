@@ -383,6 +383,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-sam3"
+version = "0.0.0"
+dependencies = [
+ "candle-core",
+ "candle-gen",
+ "candle-nn",
+]
+
+[[package]]
 name = "candle-gen-sdxl"
 version = "0.0.0"
 dependencies = [

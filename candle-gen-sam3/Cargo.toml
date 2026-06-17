@@ -1,0 +1,28 @@
+[package]
+name = "candle-gen-sam3"
+version = "0.0.0"
+edition = "2021"
+description = "Native-candle SAM3 (Segment Anything 3) concept segmenter for candle-gen — the Windows/CUDA sibling of mlx-gen-sam3 (epic 5482, sc-5062). The off-Mac person-track PCS path: a plain utility segmenter (like candle-gen-face), NOT an inventory-registered generator."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "sam3", "segmentation"]
+categories = ["science"]
+
+[dependencies]
+# Core crate — re-exports gen_core + candle, so this provider links exactly one gen-core / candle
+# build (single resolution; see scripts/check-gen-core-skew.sh).
+candle-gen = { path = "../candle-gen" }
+# Direct candle deps: SAM3's PE ViT + FPN + DETR + tracker are a from-scratch port of the public
+# `transformers` reference (no candle-transformers SAM model at this pin), built on candle-core /
+# candle-nn primitives — the same workspace pin candle-gen uses → one candle build (no skew).
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+
+[features]
+# Pass the backend selection through to the core crate so a downstream `--features cuda`/`metal`
+# selects the matching candle backend everywhere (SAM3 runs f32 for parity; the device follows the
+# build so the worker keeps one device across the person-track pipeline).
+default = []
+metal = ["candle-gen/metal"]
+cuda = ["candle-gen/cuda"]
+flash-attn = ["candle-gen/flash-attn"]
