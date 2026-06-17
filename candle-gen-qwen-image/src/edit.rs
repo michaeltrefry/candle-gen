@@ -116,6 +116,25 @@ fn read_zero_cond_t(root: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Locate the assembled HF `tokenizer.json` (sc-6294). The original `Qwen-Image-Edit` ships it under
+/// `tokenizer/`, but `Qwen-Image-Edit-2511` ships the assembled file only inside the Qwen2.5-VL
+/// processor bundle (`processor/tokenizer.json`) — the `tokenizer/` dir there carries just the BPE
+/// source (`merges.txt`/`vocab.json`). The two locations are byte-identical (same SHA256), so prefer
+/// `tokenizer/`, then fall back to `processor/`, so a whole-repo -2511 download loads without a
+/// hand-staged tokenizer.json.
+fn tokenizer_json_path(root: &Path) -> Result<PathBuf> {
+    for rel in ["tokenizer/tokenizer.json", "processor/tokenizer.json"] {
+        let p = root.join(rel);
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    Err(CandleError::Msg(format!(
+        "qwen edit: no tokenizer.json under tokenizer/ or processor/ (at {})",
+        root.display()
+    )))
+}
+
 /// The loaded Qwen-Image-Edit model: the VL conditioning encoder, the MMDiT, the VAE (decode) + VAE
 /// encoder (reference dual-latent), the image processor + tokenizer.
 pub struct QwenEdit {
@@ -146,7 +165,7 @@ impl QwenEdit {
         let vae = QwenVae::new(component_vb(root, "vae", ENC_DTYPE, &device)?)?;
         let vae_encoder = QwenVaeEncoder::new(component_vb(root, "vae", ENC_DTYPE, &device)?)?;
         let tokenizer = TextTokenizer::from_file(
-            root.join("tokenizer/tokenizer.json"),
+            tokenizer_json_path(root)?,
             TokenizerConfig {
                 max_length: te_cfg.max_length,
                 pad_token_id: te_cfg.pad_token_id,
@@ -341,5 +360,28 @@ mod tests {
     fn zero_cond_t_defaults_false_when_absent() {
         // A nonexistent config → false (the original Qwen-Image-Edit / 2509 path).
         assert!(!read_zero_cond_t(Path::new("/nonexistent")));
+    }
+
+    #[test]
+    fn tokenizer_json_path_prefers_tokenizer_then_processor() {
+        // -2511 ships the assembled tokenizer.json only under processor/ (sc-6294).
+        let tmp = std::env::temp_dir().join(format!("qwen_edit_tok_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("processor")).unwrap();
+        std::fs::write(tmp.join("processor/tokenizer.json"), b"{}").unwrap();
+        assert!(tokenizer_json_path(&tmp)
+            .unwrap()
+            .ends_with("processor/tokenizer.json"));
+
+        // When tokenizer/ also has it (the original Edit), that location wins.
+        std::fs::create_dir_all(tmp.join("tokenizer")).unwrap();
+        std::fs::write(tmp.join("tokenizer/tokenizer.json"), b"{}").unwrap();
+        assert!(tokenizer_json_path(&tmp)
+            .unwrap()
+            .ends_with("tokenizer/tokenizer.json"));
+
+        // Neither present → a descriptive error rather than a silent panic.
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(tokenizer_json_path(&tmp).is_err());
     }
 }
