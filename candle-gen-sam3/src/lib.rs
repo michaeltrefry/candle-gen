@@ -26,7 +26,15 @@
 //! * [`Sam3Tracker`] — the SAM2.1 single-frame box-prompt tracker (tracker neck + prompt encoder +
 //!   two-way mask decoder) plus the video memory primitives (memory encoder, RoPE memory attention,
 //!   per-object bank conditioning), and [`Sam3VideoModel`] — the multi-object video PCS pipeline that
-//!   orchestrates the detector + tracker frame-by-frame (slice sc-6245; **this slice**).
+//!   orchestrates the detector + tracker frame-by-frame (slice sc-6245).
+//!
+//! ## Quantization (sc-6246)
+//! Each model loads dense and can be affine-quantized in place to Q8 (near-lossless) or Q4 (coherent)
+//! with `quantize(Quant)` — built on candle-core's GGUF `QMatMul`, the same seam `candle-gen-lens` /
+//! `candle-gen-seedvr2` use. The attention/FFN/projection linears fold to `Q8_0`/`Q4_0`; convs,
+//! GroupNorms, embeddings, and the few sub-block-width projections (the BoxRPB `2→256`, the geometry
+//! `4→256` / `258→256`) stay dense (`in_features` must divide the 32-wide block). The video model
+//! quantizes its one shared PE backbone (F-028) exactly once.
 //!
 //! ## Layout note
 //! The MLX port runs NHWC and permutes the torch OIHW/IOHW conv kernels to MLX OHWI at load. candle's

@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::candle_nn::ops::sigmoid;
+use candle_gen::gen_core::Quant;
 use candle_gen::Result;
 
 use crate::config::Sam3VisionConfig;
@@ -125,6 +126,18 @@ impl Sam3VideoModel {
             removed: std::collections::BTreeSet::new(),
             last_occluded: BTreeMap::new(),
         })
+    }
+
+    /// Affine-quantize the whole video model to Q4/Q8. The PE backbone is shared (one `Arc`) between
+    /// the detector segmenter and the tracker (F-028), so it is quantized **once** — via the
+    /// segmenter, whose `Arc::make_mut` clones the shared backbone, quantizes the copy, and leaves the
+    /// segmenter holding the quantized one — then reinstalled into the tracker, which only quantizes
+    /// its own heads. Quantizing both independently would re-duplicate the weights we deduplicated.
+    pub fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.segmenter.quantize(quant)?; // backbone (clone-on-write) + segmenter heads
+        self.tracker
+            .set_backbone(self.segmenter.vision_backbone_arc());
+        self.tracker.quantize_heads(quant)
     }
 
     /// The detector segmenter (read-only) — for the F-028 shared-backbone parity check.

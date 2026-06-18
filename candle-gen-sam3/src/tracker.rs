@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::ops::sigmoid;
+use candle_gen::gen_core::Quant;
 use candle_gen::{CandleError, Result};
 
 use crate::common::{
@@ -115,6 +116,14 @@ impl FeedForward {
         }
         Ok(h)
     }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.proj_in.quantize(quant)?;
+        for l in &mut self.layers {
+            l.quantize(quant)?;
+        }
+        self.proj_out.quantize(quant)
+    }
 }
 
 // --- Attention (Sam3TrackerVideoAttention, with q/k/v down-projection) ---------------------------
@@ -158,6 +167,13 @@ impl Attention {
         let (b, h, n, c) = out.dims4()?;
         let out = out.transpose(1, 2)?.contiguous()?.reshape((b, n, h * c))?;
         self.o.forward(&out)
+    }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.q.quantize(quant)?;
+        self.k.quantize(quant)?;
+        self.v.quantize(quant)?;
+        self.o.quantize(quant)
     }
 }
 
@@ -222,6 +238,13 @@ impl TwoWayBlock {
         )?;
         Ok((queries, keys))
     }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.self_attn.quantize(quant)?;
+        self.cross_t2i.quantize(quant)?;
+        self.mlp.quantize(quant)?;
+        self.cross_i2t.quantize(quant)
+    }
 }
 
 struct TwoWayTransformer {
@@ -263,6 +286,13 @@ impl TwoWayTransformer {
             &self.norm_final,
         )?;
         Ok((queries, keys))
+    }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.quantize(quant)?;
+        }
+        self.final_attn.quantize(quant)
     }
 }
 
@@ -545,6 +575,17 @@ impl MaskDecoder {
             dynamic_multimask_via_stability(&masks, &ious)?
         };
         Ok((masks, ious, obj_score, mask_tokens_out))
+    }
+
+    /// Quantize the mask decoder's linears (the two-way transformer + the per-mask hypernetworks +
+    /// the IoU / object-score heads). The token embeddings + upscale transposed-convs stay dense.
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.transformer.quantize(quant)?;
+        for h in &mut self.hypernet {
+            h.quantize(quant)?;
+        }
+        self.iou_head.quantize(quant)?;
+        self.obj_score_head.quantize(quant)
     }
 }
 
@@ -916,6 +957,13 @@ impl RoPEAttention {
         ))?;
         self.o.forward(&out)
     }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.q.quantize(quant)?;
+        self.k.quantize(quant)?;
+        self.v.quantize(quant)?;
+        self.o.quantize(quant)
+    }
 }
 
 /// One memory-attention layer: pre-norm self-attn → pre-norm cross-attn over `keys + key_pos` →
@@ -966,6 +1014,13 @@ impl MemAttnLayer {
         let q = self.linear2.forward(&self.linear1.forward(&q)?.relu()?)?;
         Ok(queries.add(&q)?)
     }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.self_attn.quantize(quant)?;
+        self.cross_attn.quantize(quant)?;
+        self.linear1.quantize(quant)?;
+        self.linear2.quantize(quant)
+    }
 }
 
 /// `Sam3TrackerVideoMemoryAttention`: 4 layers + a final LayerNorm, over precomputed RoPE tables.
@@ -1015,6 +1070,13 @@ impl MemoryAttention {
             )?;
         }
         ln(&output, &self.norm)
+    }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.quantize(quant)?;
+        }
+        Ok(())
     }
 }
 
@@ -1133,6 +1195,29 @@ impl Sam3Tracker {
     #[cfg(test)]
     pub(crate) fn backbone_arc(&self) -> Arc<Backbone> {
         self.backbone.clone()
+    }
+
+    /// Replace the PE backbone with a (typically once-quantized, shared) one — the video model
+    /// quantizes the backbone once via the segmenter and reinstalls it here (F-028).
+    pub(crate) fn set_backbone(&mut self, backbone: Arc<Backbone>) {
+        self.backbone = backbone;
+    }
+
+    /// Affine-quantize the whole single-frame tracker to Q4/Q8 (the shared PE backbone + the heads).
+    pub fn quantize(&mut self, quant: Quant) -> Result<()> {
+        Arc::make_mut(&mut self.backbone).quantize(quant)?;
+        self.quantize_heads(quant)
+    }
+
+    /// Quantize everything **except** the PE backbone — the mask decoder, the memory attention, the
+    /// object-pointer projection, and the temporal-pos projection. The prompt encoder, memory encoder,
+    /// and tracker neck (all convs/embeddings) stay dense. The video model calls this after the single
+    /// shared backbone has been quantized once and reinstalled (F-028).
+    pub(crate) fn quantize_heads(&mut self, quant: Quant) -> Result<()> {
+        self.decoder.quantize(quant)?;
+        self.memory_attention.quantize(quant)?;
+        self.object_pointer_proj.quantize(quant)?;
+        self.tpos_proj.quantize(quant)
     }
 
     /// The axial 2-D RoPE `(cos, sin)` tables `[72², 256]` the memory attention uses (exposed for

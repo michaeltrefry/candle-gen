@@ -13,6 +13,7 @@
 use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::gen_core::Quant;
 use candle_gen::{CandleError, Result};
 use tokenizers::Tokenizer;
 
@@ -82,6 +83,15 @@ impl ClipLayer {
         let o = sdpa_masked(&q, &k, &v, scale, Some(mask))?;
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, n, nh * hd))?;
         self.o.forward(&o)
+    }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.q.quantize(quant)?;
+        self.k.quantize(quant)?;
+        self.v.quantize(quant)?;
+        self.o.quantize(quant)?;
+        self.fc1.quantize(quant)?;
+        self.fc2.quantize(quant)
     }
 }
 
@@ -159,6 +169,15 @@ impl Sam3TextEncoder {
         let last_hidden_state = layer_norm(&x, &self.final_ln_w, &self.final_ln_b, self.eps)?;
         // SAM3 projection: every token 1024 → 256.
         self.proj.forward(&last_hidden_state)
+    }
+
+    /// Affine-quantize the CLIP layers' attention/MLP projections + the 1024→256 `text_projection`
+    /// to Q4/Q8 (the token/position embeddings + LayerNorms stay dense).
+    pub fn quantize(&mut self, quant: Quant) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.quantize(quant)?;
+        }
+        self.proj.quantize(quant)
     }
 }
 

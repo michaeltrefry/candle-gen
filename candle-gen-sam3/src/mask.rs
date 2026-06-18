@@ -11,6 +11,7 @@
 
 use candle_gen::candle_core::Tensor;
 use candle_gen::candle_nn::ops::sigmoid;
+use candle_gen::gen_core::Quant;
 use candle_gen::Result;
 
 use crate::common::{
@@ -44,6 +45,13 @@ impl MaskEmbedder {
             }
         }
         Ok(h)
+    }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        for l in &mut self.layers {
+            l.quantize(quant)?;
+        }
+        Ok(())
     }
 }
 
@@ -131,6 +139,14 @@ impl Sam3MaskHead {
             prompt_norm_w: w.require(&join(&p, "prompt_cross_attn_norm.weight"))?,
             prompt_norm_b: w.require(&join(&p, "prompt_cross_attn_norm.bias"))?,
         })
+    }
+
+    /// Affine-quantize the mask head's linears to Q4/Q8 (the query mask-embedder MLP + the prompt
+    /// cross-attention). The pixel-decoder convs + the instance/semantic 1×1 conv projections are
+    /// dense.
+    pub fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.mask_embedder.quantize(quant)?;
+        self.prompt_attn.quantize(quant)
     }
 
     /// `query_hidden`: `[1, Q, D]`; `backbone_features`: NHWC fine→coarse `[288²,144²,72²]`;

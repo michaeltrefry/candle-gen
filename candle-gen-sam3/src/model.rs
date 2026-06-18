@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use candle_gen::candle_core::{Device, Tensor};
+use candle_gen::gen_core::Quant;
 use candle_gen::Result;
 
 use crate::config::{Sam3DetrConfig, Sam3GeometryConfig, Sam3TextConfig, Sam3VisionConfig};
@@ -100,11 +101,27 @@ impl Sam3ImageSegmenter {
         })
     }
 
-    /// The shared PE [`Backbone`] handle (clone of the `Arc`) — exercised by the F-028 shared-backbone
-    /// parity check (the segmenter and tracker must point at one backbone).
-    #[cfg(test)]
+    /// The shared PE [`Backbone`] handle (clone of the `Arc`) — used by the video model to reinstall a
+    /// once-quantized backbone into the tracker, and by the F-028 shared-backbone parity check.
     pub(crate) fn vision_backbone_arc(&self) -> Arc<Backbone> {
         self.vision.backbone_arc()
+    }
+
+    /// Affine-quantize the whole still-image segmenter to Q4/Q8 (the PE backbone + text/detr/geometry/
+    /// mask projections). Convs, GroupNorms, embeddings, and sub-block-width projections stay dense.
+    pub fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.vision.quantize_backbone(quant)?;
+        self.quantize_heads(quant)
+    }
+
+    /// Quantize everything **except** the PE backbone (text/detr/geometry/mask). The video model calls
+    /// this after the single shared backbone has been quantized once and reinstalled (F-028), so the
+    /// backbone is not quantized twice.
+    pub(crate) fn quantize_heads(&mut self, quant: Quant) -> Result<()> {
+        self.text.quantize(quant)?;
+        self.detector.quantize(quant)?;
+        self.geometry.quantize(quant)?;
+        self.mask_head.quantize(quant)
     }
 
     /// `pixel_values`: NCHW `[1, 3, 1008, 1008]`; `input_ids`: `[1, 32]`; `text_mask`: per-token

@@ -19,6 +19,7 @@
 use std::f32::consts::PI;
 
 use candle_gen::candle_core::{Device, Tensor};
+use candle_gen::gen_core::Quant;
 use candle_gen::Result;
 
 use crate::common::{join, layer_norm, Linear, Weights};
@@ -75,6 +76,12 @@ impl GeometryLayer {
         let a = self.ffn.forward(&h)?;
         Ok(x.add(&a)?)
     }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.self_attn.quantize(quant)?;
+        self.cross_attn.quantize(quant)?;
+        self.ffn.quantize(quant)
+    }
 }
 
 /// SAM3 geometry/exemplar prompt encoder (`Sam3GeometryEncoder`).
@@ -120,6 +127,19 @@ impl Sam3GeometryEncoder {
             output_ln_b: w.require(&join(prefix, "output_layer_norm.bias"))?,
             cfg: cfg.clone(),
         })
+    }
+
+    /// Affine-quantize the geometry encoder's projections to Q4/Q8 (the `final_proj` + the 3 layers'
+    /// attention/FFN). The `boxes_direct` (4→256) and `boxes_pos` (258→256) projections auto-skip and
+    /// stay dense ([`Linear::quantize`]); the ROI-pool conv + embeddings are dense.
+    pub fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.boxes_direct.quantize(quant)?;
+        self.boxes_pos.quantize(quant)?;
+        self.final_proj.quantize(quant)?;
+        for layer in &mut self.layers {
+            layer.quantize(quant)?;
+        }
+        Ok(())
     }
 
     /// Encode box prompts into prompt tokens.

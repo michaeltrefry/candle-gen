@@ -9,13 +9,15 @@
 //! **BoxRPB** relative-position bias (log-scale-encoded box↔grid deltas), and boxes are refined
 //! iteratively across the 6 layers. Token layout `[B, seq, C]` — plain row-major, no NHWC/conv (only
 //! the input FPN map is flattened from NHWC). Mirrors the MLX module line-by-line (the parity
-//! oracle), so the reference cosine bar (>0.999) carries over. Quantization is a later slice
-//! (sc-6246), so no `quantize` here.
+//! oracle), so the reference cosine bar (>0.999) carries over. The projections are Q4/Q8-quantizable
+//! via the per-struct `quantize` cascades (sc-6246; `Linear::quantize` skips the sub-block BoxRPB
+//! embedders).
 
 use std::f32::consts::{LOG2_E, PI};
 
 use candle_gen::candle_core::{Device, Tensor, D};
 use candle_gen::candle_nn::ops::sigmoid;
+use candle_gen::gen_core::Quant;
 use candle_gen::{CandleError, Result};
 
 use crate::common::{join, layer_norm, sdpa_masked, Linear, Weights};
@@ -142,6 +144,13 @@ impl Attn {
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, ql, nh * hd))?;
         self.o.forward(&o)
     }
+
+    pub(crate) fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.q.quantize(quant)?;
+        self.k.quantize(quant)?;
+        self.v.quantize(quant)?;
+        self.o.quantize(quant)
+    }
 }
 
 /// `Sam3MLP` (DETR enc/dec FFN): `fc1` → **ReLU** → `fc2` (`hidden_act = "relu"`). Shared with the
@@ -161,6 +170,11 @@ impl Ffn {
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let h = self.fc1.forward(x)?.relu()?;
         self.fc2.forward(&h)
+    }
+
+    pub(crate) fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.fc1.quantize(quant)?;
+        self.fc2.quantize(quant)
     }
 }
 
@@ -187,6 +201,13 @@ impl DecoderMlp {
             }
         }
         Ok(h)
+    }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        for l in &mut self.layers {
+            l.quantize(quant)?;
+        }
+        Ok(())
     }
 }
 
@@ -247,6 +268,12 @@ impl DotScoring {
             .sum(D::Minus1)?;
         clamp(&scores.affine(self.scale, 0.0)?, -self.clamp, self.clamp)
     }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.text_mlp.quantize(quant)?;
+        self.text_proj.quantize(quant)?;
+        self.query_proj.quantize(quant)
+    }
 }
 
 /// One pre-norm DETR encoder layer: vision self-attn + text cross-attn + FFN.
@@ -299,6 +326,12 @@ impl EncoderLayer {
         let h = layer_norm(&x, &self.ln3_w, &self.ln3_b, self.eps)?;
         let a = self.ffn.forward(&h)?;
         Ok(x.add(&a)?)
+    }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.self_attn.quantize(quant)?;
+        self.cross_attn.quantize(quant)?;
+        self.ffn.quantize(quant)
     }
 }
 
@@ -371,6 +404,13 @@ impl DecoderLayer {
         let x = x.add(&a)?;
         layer_norm(&x, &self.mlp_ln_w, &self.mlp_ln_b, self.eps)
     }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.self_attn.quantize(quant)?;
+        self.text_attn.quantize(quant)?;
+        self.vis_attn.quantize(quant)?;
+        self.ffn.quantize(quant)
+    }
 }
 
 /// The detector outputs needed downstream (the mask head, sc-6243, adds masks).
@@ -440,6 +480,24 @@ impl Sam3Detector {
             scoring: DotScoring::from_weights(w, &join(prefix, "dot_product_scoring"), cfg)?,
             cfg: cfg.clone(),
         })
+    }
+
+    /// Affine-quantize the detector's projections to Q4/Q8 (the encoder/decoder attentions + FFNs,
+    /// the box / presence / ref-point heads, and the dot-product scoring). The BoxRPB embedders
+    /// (in=2) and any other sub-block-width projection auto-skip and stay dense ([`Linear::quantize`]).
+    pub fn quantize(&mut self, quant: Quant) -> Result<()> {
+        for l in &mut self.enc_layers {
+            l.quantize(quant)?;
+        }
+        for l in &mut self.dec_layers {
+            l.quantize(quant)?;
+        }
+        self.box_head.quantize(quant)?;
+        self.presence_head.quantize(quant)?;
+        self.ref_point_head.quantize(quant)?;
+        self.box_rpb_x.quantize(quant)?;
+        self.box_rpb_y.quantize(quant)?;
+        self.scoring.quantize(quant)
     }
 
     /// `vision_feature`: the 72² FPN feature **NHWC** `[1, H, W, 256]`; `text`: `[1, L, 256]`.

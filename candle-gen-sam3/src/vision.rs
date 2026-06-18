@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use candle_gen::candle_core::{Device, Tensor};
+use candle_gen::gen_core::Quant;
 use candle_gen::{CandleError, Result};
 
 use crate::common::{
@@ -136,6 +137,7 @@ fn apply_rope(q: &Tensor, table: &RopeTable) -> Result<Tensor> {
 }
 
 /// Two-layer GELU MLP (`mlp.fc1` → exact-gelu → `mlp.fc2`). exact GELU = candle `gelu_erf`.
+#[derive(Clone)]
 struct Mlp {
     fc1: Linear,
     fc2: Linear,
@@ -153,10 +155,16 @@ impl Mlp {
         let h = self.fc1.forward(x)?.gelu_erf()?;
         self.fc2.forward(&h)
     }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.fc1.quantize(quant)?;
+        self.fc2.quantize(quant)
+    }
 }
 
 /// RoPE self-attention (separate q/k/v/o projections). Operates on NHWC `[b, H, W, C]`
 /// (`b = batch·num_windows` for windowed layers).
+#[derive(Clone)]
 struct Attention {
     q: Linear,
     k: Linear,
@@ -198,9 +206,17 @@ impl Attention {
             .reshape((b, h, w, nh * hd))?;
         self.o.forward(&out)
     }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.q.quantize(quant)?;
+        self.k.quantize(quant)?;
+        self.v.quantize(quant)?;
+        self.o.quantize(quant)
+    }
 }
 
 /// One pre-norm ViT layer: (windowed) RoPE attention + GELU MLP.
+#[derive(Clone)]
 struct ViTLayer {
     norm1_w: Tensor,
     norm1_b: Tensor,
@@ -257,10 +273,18 @@ impl ViTLayer {
         let mlp_in = layer_norm(&x, &self.norm2_w, &self.norm2_b, self.eps)?;
         Ok(x.broadcast_add(&self.mlp.forward(&mlp_in)?)?)
     }
+
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.attn.quantize(quant)?;
+        self.mlp.quantize(quant)
+    }
 }
 
 /// PE ViT backbone: patch-embed → tiled position embedding → front LayerNorm → layers. Shared (via
 /// `Arc`) between the detector neck and the tracker neck (the video model loads it once; F-028).
+/// `Clone` is cheap (candle tensors are `Arc`-backed) — the video model clones the dense backbone to
+/// quantize it once and reinstall the quantized copy into both consumers.
+#[derive(Clone)]
 pub(crate) struct Backbone {
     patch_w: Tensor, // OIHW (torch-native), no bias
     pos_embed: Tensor,
@@ -334,6 +358,15 @@ impl Backbone {
             x = layer.forward(&x)?;
         }
         Ok(x)
+    }
+
+    /// Affine-quantize the 32 ViT layers' attention/MLP projections to Q4/Q8 (the bulk of the model's
+    /// ~445M params). The patch-embed conv, position embedding, and LayerNorms stay dense.
+    pub(crate) fn quantize(&mut self, quant: Quant) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.quantize(quant)?;
+        }
+        Ok(())
     }
 }
 
@@ -458,11 +491,17 @@ impl Sam3VisionEncoder {
             .collect()
     }
 
-    /// The shared PE [`Backbone`] handle (clone of the `Arc`) — exercised by the F-028 shared-backbone
-    /// parity check (the segmenter and tracker must point at one backbone).
-    #[cfg(test)]
+    /// The shared PE [`Backbone`] handle (clone of the `Arc`) — used by the video model to reinstall a
+    /// once-quantized backbone, and by the F-028 shared-backbone parity check.
     pub(crate) fn backbone_arc(&self) -> Arc<Backbone> {
         self.backbone.clone()
+    }
+
+    /// Affine-quantize the shared PE backbone in place. `Arc::make_mut` clones the backbone first iff
+    /// it is shared (the video model holds it in both the segmenter and the tracker), so a standalone
+    /// segmenter quantizes in place. The FPN neck is all convs and stays dense.
+    pub(crate) fn quantize_backbone(&mut self, quant: Quant) -> Result<()> {
+        Arc::make_mut(&mut self.backbone).quantize(quant)
     }
 }
 
