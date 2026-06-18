@@ -56,10 +56,16 @@ impl Weights {
     fn extend_from(map: &mut HashMap<String, Tensor>, path: &Path, device: &Device) -> Result<()> {
         let raw = safetensors::load(path, device)?;
         for (k, v) in raw {
-            let v = if v.dtype() == DType::F32 {
-                v
-            } else {
-                v.to_dtype(DType::F32)?
+            let v = match v.dtype() {
+                DType::F32 => v,
+                // Float casts run on-device. Integer casts (the parity fixtures' `input_ids` /
+                // `attention_mask` / `box_labels` / `instance_masks`) hit a missing int->f32 CUDA cast
+                // kernel on this candle build (`CUDA_ERROR_NOT_FOUND`), so route those through the CPU.
+                DType::F16 | DType::BF16 | DType::F64 => v.to_dtype(DType::F32)?,
+                _ => v
+                    .to_device(&Device::Cpu)?
+                    .to_dtype(DType::F32)?
+                    .to_device(device)?,
             };
             map.insert(k, v);
         }
@@ -155,7 +161,11 @@ impl Linear {
                 bias,
                 out_features,
             } => {
-                // `QMatMul` (CPU + the CUDA dmmv fallback) needs a contiguous f32 activation.
+                // `QMatMul` (CPU + the CUDA dmmv fallback) needs a contiguous f32 activation. NOTE:
+                // candle's GGUF `QMatMul` returns NaN on Blackwell sm_120 (both the f32 dmmv and the
+                // bf16 fast paths) — a candle CUDA quant-kernel limitation, NOT a port issue (dense is
+                // bit-exact; the CPU `Linear` quant roundtrip is near-lossless). Off-Mac the worker
+                // therefore defaults to dense until candle's Blackwell quant kernels land (sc-6248).
                 let xf = x2.to_dtype(DType::F32)?.contiguous()?;
                 (matmul.forward(&xf)?, *out_features, bias)
             }

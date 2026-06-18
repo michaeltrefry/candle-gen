@@ -1,7 +1,15 @@
 //! SAM3 quantization smoke (sc-6246): build the image segmenter + tracker dense / Q8 / Q4 from the
 //! real `facebook/sam3` weights and check that Q8 stays near-lossless vs the dense baseline while Q4
-//! stays coherent (the candle twin of `mlx-gen-sam3`'s `quant_smoke`). `#[ignore]` until weights +
-//! fixtures are staged on the Blackwell box (sc-6248). Run:
+//! stays coherent (the candle twin of `mlx-gen-sam3`'s `quant_smoke`).
+//!
+//! **KNOWN FAILURE on Blackwell sm_120 (sc-6248):** candle's GGUF `QMatMul` returns NaN on Blackwell
+//! (both the f32 dmmv and bf16 fast paths), so on this box Q8/Q4 collapse to NaN masks / zero
+//! detections while the dense path is bit-exact (every other parity test is cosine ≈ 1.0). This is a
+//! candle CUDA quant-kernel limitation, NOT a port issue — the CPU `Linear` quant roundtrip
+//! (`common::tests`) is near-lossless. Off-Mac the worker therefore defaults to **dense** until
+//! candle's Blackwell quant kernels land; revisit this gate then.
+//!
+//! `#[ignore]` until weights + fixtures are staged on the box (sc-6248). Run:
 //!   SAM3_WEIGHTS=<snapshot> SAM3_E2E_FIXTURE=<e2e_fixture.safetensors> \
 //!   SAM3_TRACKER_FIXTURE=<tracker_fixture.safetensors> \
 //!     cargo test -p candle-gen-sam3 --release --features cuda --test quant_smoke -- --ignored --nocapture
