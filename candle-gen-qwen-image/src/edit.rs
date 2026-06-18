@@ -18,13 +18,14 @@
 //! `heads · seq² > i32::MAX` (~2.1B; reached around 2048² output) would silently corrupt — keep the
 //! output ≤ ~1536² until the shared `JointAttention` gains query-row chunking (the FLUX.2 fix).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{AdapterSpec, Image, Progress};
 use candle_gen::{CandleError, Result};
 
 use crate::config::{TextEncoderConfig, TransformerConfig, NEGATIVE_FALLBACK};
@@ -46,6 +47,10 @@ pub struct QwenEditPaths {
     /// The `Qwen/Qwen-Image-Edit` diffusers snapshot dir (`text_encoder/` [LM + vision], `transformer/`,
     /// `vae/`, `tokenizer/`). The validated reference is `-2511`.
     pub root: PathBuf,
+    /// LoRA/LoKr adapters folded into the MMDiT at load (sc-6220) — e.g. the Qwen-Image-Edit-2511
+    /// Lightning distill, stacked ahead of any user adapters. **Empty** = the production (non-distilled)
+    /// edit path: the transformer loads via the mmap fast path, byte-identical to before.
+    pub adapters: Vec<AdapterSpec>,
 }
 
 /// One Qwen-Image-Edit generation request.
@@ -56,9 +61,14 @@ pub struct QwenEditRequest {
     pub width: u32,
     pub height: u32,
     pub steps: usize,
-    /// True-CFG guidance scale.
+    /// True-CFG guidance scale. Ignored (CFG forced off) on the [`lightning`](Self::lightning) path.
     pub guidance: f32,
     pub seed: u64,
+    /// The Qwen-Image-Edit-2511-Lightning few-step distill path (sc-6220): use the static-shift
+    /// [`pipeline::lightning_sigmas`] schedule and run **CFG-off** (a single forward per step, no
+    /// negative branch — the distill LoRA is CFG-distilled). The matching distill LoRA must be supplied
+    /// via [`QwenEditPaths::adapters`]. `false` = the production multi-step true-CFG path.
+    pub lightning: bool,
     pub cancel: CancelFlag,
 }
 
@@ -72,6 +82,7 @@ impl Default for QwenEditRequest {
             steps: 30,
             guidance: 4.0,
             seed: 0,
+            lightning: false,
             cancel: CancelFlag::default(),
         }
     }
@@ -105,6 +116,67 @@ fn component_vb(
     }
     // SAFETY: mmap of read-only weight files; standard candle loading path.
     Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? })
+}
+
+/// Load every `.safetensors` in `root/transformer` into one CPU tensor map (native dtype). The eager
+/// load (vs the mmap [`component_vb`] fast path) is what lets the adapter deltas fold into the dense
+/// weights before the MMDiT is built (sc-6220).
+fn load_transformer_tensors(root: &Path) -> Result<HashMap<String, Tensor>> {
+    let dir = root.join("transformer");
+    if !dir.is_dir() {
+        return Err(CandleError::Msg(format!(
+            "qwen edit: snapshot is missing the transformer/ dir (at {})",
+            root.display()
+        )));
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|e| CandleError::Msg(format!("qwen edit: read transformer/: {e}")))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return Err(CandleError::Msg(format!(
+            "qwen edit: no .safetensors in transformer/ (at {})",
+            dir.display()
+        )));
+    }
+    let mut map = HashMap::new();
+    for f in &files {
+        let part = candle_gen::candle_core::safetensors::load(f, &Device::Cpu)?;
+        map.extend(part);
+    }
+    Ok(map)
+}
+
+/// Build the MMDiT, optionally folding LoRA/LoKr `adapters` into the dense weights at load (sc-6220).
+/// With **no** adapters this is the mmap fast path (byte-identical to before). With adapters: load the
+/// `transformer/` tensors onto CPU at native dtype, fold the deltas in f32
+/// ([`crate::adapters::merge_adapters`]), then build the MMDiT from the merged map — each tensor cast to
+/// `dtype` + moved to `device` as the VarBuilder serves it, so peak GPU is unchanged vs the mmap path
+/// (mirrors `candle-gen-sdxl`'s `load_instantid_unet_with_adapters`). A non-empty `adapters` slice that
+/// matches no MMDiT module errors (it never renders an unadapted image silently).
+fn load_transformer(
+    root: &Path,
+    adapters: &[AdapterSpec],
+    dtype: DType,
+    device: &Device,
+) -> Result<QwenTransformer> {
+    let cfg = TransformerConfig::qwen_image();
+    if adapters.is_empty() {
+        return Ok(QwenTransformer::new(
+            &cfg,
+            component_vb(root, "transformer", dtype, device)?,
+        )?);
+    }
+    let mut tensors = load_transformer_tensors(root)?;
+    let report = crate::adapters::merge_adapters(&mut tensors, adapters)?;
+    eprintln!(
+        "qwen edit: merged {} adapter target(s) into the MMDiT ({} key(s) off-surface)",
+        report.merged, report.skipped_keys
+    );
+    let vb = VarBuilder::from_tensors(tensors, dtype, device);
+    Ok(QwenTransformer::new(&cfg, vb)?)
 }
 
 /// `transformer/config.json` `zero_cond_t` (Edit-2511 = true; the original Edit / 2509 omit it).
@@ -155,13 +227,9 @@ impl QwenEdit {
         let device = candle_gen::default_device()?;
         let root = &paths.root;
         let te_cfg = TextEncoderConfig::qwen_image();
-        let dit_cfg = TransformerConfig::qwen_image();
 
         let vl_encoder = load_vision_language_encoder(root, &device)?;
-        let transformer = QwenTransformer::new(
-            &dit_cfg,
-            component_vb(root, "transformer", DIT_DTYPE, &device)?,
-        )?;
+        let transformer = load_transformer(root, &paths.adapters, DIT_DTYPE, &device)?;
         let vae = QwenVae::new(component_vb(root, "vae", ENC_DTYPE, &device)?)?;
         let vae_encoder = QwenVaeEncoder::new(component_vb(root, "vae", ENC_DTYPE, &device)?)?;
         let tokenizer = TextTokenizer::from_file(
@@ -229,7 +297,9 @@ impl QwenEdit {
             .vl_encoder
             .encode_vision(&edit_img.pixel_values, &[edit_img.grid])?;
         let pos = self.encode_prompt(&req.prompt, edit_img.n_image_tokens, &vision)?;
-        let neg = if req.guidance > 1.0 {
+        // CFG-off on the lightning path: the distill LoRA is CFG-distilled, so a single forward per
+        // step (no negative branch) — matching the MLX lightning recipe (sc-6220).
+        let neg = if req.guidance > 1.0 && !req.lightning {
             let n = if req.negative.trim().is_empty() {
                 NEGATIVE_FALLBACK
             } else {
@@ -263,7 +333,13 @@ impl QwenEdit {
         };
         let noise_seq = lat_h * lat_w;
 
-        let sigmas = pipeline::qwen_sigmas(req.steps, req.width, req.height);
+        // Lightning uses the static-shift schedule (resolution-independent); production uses the
+        // dynamic-μ schedule (sc-6220).
+        let sigmas = if req.lightning {
+            pipeline::lightning_sigmas(req.steps)
+        } else {
+            pipeline::qwen_sigmas(req.steps, req.width, req.height)
+        };
         let mut latents = pipeline::create_noise(req.seed, req.width, req.height, &self.device)?
             .to_dtype(DIT_DTYPE)?;
 

@@ -18,6 +18,10 @@
 //! **First-slice surface:** txt2img only. The mlx provider's img2img / Edit / ControlNet / Lightning
 //! / LoRA / quantization surface is **deferred** and rejected. `backend = "candle"`, `mac_only = false`.
 
+// Qwen-Image-Edit inference adapter merge (sc-6220, epic 5480): fold a LoRA/LoKr `.safetensors` delta
+// into the dense MMDiT weights at load — the Qwen-Image-Edit-2511-Lightning few-step distill, plus
+// general Qwen-family LoRA/LoKr. Consumed by `edit::QwenEdit::load`.
+pub mod adapters;
 pub mod config;
 // Qwen-Image ControlNet (strict pose) — the candle reference-pose lane (sc-5489, epic 5480). The pose
 // skeleton is VAE-encoded + packed and fed to the InstantX control branch, whose per-block residuals

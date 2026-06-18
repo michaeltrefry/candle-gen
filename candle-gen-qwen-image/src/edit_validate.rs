@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{AdapterKind, AdapterSpec, Image, Progress};
 
 use crate::edit::{QwenEdit, QwenEditPaths, QwenEditRequest};
 
@@ -109,6 +109,7 @@ fn real_weight_edit() {
     let t0 = std::time::Instant::now();
     let model = QwenEdit::load(&QwenEditPaths {
         root: env_path("QWEN_EDIT_BASE"),
+        adapters: vec![],
     })
     .expect("load QwenEdit");
     println!(
@@ -124,6 +125,7 @@ fn real_weight_edit() {
         steps: 20,
         guidance: 4.0,
         seed: 12345,
+        lightning: false,
         cancel: CancelFlag::new(),
     };
 
@@ -229,6 +231,7 @@ fn high_res_edit_avoids_i32_overflow() {
     let reference = read_ppm(&env_path("QWEN_EDIT_REF"));
     let model = QwenEdit::load(&QwenEditPaths {
         root: env_path("QWEN_EDIT_BASE"),
+        adapters: vec![],
     })
     .expect("load QwenEdit");
 
@@ -240,6 +243,7 @@ fn high_res_edit_avoids_i32_overflow() {
         steps: 20,
         guidance: 4.0,
         seed: 12345,
+        lightning: false,
         cancel: CancelFlag::new(),
     };
     let mut noop = |_p: Progress| {};
@@ -260,4 +264,80 @@ fn high_res_edit_avoids_i32_overflow() {
     println!(
         "sc-6217 high-res edit PASS ✅ (eyeball qwen_edit_highres_1536.ppm — no noisy bottom band)"
     );
+}
+
+/// sc-6220: the **Qwen-Image-Edit-2511-Lightning** few-step distill — load the `-2511` base with the
+/// lightx2v 4-step LoRA folded into the MMDiT ([`QwenEditPaths::adapters`]), then run the CFG-off
+/// lightning schedule at 4 steps ([`QwenEditRequest::lightning`]). Gates: the 4-step edit is coherent
+/// (finite, non-flat) AND prompt-sensitive (A vs B differ), proving the merged distill produces a clean
+/// image in 4 steps rather than the 20+ the production schedule needs — i.e. both the adapter merge and
+/// the lightning sampler are wired correctly. Run with `QWEN_EDIT_BASE` = a `-2511` snapshot and
+/// `QWEN_EDIT_LIGHTNING_LORA` = the 4-step bf16 distill `.safetensors`.
+#[test]
+#[ignore = "real-weight GPU validation; set QWEN_EDIT_BASE/QWEN_EDIT_REF/QWEN_EDIT_OUT/QWEN_EDIT_LIGHTNING_LORA"]
+fn lightning_edit_4steps() {
+    let out_dir = env_path("QWEN_EDIT_OUT");
+    std::fs::create_dir_all(&out_dir).ok();
+    let reference = read_ppm(&env_path("QWEN_EDIT_REF"));
+    let lora = env_path("QWEN_EDIT_LIGHTNING_LORA");
+    println!("loading QwenEdit + lightning distill {} …", lora.display());
+
+    let t0 = std::time::Instant::now();
+    let model = QwenEdit::load(&QwenEditPaths {
+        root: env_path("QWEN_EDIT_BASE"),
+        adapters: vec![AdapterSpec::new(lora, 1.0, AdapterKind::Lora)],
+    })
+    .expect("load QwenEdit + lightning LoRA");
+    println!(
+        "loaded in {:?} (distill merged into the MMDiT)",
+        t0.elapsed()
+    );
+
+    let base = QwenEditRequest {
+        prompt: "turn it into a snowy winter landscape, heavy snowfall, cold blue tones".into(),
+        negative: String::new(), // CFG-off → unused
+        width: 1024,
+        height: 1024,
+        steps: 4,
+        guidance: 1.0,
+        seed: 12345,
+        lightning: true,
+        cancel: CancelFlag::new(),
+    };
+    let mut noop = |_p: Progress| {};
+
+    // Edit A (4 steps).
+    let t = std::time::Instant::now();
+    let out_a = model
+        .generate(&base, std::slice::from_ref(&reference), &mut noop)
+        .expect("lightning edit A");
+    println!("[lightning A · 4 steps] {:?}", t.elapsed());
+    write_ppm(&out_dir.join("qwen_edit_lightning_a.ppm"), &out_a);
+
+    // Edit B — same reference + seed, a different prompt (prompt-sensitivity ablation).
+    let req_b = QwenEditRequest {
+        prompt: "turn it into a sunny tropical beach at noon, palm trees, warm golden light".into(),
+        ..base.clone()
+    };
+    let out_b = model
+        .generate(&req_b, std::slice::from_ref(&reference), &mut noop)
+        .expect("lightning edit B");
+    write_ppm(&out_dir.join("qwen_edit_lightning_b.ppm"), &out_b);
+
+    let diff = mean_abs_diff(&out_a, &out_b);
+    let (sa, sb) = (pixel_std(&out_a), pixel_std(&out_b));
+    println!("=== Qwen-Image-Edit-2511 Lightning (4-step) validation ===");
+    println!("  edit A std {sa:.2}, edit B std {sb:.2}; prompt A-vs-B diff {diff:.2}");
+    println!("  outputs: {}", out_dir.display());
+
+    assert_eq!(out_a.width, 1024);
+    assert!(
+        sa > 5.0 && sb > 5.0,
+        "lightning edits are degenerate (flat) — std {sa:.2}/{sb:.2}"
+    );
+    assert!(
+        diff > 5.0,
+        "lightning prompt A-vs-B diff {diff:.2} too small — distill/sampler not steering"
+    );
+    println!("sc-6220 lightning 4-step edit PASS ✅ (eyeball the PPMs)");
 }

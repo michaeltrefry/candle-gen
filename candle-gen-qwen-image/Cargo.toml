@@ -21,6 +21,10 @@ tokenizers = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
 serde_json = "1"
+# Read adapter `.safetensors` header metadata (`networkType`/`rank`/`alpha` + the diffusers
+# `lora_adapter_metadata` blob) for the inference LoRA/LoKr merge (sc-6220); candle's tensor loader
+# drops the `__metadata__`. Already in the workspace lock via candle.
+safetensors = "0.7"
 
 [features]
 default = []

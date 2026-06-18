@@ -96,6 +96,38 @@ pub fn qwen_sigmas(num_steps: usize, width: u32, height: u32) -> Vec<f32> {
     shifted
 }
 
+/// The official lightx2v Qwen-Image-Lightning flow-match shift (`exp(μ)`, μ = `ln 3`): the model card
+/// sets `base_shift = max_shift = ln 3`, so the per-resolution dynamic shift collapses to this constant.
+const LIGHTNING_SHIFT: f32 = 3.0;
+/// Flow-match training timesteps (diffusers `num_train_timesteps`): the Lightning span runs down to
+/// `1/1000`, the full diffusers minimum (NOT the production schedule's `1/n` floor).
+const LIGHTNING_NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
+
+/// The few-step **Lightning** sigma schedule (length `steps + 1`, descending to 0) for the
+/// Qwen-Image-Edit-2511-Lightning distill (sc-6220) — the candle twin of `mlx-gen-qwen-image`'s
+/// `sampler::lightning`. Reproduces diffusers' `FlowMatchEulerDiscreteScheduler` under the lightx2v
+/// Lightning config: a **static** flow-match shift of 3.0 (`base_shift == max_shift`) over
+/// `linspace(1, 1/1000, n)`, with **no terminal rescale** (unlike [`qwen_sigmas`]'s 0.02). Resolution-
+/// independent. 4-step → `[1.0, 0.857.., 0.601.., 0.00299.., 0.0]`. Drives the same [`euler_step`].
+pub fn lightning_sigmas(num_steps: usize) -> Vec<f32> {
+    let n = num_steps.max(1);
+    let e = LIGHTNING_SHIFT; // exp(μ)
+    let sigma_min = 1.0 / LIGHTNING_NUM_TRAIN_TIMESTEPS;
+    let mut sigmas: Vec<f32> = (0..n)
+        .map(|i| {
+            // linspace(1.0, sigma_min, n)
+            let s = if n == 1 {
+                1.0
+            } else {
+                1.0 + (sigma_min - 1.0) * (i as f32) / ((n - 1) as f32)
+            };
+            e / (e + (1.0 / s - 1.0))
+        })
+        .collect();
+    sigmas.push(0.0);
+    sigmas
+}
+
 /// One flow-match Euler step: `x_{i+1} = x_i + (σ_{i+1} − σ_i)·v` (descending sigmas, negative dt, no
 /// velocity negation). The model timestep is the **raw sigma** `σ_i`.
 pub fn euler_step(latents: &Tensor, velocity: &Tensor, sigmas: &[f32], i: usize) -> Result<Tensor> {
@@ -175,6 +207,27 @@ mod tests {
         for w in &s[..20].windows(2).collect::<Vec<_>>() {
             assert!(w[0] > w[1], "descending: {s:?}");
         }
+    }
+
+    #[test]
+    fn lightning_sigmas_match_diffusers_golden() {
+        // The official lightx2v 4-step recipe (shift 3.0, no terminal rescale) over linspace(1, 1/1000,
+        // 4) — the bit-exact diffusers values pinned in mlx-gen's `sampler::lightning` test.
+        let s = lightning_sigmas(4);
+        assert_eq!(s.len(), 5);
+        let expected = [1.0_f32, 0.857_326_5, 0.600_719_4, 0.002_994_012, 0.0];
+        for (i, want) in expected.iter().enumerate() {
+            assert!(
+                (s[i] - want).abs() < 1e-5,
+                "lightning sigma[{i}] = {} want {want}",
+                s[i]
+            );
+        }
+        // No terminal rescale: the last pre-0 sigma runs to the diffusers 1/1000 floor (≈0.003), NOT
+        // the production schedule's 0.02 — the whole difference from `qwen_sigmas`.
+        assert!(s[3] < 0.01);
+        // Resolution-independent: identical regardless of size, unlike the production schedule.
+        assert_eq!(lightning_sigmas(4), s);
     }
 
     #[test]
