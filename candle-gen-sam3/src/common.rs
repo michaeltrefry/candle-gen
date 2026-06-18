@@ -161,11 +161,14 @@ impl Linear {
                 bias,
                 out_features,
             } => {
-                // `QMatMul` (CPU + the CUDA dmmv fallback) needs a contiguous f32 activation. NOTE:
-                // candle's GGUF `QMatMul` returns NaN on Blackwell sm_120 (both the f32 dmmv and the
-                // bf16 fast paths) — a candle CUDA quant-kernel limitation, NOT a port issue (dense is
-                // bit-exact; the CPU `Linear` quant roundtrip is near-lossless). Off-Mac the worker
-                // therefore defaults to dense until candle's Blackwell quant kernels land (sc-6248).
+                // `QMatMul` needs a contiguous f32 activation (CPU + the CUDA dmmv fallback). NOTE:
+                // off-Mac SAM3 runs DENSE by default (the worker leaves `SCENEWORKS_SAM3_QUANT` unset).
+                // This is NOT a candle/Blackwell bug: candle's GGUF `QMatMul` is correct on sm_120
+                // (Q8/Q4 over f32/f16/bf16 all verified; seedvr2's DiT quantizes near-losslessly on the
+                // same box). SAM3's PE vision ViT backbone is what breaks when quantized — its massive
+                // activations overflow GGUF's f16 q8_1 block scale (amax/127 -> inf -> NaN), on ANY
+                // device (sc-6361). The heads quantize fine; dense is bit-exact and fits, so quant buys
+                // ~nothing here.
                 let xf = x2.to_dtype(DType::F32)?.contiguous()?;
                 (matmul.forward(&xf)?, *out_features, bias)
             }

@@ -2,12 +2,14 @@
 //! real `facebook/sam3` weights and check that Q8 stays near-lossless vs the dense baseline while Q4
 //! stays coherent (the candle twin of `mlx-gen-sam3`'s `quant_smoke`).
 //!
-//! **KNOWN FAILURE on Blackwell sm_120 (sc-6248):** candle's GGUF `QMatMul` returns NaN on Blackwell
-//! (both the f32 dmmv and bf16 fast paths), so on this box Q8/Q4 collapse to NaN masks / zero
-//! detections while the dense path is bit-exact (every other parity test is cosine ≈ 1.0). This is a
-//! candle CUDA quant-kernel limitation, NOT a port issue — the CPU `Linear` quant roundtrip
-//! (`common::tests`) is near-lossless. Off-Mac the worker therefore defaults to **dense** until
-//! candle's Blackwell quant kernels land; revisit this gate then.
+//! **KNOWN LIMITATION (sc-6361):** quantizing SAM3's PE vision ViT backbone yields NaN masks / zero
+//! detections, because the backbone's massive activations overflow GGUF's f16 q8_1 block scale
+//! (`amax/127` -> inf -> NaN). This is a model dynamic-range limitation, hardware-agnostic — NOT a
+//! candle or Blackwell kernel bug: candle's GGUF `QMatMul` is correct on sm_120 (Q8/Q4 over
+//! f32/f16/bf16 verified in isolation; seedvr2's DiT quantizes near-losslessly on the same box), and
+//! the SAM3 heads (text/detector/geometry/mask) quantize fine — only the backbone breaks. Off-Mac the
+//! worker therefore defaults to **dense** (bit-exact, fits the box, quant saves ~nothing); to use a
+//! heads-only Q8 keep the backbone dense and re-validate here.
 //!
 //! `#[ignore]` until weights + fixtures are staged on the box (sc-6248). Run:
 //!   SAM3_WEIGHTS=<snapshot> SAM3_E2E_FIXTURE=<e2e_fixture.safetensors> \
