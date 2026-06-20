@@ -37,8 +37,20 @@ pub mod control;
 #[cfg(test)]
 mod control_validate;
 
+// Z-Image **img2img / edit** (sc-6595, epic 5480) — the candle sibling of the MLX `z_image_turbo`
+// `Conditioning::Reference` route. A bespoke provider driven directly by the worker (a `z_image_edit` /
+// `z_image_turbo`+`edit_image` stream), like the strict-pose control above; the registered
+// `z_image_turbo` descriptor stays txt2img-only (it can't promise img2img through the registry path).
+pub mod edit;
+
+// Z-Image img2img real-weight GPU validation (sc-6595) — env-driven, `#[ignore]`d integration test
+// (strength ablation + the strength-1.0 source round-trip + mid-denoise cancel).
+#[cfg(test)]
+mod edit_validate;
+
 pub use adapters::{merge_adapters, MergeReport};
 pub use control::{ZImageControl, ZImageControlPaths, ZImageControlRequest, DEFAULT_CONTROL_SCALE};
+pub use edit::{ZImageEdit, ZImageEditPaths, ZImageEditRequest, DEFAULT_EDIT_STRENGTH};
 
 use std::path::PathBuf;
 use std::sync::Mutex;
