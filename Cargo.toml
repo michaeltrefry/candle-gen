@@ -1,5 +1,5 @@
 [workspace]
-members = ["candle-gen", "candle-gen-sdxl", "candle-gen-z-image", "candle-gen-flux", "candle-gen-flux2", "candle-gen-qwen-image", "candle-gen-wan", "candle-gen-ltx", "candle-gen-svd", "candle-gen-joycaption", "candle-gen-lens", "candle-gen-chroma", "candle-gen-prompt-refine", "candle-gen-kolors", "candle-gen-sensenova", "candle-gen-face", "candle-gen-instantid", "candle-gen-seedvr2", "candle-gen-pulid", "candle-gen-sam3", "candle-gen-ideogram"]
+members = ["candle-gen", "candle-gen-sdxl", "candle-gen-z-image", "candle-gen-flux", "candle-gen-flux2", "candle-gen-qwen-image", "candle-gen-wan", "candle-gen-scail2", "candle-gen-ltx", "candle-gen-svd", "candle-gen-joycaption", "candle-gen-lens", "candle-gen-chroma", "candle-gen-prompt-refine", "candle-gen-kolors", "candle-gen-sensenova", "candle-gen-face", "candle-gen-instantid", "candle-gen-seedvr2", "candle-gen-pulid", "candle-gen-sam3", "candle-gen-ideogram"]
 resolver = "2"
 
 # Single source of truth for the deps shared across the workspace (mirrors mlx-gen's F-151). The

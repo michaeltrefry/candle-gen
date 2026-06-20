@@ -1,0 +1,37 @@
+[package]
+name = "candle-gen-scail2"
+version = "0.0.0"
+edition = "2021"
+description = "zai-org SCAIL-2 (Wan2.1-14B I2V end-to-end character animation / cross-identity replacement) provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-scail2."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "video", "character-animation", "inference"]
+categories = ["science"]
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+# SCAIL-2 is Wan2.1-14B I2V: the z16 VAE, UMT5 text encoder, the flow/UniPC scheduler, the base 3-axis
+# RoPE apply (`rope::apply_rope`), and the pipeline glue (noise / CFG / frames→Image) all come from
+# candle-gen-wan. The SCAIL-2 deltas (3 patch-embed stems + additive mask/pose embeds, per-source RoPE
+# shifts, Wan-I2V image cross-attn, the open-CLIP ViT-H/14 visual encoder, 28-ch masks) layer on top.
+# This is the first vertical candle-gen → candle-gen-wan dependency (mirrors mlx-gen-scail2 → mlx-gen-wan).
+candle-gen-wan = { path = "../candle-gen-wan" }
+inventory = { workspace = true }
+# UMT5 tokenizer.json (reused via candle-gen-wan's text path).
+tokenizers = { workspace = true }
+# Deterministic CPU-seeded per-segment initial noise (sc-3673 parity).
+rand = { workspace = true }
+rand_distr = { workspace = true }
+# config.json (mask_dim / dims) sidecar reading + adapter `__metadata__` (sc-6838 LoRA, later).
+serde_json = { workspace = true }
+safetensors = "0.7"
+
+[features]
+default = []
+metal = ["candle-gen/metal", "candle-gen-wan/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-wan/cuda"]
+flash-attn = ["candle-gen/flash-attn", "candle-gen-wan/flash-attn"]
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "dc40c74ea6d364010a8e0198eab6fceba2422e2a" }
