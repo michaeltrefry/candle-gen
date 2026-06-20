@@ -7,7 +7,7 @@
 //!   sequence; the unconditional DiT runs over the **image-only** slice with zeroed conditioning.
 //!   Per step `v = g·pos_v + (1−g)·neg_v` (guidance drops to 3.0 for the final 3 polish steps).
 //! * **Turbo (CFG-free single DiT)** — `uncond` is `None` and the conditional DiT carries the ostris
-//!   TurboTime LoRA; per step `v = pos_v`. The LoRA merge is sc-6596 follow-up (see [`load_turbo`]).
+//!   TurboTime LoRA (merged at load via [`load_components_turbo`]); per step `v = pos_v`, few-step.
 //!
 //! The VAE is reused from `candle-gen-flux2` (`AutoencoderKLFlux2`), but Ideogram packs the 128
 //! transformer channels as `(ph,pw,c)` (c innermost) vs FLUX.2's `(c,ph,pw)`, so the bn-denorm +
@@ -28,7 +28,8 @@ use rand_distr::{Distribution, StandardNormal};
 
 use crate::config::{
     Ideogram4DitConfig, Ideogram4TextEncoderConfig, DEFAULT_GUIDANCE, DEFAULT_STEPS,
-    EXTRACTED_LAYERS, MAX_TEXT_TOKENS, PAD_TOKEN_ID,
+    DEFAULT_TURBO_STEPS, EXTRACTED_LAYERS, MAX_TEXT_TOKENS, PAD_TOKEN_ID, TURBO_LORA_FILE,
+    TURBO_LORA_SCALE,
 };
 use crate::scheduler::{make_step_intervals, preset_mu_std, LogitNormalSchedule};
 use crate::text_encoder::Ideogram4TextEncoder;
@@ -123,6 +124,40 @@ pub fn load_components(root: &Path, device: &Device) -> CResult<Components> {
     })
 }
 
+/// Load the **turbo** components: the conditional DiT with the bundled TurboTime LoRA merged in (no
+/// unconditional DiT). CFG-free single-DiT few-step path.
+pub fn load_components_turbo(root: &Path, device: &Device) -> CResult<Components> {
+    let dit = Ideogram4DitConfig::v4();
+    let te_cfg = Ideogram4TextEncoderConfig::qwen3_vl_8b();
+
+    let mut cond_w =
+        crate::loader::Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
+    let n = crate::adapters::merge_turbo_lora(
+        &mut cond_w,
+        &root.join(TURBO_LORA_FILE),
+        TURBO_LORA_SCALE,
+    )?;
+    eprintln!("ideogram turbo: merged {n} TurboTime LoRA target module(s)");
+    let cond = Ideogram4Transformer::load(&cond_w, &dit)?;
+
+    let te = Ideogram4TextEncoder::new(
+        &te_cfg,
+        &EXTRACTED_LAYERS,
+        MAX_TEXT_TOKENS,
+        component_vb(root, "text_encoder", ENC_DTYPE, device)?,
+    )?;
+    let vae = Flux2Vae::new(component_vb(root, "vae", ENC_DTYPE, device)?)?;
+
+    Ok(Components {
+        cond,
+        uncond: None,
+        te,
+        vae,
+        tokenizer_path: root.join("tokenizer/tokenizer.json"),
+        dit,
+    })
+}
+
 impl Components {
     /// Tokenize a prompt to `input_ids` exactly as the reference `_tokenize`: the Qwen3-VL single-user
     /// chat template, `add_special_tokens=false`. Rejects > `MAX_TEXT_TOKENS`.
@@ -157,10 +192,16 @@ pub fn render(
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> CResult<Vec<Image>> {
+    // Turbo (no unconditional DiT) defaults to the few-step count; quality to 48.
+    let default_steps = if comps.uncond.is_none() {
+        DEFAULT_TURBO_STEPS
+    } else {
+        DEFAULT_STEPS
+    };
     let steps = req
         .steps
         .map(|s| s as usize)
-        .unwrap_or(DEFAULT_STEPS as usize);
+        .unwrap_or(default_steps as usize);
     let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
 

@@ -14,12 +14,12 @@
 //! text path ([`text_encoder`]) is adapted from flux2's Qwen3 encoder (θ=5e6, 13 interleaved
 //! captured states). The single-stream DiT + the denoise pipeline are ported here.
 //!
-//! **Status (sc-6596):** `ideogram_4` (quality) T2I is wired end-to-end — Qwen3-VL text encode →
-//! single-stream DiT (asymmetric two-DiT CFG) → VAE decode — pending GPU validation vs MLX and the
-//! bf16 weight provisioning. `ideogram_4_turbo` is registered but [`Ideogram4Generator::generate`]
-//! rejects it until the bundled TurboTime LoRA merge lands (sc-6596 follow-up). Remix/edit is sc-6598.
-//! `backend = "candle"`, `mac_only = false`.
+//! **Status (sc-6596):** both `ideogram_4` (quality, asymmetric two-DiT CFG) and `ideogram_4_turbo`
+//! (CFG-free single DiT + the bundled TurboTime LoRA merged at load, [`adapters`]) are wired
+//! end-to-end — Qwen3-VL text encode → single-stream DiT → VAE decode — pending GPU validation vs MLX
+//! and the bf16 weight provisioning. Remix/edit is sc-6598. `backend = "candle"`, `mac_only = false`.
 
+pub mod adapters;
 pub mod config;
 pub mod loader;
 pub mod pipeline;
@@ -60,7 +60,12 @@ impl Ideogram4Generator {
         if let Some(c) = guard.as_ref() {
             return Ok(c.clone());
         }
-        let c = Arc::new(pipeline::load_components(&self.root, &self.device)?);
+        let components = if self.turbo {
+            pipeline::load_components_turbo(&self.root, &self.device)?
+        } else {
+            pipeline::load_components(&self.root, &self.device)?
+        };
+        let c = Arc::new(components);
         *guard = Some(c.clone());
         Ok(c)
     }
@@ -102,16 +107,6 @@ impl Generator for Ideogram4Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        if self.turbo {
-            // The CFG-free turbo path needs the bundled TurboTime LoRA merged into the conditional
-            // DiT; that merge (adapters) is the sc-6596 follow-up. Reject rather than emit a wrong
-            // (un-distilled) render. Quality (`ideogram_4`) is wired.
-            return Err(gen_core::Error::Unsupported(
-                "ideogram_4_turbo: TurboTime LoRA merge not yet wired (sc-6596 follow-up); \
-                 ideogram_4 (quality) is available"
-                    .into(),
-            ));
-        }
         let comps = self.components()?;
         let images = pipeline::render(&comps, req, &self.device, on_progress)?;
         Ok(GenerationOutput::Images(images))
@@ -283,26 +278,22 @@ mod tests {
     }
 
     #[test]
-    fn turbo_gated_quality_reaches_pipeline() {
+    fn both_variants_reach_pipeline() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-ideogram-snap".into()));
         let req = GenerationRequest {
             prompt: "a fox".into(),
             ..Default::default()
         };
-        // Turbo is gated on the TurboTime LoRA merge (sc-6596 follow-up) → Unsupported.
-        let turbo = registry::load(MODEL_ID_TURBO, &spec).unwrap();
-        assert!(matches!(
-            turbo.generate(&req, &mut |_| {}).unwrap_err(),
-            gen_core::Error::Unsupported(_)
-        ));
-        // Quality is wired — it passes the gate and fails on the missing snapshot (a load error,
-        // NOT Unsupported), proving the pipeline path is reached.
-        let quality = registry::load(MODEL_ID, &spec).unwrap();
-        let err = quality.generate(&req, &mut |_| {}).unwrap_err();
-        assert!(
-            !matches!(err, gen_core::Error::Unsupported(_)),
-            "quality should reach the pipeline, got {err:?}"
-        );
+        // Both quality and turbo are wired — generate() passes the capability gate and fails on the
+        // missing snapshot dir (a load error, NOT Unsupported), proving the pipeline path is reached.
+        for id in [MODEL_ID, MODEL_ID_TURBO] {
+            let g = registry::load(id, &spec).unwrap();
+            let err = g.generate(&req, &mut |_| {}).unwrap_err();
+            assert!(
+                !matches!(err, gen_core::Error::Unsupported(_)),
+                "{id} should reach the pipeline, got {err:?}"
+            );
+        }
     }
 
     #[test]
