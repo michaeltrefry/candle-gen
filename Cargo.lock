@@ -276,6 +276,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-ideogram"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-flux2",
+ "candle-transformers",
+ "image",
+ "inventory",
+ "rand",
+ "rand_distr",
+ "safetensors 0.7.0",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "tokenizers 0.22.2",
+]
+
+[[package]]
 name = "candle-gen-instantid"
 version = "0.0.0"
 dependencies = [

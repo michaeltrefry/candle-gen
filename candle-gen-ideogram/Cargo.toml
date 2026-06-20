@@ -1,0 +1,38 @@
+[package]
+name = "candle-gen-ideogram"
+version = "0.0.0"
+edition = "2021"
+description = "Ideogram 4 provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-ideogram."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "diffusion", "ideogram", "inference"]
+categories = ["science"]
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+# Ideogram's VAE is the FLUX.2 `AutoencoderKLFlux2` (32-ch, 2×2 patchify, identity scaling) — reuse
+# `candle-gen-flux2`'s `Flux2Vae` verbatim, exactly as `mlx-gen-ideogram` reuses `mlx-gen-flux2`.
+candle-gen-flux2 = { path = "../candle-gen-flux2" }
+inventory = { workspace = true }
+# Ideogram has NO candle-transformers reference: the single-stream flow DiT and the Qwen3-VL-8B
+# prompt-embeds path are written here on candle-core/candle-nn (the VAE is reused from flux2).
+candle-transformers = { workspace = true }
+# Qwen3-VL tokenizer.json loading; the Qwen instruct chat template comes from gen-core's
+# `TextTokenizer` (re-exported through `candle_gen::gen_core`).
+tokenizers = { workspace = true }
+# Deterministic CPU-seeded initial noise (sc-3673 parity).
+rand = { workspace = true }
+rand_distr = { workspace = true }
+serde_json = "1"
+# Read adapter `.safetensors` header metadata for the bundled TurboTime LoRA merge (turbo path).
+safetensors = "0.7"
+
+[features]
+default = []
+metal = ["candle-gen/metal", "candle-gen-flux2/metal", "candle-transformers/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda", "candle-transformers/cuda"]
+flash-attn = ["candle-gen/flash-attn", "candle-gen-flux2/flash-attn", "candle-transformers/flash-attn"]
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "0b86fad4fb98a3b2a73d0a38e47616cd505094ca" }
