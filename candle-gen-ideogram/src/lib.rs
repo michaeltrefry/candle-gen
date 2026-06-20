@@ -14,10 +14,11 @@
 //! text path ([`text_encoder`]) is adapted from flux2's Qwen3 encoder (θ=5e6, 13 interleaved
 //! captured states). The single-stream DiT + the denoise pipeline are ported here.
 //!
-//! **Status (sc-6596):** both `ideogram_4` (quality, asymmetric two-DiT CFG) and `ideogram_4_turbo`
-//! (CFG-free single DiT + the bundled TurboTime LoRA merged at load, [`adapters`]) are wired
-//! end-to-end — Qwen3-VL text encode → single-stream DiT → VAE decode — pending GPU validation vs MLX
-//! and the bf16 weight provisioning. Remix/edit is sc-6598. `backend = "candle"`, `mac_only = false`.
+//! **Status:** both `ideogram_4` (quality, asymmetric two-DiT CFG) and `ideogram_4_turbo` (CFG-free
+//! single DiT + the bundled TurboTime LoRA merged at load, [`adapters`]) are wired end-to-end —
+//! Qwen3-VL text encode → single-stream DiT → VAE decode — for **T2I** (sc-6596) and **edit**
+//! (sc-6598: img2img/Remix `Reference` + mask inpaint `Mask`, via the FLUX.2 VAE encoder). `backend =
+//! "candle"`, `mac_only = false`.
 
 pub mod adapters;
 pub mod config;
@@ -33,8 +34,8 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, WeightsSource,
+    self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
 
 use config::{MODEL_ID, MODEL_ID_TURBO, SIZE_MULTIPLE};
@@ -98,6 +99,23 @@ impl Generator for Ideogram4Generator {
                 self.descriptor.id, req.width, req.height
             )));
         }
+        // Edit: an inpaint `Mask` is meaningless without a source `Reference` to keep/blend against
+        // (the capability floor admits both kinds individually; this enforces the pairing). Multiple
+        // references / masks are caught in `resolve_edit` at generate time.
+        let has_ref = req
+            .conditioning
+            .iter()
+            .any(|c| matches!(c, Conditioning::Reference { .. }));
+        let has_mask = req
+            .conditioning
+            .iter()
+            .any(|c| matches!(c, Conditioning::Mask { .. }));
+        if has_mask && !has_ref {
+            return Err(gen_core::Error::Msg(format!(
+                "{}: an inpaint mask requires a reference (source) image",
+                self.descriptor.id
+            )));
+        }
         Ok(())
     }
 
@@ -114,7 +132,8 @@ impl Generator for Ideogram4Generator {
 }
 
 /// Ideogram 4 (quality) descriptor — asymmetric two-DiT CFG; no text negative prompt (the negative
-/// branch is the trained unconditional DiT). T2I only for now; Remix/edit conditioning is sc-6598.
+/// branch is the trained unconditional DiT). Edit (sc-6598): img2img/Remix via a source `Reference`,
+/// and mask inpaint via a `Mask` (white = repaint) alongside the `Reference`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
@@ -125,7 +144,9 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: false,
             supports_guidance: true,
             supports_true_cfg: false,
-            conditioning: vec![],
+            // Edit (sc-6303/6330 → candle sc-6598): one img2img/inpaint source Reference + optional
+            // inpaint Mask. No control/pose/multi-reference. Works in both quality and turbo.
+            conditioning: vec![ConditioningKind::Reference, ConditioningKind::Mask],
             supports_lora: false,
             supports_lokr: false,
             samplers: vec![],
@@ -165,8 +186,10 @@ fn build(
             )));
         }
     };
-    // User adapters / on-the-fly quant / control overlays are not wired (the turbo LoRA is bundled
-    // in the snapshot and installed internally; edit conditioning is sc-6598).
+    // User adapters / on-the-fly quant / ControlNet+IP-Adapter overlays are not wired (the turbo LoRA
+    // is bundled in the snapshot and installed internally). img2img/Remix + mask inpaint edit is NOT a
+    // LoadSpec overlay — it arrives as per-request `Reference`/`Mask` conditioning (sc-6598), handled
+    // in the pipeline, so it is unaffected by these load-time rejects.
     if !spec.adapters.is_empty() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {} does not accept user LoRA/LoKr (the TurboTime LoRA is bundled)",
@@ -181,7 +204,8 @@ fn build(
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
-            "candle {} does not support control / Edit yet (txt2img only; Remix/edit is sc-6598)",
+            "candle {} does not support ControlNet / IP-Adapter overlays (img2img/mask edit is \
+             request-time Reference/Mask conditioning, which is supported)",
             descriptor.id
         )));
     }
@@ -223,8 +247,7 @@ pub fn force_link() {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
-    use candle_gen::gen_core::ConditioningKind;
+    use candle_gen::gen_core::{registry, Image};
 
     #[test]
     fn registers_both_ids_as_candle() {
@@ -243,11 +266,15 @@ mod tests {
         let q = descriptor();
         assert!(q.capabilities.supports_guidance);
         assert!(!q.capabilities.supports_negative_prompt);
-        assert!(q.capabilities.conditioning.is_empty());
-        assert!(!q.capabilities.accepts(ConditioningKind::Reference));
+        // Edit surface (sc-6598): img2img Reference + inpaint Mask.
+        assert!(q.capabilities.accepts(ConditioningKind::Reference));
+        assert!(q.capabilities.accepts(ConditioningKind::Mask));
+        assert!(!q.capabilities.accepts(ConditioningKind::Control));
         let t = descriptor_turbo();
         assert_eq!(t.id, MODEL_ID_TURBO);
         assert!(!t.capabilities.supports_guidance);
+        // Turbo shares the edit surface.
+        assert!(t.capabilities.accepts(ConditioningKind::Reference));
     }
 
     #[test]
@@ -275,6 +302,70 @@ mod tests {
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
+    }
+
+    #[test]
+    fn validate_edit_conditioning_surface() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load(MODEL_ID, &spec).unwrap();
+        let img = |w: u32, h: u32| Image {
+            width: w,
+            height: h,
+            pixels: vec![0u8; (w * h * 3) as usize],
+        };
+        let base = GenerationRequest {
+            prompt: "a fox".into(),
+            width: 512,
+            height: 512,
+            ..Default::default()
+        };
+        // img2img: a single source Reference is accepted.
+        assert!(g
+            .validate(&GenerationRequest {
+                conditioning: vec![Conditioning::Reference {
+                    image: img(512, 512),
+                    strength: Some(0.6),
+                }],
+                ..base.clone()
+            })
+            .is_ok());
+        // inpaint: Reference + Mask is accepted.
+        assert!(g
+            .validate(&GenerationRequest {
+                conditioning: vec![
+                    Conditioning::Reference {
+                        image: img(512, 512),
+                        strength: None,
+                    },
+                    Conditioning::Mask {
+                        image: img(512, 512)
+                    },
+                ],
+                ..base.clone()
+            })
+            .is_ok());
+        // A Mask without a Reference is rejected (pairing).
+        let e = g
+            .validate(&GenerationRequest {
+                conditioning: vec![Conditioning::Mask {
+                    image: img(512, 512),
+                }],
+                ..base.clone()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("requires a reference"), "got: {e}");
+        // An out-of-surface Control conditioning is rejected by the capability floor.
+        assert!(g
+            .validate(&GenerationRequest {
+                conditioning: vec![Conditioning::Control {
+                    image: img(512, 512),
+                    kind: candle_gen::gen_core::ControlKind::Pose,
+                    scale: 1.0,
+                }],
+                ..base
+            })
+            .is_err());
     }
 
     #[test]

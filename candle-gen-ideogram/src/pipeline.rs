@@ -1,6 +1,13 @@
-//! Ideogram 4 text-to-image pipeline: Qwen3-VL text encode → flow-matching denoise → latent
-//! de-normalize + (ph,pw,c) unpatchify + VAE decode. Port of `mlx-gen-ideogram`'s
-//! `Ideogram4Pipeline` (T2I path; img2img/edit is sc-6598).
+//! Ideogram 4 text-to-image **and edit** pipeline: Qwen3-VL text encode → flow-matching denoise →
+//! latent de-normalize + (ph,pw,c) unpatchify + VAE decode. Port of `mlx-gen-ideogram`'s
+//! `Ideogram4Pipeline` (T2I + the sc-6303/6330 img2img/Remix + mask inpaint edit, sc-6598).
+//!
+//! **Edit (img2img / mask inpaint).** With an [`EditInit`] (a source `Reference` + optional `Mask`),
+//! the denoise starts from the VAE-encoded source latent noised to a strength-derived step instead of
+//! pure noise (img2img / Remix); an optional latent-grid mask additionally pins the keep region
+//! (mask 0) to the source re-noised to each step's σ while regenerating the white region (mask 1) —
+//! masked img2img inpaint on the same flow-match loop. With no [`EditInit`] the path is identical to
+//! the original text-to-image render.
 //!
 //! Two denoise modes share the loop, selected by whether the **unconditional** DiT is present:
 //! * **Quality (asymmetric CFG, default)** — the conditional DiT runs over the full `[text ; image]`
@@ -18,8 +25,9 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::imageops::{resize_lanczos_u8, resize_nearest_u8};
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
-use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
+use candle_gen::gen_core::{self, Conditioning, GenerationRequest, Image, Progress};
 use candle_gen::{CandleError, Result as CResult};
 use candle_gen_flux2::vae::Flux2Vae;
 use rand::rngs::StdRng;
@@ -27,9 +35,9 @@ use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::config::{
-    Ideogram4DitConfig, Ideogram4TextEncoderConfig, DEFAULT_GUIDANCE, DEFAULT_STEPS,
-    DEFAULT_TURBO_STEPS, EXTRACTED_LAYERS, MAX_TEXT_TOKENS, PAD_TOKEN_ID, TURBO_LORA_FILE,
-    TURBO_LORA_SCALE,
+    Ideogram4DitConfig, Ideogram4TextEncoderConfig, DEFAULT_GUIDANCE, DEFAULT_IMG2IMG_STRENGTH,
+    DEFAULT_INPAINT_STRENGTH, DEFAULT_STEPS, DEFAULT_TURBO_STEPS, EXTRACTED_LAYERS,
+    MAX_TEXT_TOKENS, PAD_TOKEN_ID, TURBO_LORA_FILE, TURBO_LORA_SCALE,
 };
 use crate::scheduler::{make_step_intervals, preset_mu_std, LogitNormalSchedule};
 use crate::text_encoder::Ideogram4TextEncoder;
@@ -112,7 +120,10 @@ pub fn load_components(root: &Path, device: &Device) -> CResult<Components> {
         MAX_TEXT_TOKENS,
         component_vb(root, "text_encoder", ENC_DTYPE, device)?,
     )?;
-    let vae = Flux2Vae::new(component_vb(root, "vae", ENC_DTYPE, device)?)?;
+    // With the encoder (img2img/edit needs `vae.encode`); the encoder adds only ~the decoder's worth
+    // of weights on top of the multi-GB DiTs, so it is always loaded — a Generator serves both T2I and
+    // edit requests and does not know which at load time.
+    let vae = Flux2Vae::new_with_encoder(component_vb(root, "vae", ENC_DTYPE, device)?)?;
 
     Ok(Components {
         cond,
@@ -146,7 +157,10 @@ pub fn load_components_turbo(root: &Path, device: &Device) -> CResult<Components
         MAX_TEXT_TOKENS,
         component_vb(root, "text_encoder", ENC_DTYPE, device)?,
     )?;
-    let vae = Flux2Vae::new(component_vb(root, "vae", ENC_DTYPE, device)?)?;
+    // With the encoder (img2img/edit needs `vae.encode`); the encoder adds only ~the decoder's worth
+    // of weights on top of the multi-GB DiTs, so it is always loaded — a Generator serves both T2I and
+    // edit requests and does not know which at load time.
+    let vae = Flux2Vae::new_with_encoder(component_vb(root, "vae", ENC_DTYPE, device)?)?;
 
     Ok(Components {
         cond,
@@ -183,6 +197,52 @@ impl Components {
         }
         Ok(ids)
     }
+
+    /// VAE-encode a source image into the bn-normalized packed latent `[1, num_img, 128]` the denoise
+    /// operates on — the exact inverse of [`decode`]'s de-normalize + (ph,pw,c) unpatchify: resize →
+    /// `vae.encode` (posterior mean) → 2×2 patchify (Ideogram's `(ph,pw,c)` c-innermost order) →
+    /// bn-normalize `(x − mean)/std`. Seed-independent; encode once per request.
+    fn encode_init_latents(
+        &self,
+        image: &Image,
+        height: u32,
+        width: u32,
+        device: &Device,
+    ) -> CResult<Tensor> {
+        let grid_h = (height / PATCH_AE) as usize;
+        let grid_w = (width / PATCH_AE) as usize;
+        let pre = preprocess_source_image(image, width, height, device)?; // [1, 3, H, W]
+        let enc = self.vae.encode(&pre)?; // [1, 32, H/8, W/8] = [1, 32, gh·2, gw·2]
+                                          // Patchify to packed [1, L, 128] (ph,pw,c) — inverse of decode's unpatchify permute.
+        let packed = enc
+            .reshape((1, 32, grid_h, 2, grid_w, 2))? // [B, c, gh, ph, gw, pw]
+            .permute((0, 2, 4, 3, 5, 1))? // [B, gh, gw, ph, pw, c]
+            .contiguous()?
+            .reshape((1, grid_h * grid_w, 128))?;
+        let (bn_std, bn_mean) = self.vae.bn_stats();
+        let bn_std = bn_std.reshape((1, 1, 128))?;
+        let bn_mean = bn_mean.reshape((1, 1, 128))?;
+        Ok(packed.broadcast_sub(&bn_mean)?.broadcast_div(&bn_std)?)
+    }
+
+    /// Prepare the per-request [`EditInit`] (img2img / inpaint): VAE-encode the source once and build
+    /// the optional latent-grid mask. Reused across the per-seed count loop (seed-independent).
+    fn prepare_edit(
+        &self,
+        source: &Image,
+        mask: Option<&Image>,
+        strength: f32,
+        height: u32,
+        width: u32,
+        device: &Device,
+    ) -> CResult<EditInit> {
+        let z0 = self.encode_init_latents(source, height, width, device)?;
+        let mask = match mask {
+            Some(m) => Some(preprocess_mask_packed(m, width, height, device)?),
+            None => None,
+        };
+        Ok(EditInit { z0, mask, strength })
+    }
 }
 
 /// Render `req.count` images for `req`.
@@ -213,17 +273,83 @@ pub fn render(
         ));
     }
 
+    // Edit (img2img / inpaint): resolve a source `Reference` (+ optional `Mask`) and VAE-encode the
+    // source once (seed-independent). `None` → the text-to-image path (identical to before).
+    let edit = match resolve_edit(req)? {
+        Some((source, mask, strength)) => {
+            Some(comps.prepare_edit(source, mask, strength, req.height, req.width, device)?)
+        }
+        None => None,
+    };
+
     let mut images = Vec::with_capacity(req.count as usize);
     for index in 0..req.count {
         let seed = base_seed.wrapping_add(index as u64);
-        let z = denoise(comps, &ids, req, steps, guidance, seed, device, on_progress)?;
+        let z = denoise(
+            comps,
+            &ids,
+            req,
+            steps,
+            guidance,
+            seed,
+            edit.as_ref(),
+            device,
+            on_progress,
+        )?;
         on_progress(Progress::Decoding);
         images.push(decode(comps, &z, req.width, req.height)?);
     }
     Ok(images)
 }
 
-/// One flow-matching denoise → packed image latent `[1, num_img, 128]` (f32).
+/// Resolve the optional edit conditioning: a single img2img/inpaint source [`Conditioning::Reference`]
+/// plus an optional [`Conditioning::Mask`]. Returns `(source, mask, strength)`; `None` for pure
+/// text-to-image. A per-reference strength wins over `req.strength`, else the img2img/inpaint default.
+/// More than one `Reference`/`Mask`, or a `Mask` without a `Reference`, is an error.
+fn resolve_edit(req: &GenerationRequest) -> CResult<Option<(&Image, Option<&Image>, f32)>> {
+    let mut source: Option<(&Image, Option<f32>)> = None;
+    let mut mask: Option<&Image> = None;
+    for c in &req.conditioning {
+        match c {
+            Conditioning::Reference { image, strength } => {
+                if source.is_some() {
+                    return Err(CandleError::Msg(
+                        "ideogram: only one reference (source) image is supported for edit".into(),
+                    ));
+                }
+                source = Some((image, strength.or(req.strength)));
+            }
+            Conditioning::Mask { image } => {
+                if mask.is_some() {
+                    return Err(CandleError::Msg(
+                        "ideogram: only one inpaint mask is supported".into(),
+                    ));
+                }
+                mask = Some(image);
+            }
+            // Other conditioning kinds are rejected by the capability floor in `validate`.
+            _ => {}
+        }
+    }
+    match source {
+        Some((image, strength)) => {
+            let default = if mask.is_some() {
+                DEFAULT_INPAINT_STRENGTH
+            } else {
+                DEFAULT_IMG2IMG_STRENGTH
+            };
+            Ok(Some((image, mask, strength.unwrap_or(default))))
+        }
+        None if mask.is_some() => Err(CandleError::Msg(
+            "ideogram: an inpaint mask requires a reference (source) image".into(),
+        )),
+        None => Ok(None),
+    }
+}
+
+/// One flow-matching denoise → packed image latent `[1, num_img, 128]` (f32). With `edit = Some`
+/// (img2img / inpaint) the denoise starts from the source latent noised to a strength-derived step
+/// and (with a mask) pins the keep region per step; `edit = None` is the original text-to-image path.
 #[allow(clippy::too_many_arguments)]
 fn denoise(
     comps: &Components,
@@ -232,6 +358,7 @@ fn denoise(
     steps: usize,
     guidance: f32,
     seed: u64,
+    edit: Option<&EditInit>,
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> CResult<Tensor> {
@@ -273,11 +400,24 @@ fn denoise(
     let schedule = LogitNormalSchedule::for_resolution(height, width, mu_eff, std_eff);
     let si = make_step_intervals(steps);
 
-    // ── Init from pure noise; image-token velocity slice; text padding for the cond sequence ──
-    let mut z = create_noise(seed, num_img, ch, device)?; // [1, num_img, ch] f32
+    // Edit: run only `num_run = floor(steps·strength)` of the reversed loop (skip the noisiest leading
+    // steps) and start from the source noised to σ = schedule.eval(si[num_run]). T2I runs the full
+    // range from pure noise. (Ideogram's schedule is inverted — larger σ = cleaner, so a larger
+    // num_run/strength → a smaller start σ → more change.) `init_time_step` floors strength to ≥1 step.
+    let num_run = match edit {
+        Some(e) => init_time_step(steps, e.strength),
+        None => steps,
+    };
+
+    // ── Init: always draw the noise (identical RNG stream); blend with the source for an edit ──
+    let noise = create_noise(seed, num_img, ch, device)?; // [1, num_img, ch] f32
+    let mut z = match edit {
+        Some(e) => add_noise_by_interpolation(&e.z0, &noise, schedule.eval(si[num_run]) as f32)?,
+        None => noise.clone(),
+    };
     let text_z_padding = Tensor::zeros((1, num_text, ch), DType::F32, device)?;
 
-    for i in (0..steps).rev() {
+    for i in (0..num_run).rev() {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
@@ -312,9 +452,20 @@ fn denoise(
             None => pos_v,
         };
         z = (&z + (v * (s_val - t_val) as f64)?)?;
+        // Inpaint: pin the keep region (mask 0) to the source re-noised to this step's σ (= s_val, the
+        // post-step time) and regenerate the white region (mask 1). At the final step s≈0 the keep
+        // region is the clean source. Mask is `[1, num_img, 1]`, broadcast over the channel axis;
+        // draws no RNG, so an all-white mask reduces to plain img2img.
+        if let Some(e) = edit {
+            if let Some(mask) = &e.mask {
+                let init_noised = add_noise_by_interpolation(&e.z0, &noise, s_val)?;
+                let keep = mask.affine(-1.0, 1.0)?; // 1 − mask
+                z = (z.broadcast_mul(mask)? + init_noised.broadcast_mul(&keep)?)?;
+            }
+        }
         on_progress(Progress::Step {
-            current: (steps - i) as u32,
-            total: steps as u32,
+            current: (num_run - i) as u32,
+            total: num_run as u32,
         });
     }
     Ok(z)
@@ -370,6 +521,118 @@ fn create_noise(seed: u64, num_img: usize, ch: usize, device: &Device) -> CResul
     Ok(Tensor::from_vec(data, (1, num_img, ch), device)?)
 }
 
+/// Edit (img2img / mask inpaint) conditioning prepared **once per request** (seed-independent) by
+/// [`Components::prepare_edit`]: the bn-normalized packed source latent `[1, num_img, 128]`, an
+/// optional latent-grid inpaint mask `[1, num_img, 1]` (1 = repaint, 0 = keep), and the strength.
+pub struct EditInit {
+    /// bn-normalized packed source latent `[1, num_img, 128]` (same space as the running `z`).
+    pub z0: Tensor,
+    /// Latent-grid inpaint mask `[1, num_img, 1]` (1.0 = repaint/white, 0.0 = keep/black). `None` for
+    /// plain img2img (regenerate everywhere from the noised source).
+    pub mask: Option<Tensor>,
+    /// img2img strength in `(0, 1]` — fraction of the denoise executed from the noised source.
+    pub strength: f32,
+}
+
+/// img2img start step (the flux2/fork `init_time_step`): `max(1, floor(num_steps·strength))` for a
+/// positive strength clamped to `[0,1]`, else `0`. The denoise executes the lowest `num_run` steps
+/// over the source noised to `schedule.eval(si[num_run])`.
+fn init_time_step(num_steps: usize, strength: f32) -> usize {
+    if strength > 0.0 {
+        let s = strength.clamp(0.0, 1.0);
+        // `int(num_steps * strength)` truncates toward zero == floor for s >= 0.
+        ((num_steps as f32 * s) as usize).max(1)
+    } else {
+        0
+    }
+}
+
+/// Flow-matching interpolation `z = σ·clean + (1−σ)·noise`. Ideogram's [`LogitNormalSchedule`] is
+/// inverted from the usual flow-match σ (`eval(0) ≈ clean`, `eval(1) ≈ noise`), so a larger σ weights
+/// the clean source more — the mirror of the fork's `add_noise_by_interpolation`.
+fn add_noise_by_interpolation(clean: &Tensor, noise: &Tensor, sigma: f32) -> CResult<Tensor> {
+    Ok(((clean * sigma as f64)? + (noise * (1.0 - sigma) as f64)?)?)
+}
+
+/// Preprocess a source image onto the model's input grid: Lanczos-resize to `width×height`, normalize
+/// to `[-1,1]`, NCHW `[1,3,H,W]` f32 (candle VAE layout). Mirrors the MLX `preprocess_source_image`.
+fn preprocess_source_image(
+    image: &Image,
+    width: u32,
+    height: u32,
+    device: &Device,
+) -> CResult<Tensor> {
+    let (iw, ih) = (image.width as usize, image.height as usize);
+    let (tw, th) = (width as usize, height as usize);
+    if image.pixels.len() != iw * ih * 3 {
+        return Err(CandleError::Msg(format!(
+            "ideogram edit: source pixel buffer {} != {iw}x{ih}x3",
+            image.pixels.len()
+        )));
+    }
+    let resized: Vec<f32> = if (ih, iw) == (th, tw) {
+        image.pixels.iter().map(|&p| p as f32).collect()
+    } else {
+        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)
+    };
+    let norm: Vec<f32> = resized.iter().map(|&v| 2.0 * (v / 255.0) - 1.0).collect();
+    let hwc = Tensor::from_vec(norm, (th, tw, 3), device)?; // [H, W, 3]
+    Ok(hwc
+        .permute((2, 0, 1))?
+        .contiguous()?
+        .reshape((1, 3, th, tw))?)
+}
+
+/// Build the latent-grid inpaint mask `[1, num_img, 1]` (f32; 1.0 = repaint/white, 0.0 = keep/black)
+/// from a mask image: luma → nearest `patch·ae = 16×` downsample (top-left of each block, torch
+/// `nearest`'s `floor(dst·scale)`) → binarize at 0.5, row-major to match the image-token order
+/// (`j = h·grid_w + w`). Mirrors the MLX `preprocess_mask_packed` (downsample factor 16, not 8).
+fn preprocess_mask_packed(
+    mask: &Image,
+    width: u32,
+    height: u32,
+    device: &Device,
+) -> CResult<Tensor> {
+    let (w, h) = (width as usize, height as usize);
+    let patch = PATCH_AE as usize; // 16
+                                   // Nearest (not bicubic): a mask must not gain interpolated grays that flip the 0.5 binarize.
+    let luma: Vec<u8> = if (mask.width as usize, mask.height as usize) == (w, h) {
+        rgb_to_luma(&mask.pixels)
+    } else {
+        let resized = resize_nearest_u8(
+            &mask.pixels,
+            mask.height as usize,
+            mask.width as usize,
+            h,
+            w,
+        );
+        let u8s: Vec<u8> = resized
+            .iter()
+            .map(|&v| v.round().clamp(0.0, 255.0) as u8)
+            .collect();
+        rgb_to_luma(&u8s)
+    };
+    let (gh, gw) = (h / patch, w / patch);
+    let mut packed = Vec::with_capacity(gh * gw);
+    for ly in 0..gh {
+        for lx in 0..gw {
+            let v = luma[(ly * patch) * w + (lx * patch)]; // top-left of the block
+            packed.push(if v as f32 / 255.0 >= 0.5 { 1.0f32 } else { 0.0 });
+        }
+    }
+    Ok(Tensor::from_vec(packed, (1, gh * gw, 1), device)?)
+}
+
+/// PIL "L" grayscale luma: `round(R·299/1000 + G·587/1000 + B·114/1000)` per RGB pixel.
+fn rgb_to_luma(rgb: &[u8]) -> Vec<u8> {
+    rgb.chunks_exact(3)
+        .map(|p| {
+            let l = (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114 + 500) / 1000;
+            l.min(255) as u8
+        })
+        .collect()
+}
+
 /// Host-built packed sequence metadata: text tokens (`LLM`) then image tokens (`IMAGE`).
 struct Packing {
     position_ids: Vec<i64>,
@@ -414,5 +677,169 @@ impl Packing {
             neg_segment_ids: vec![1; num_img],
             neg_indicator: vec![OUTPUT_IMAGE_INDICATOR; num_img],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn img(w: u32, h: u32, pixels: Vec<u8>) -> Image {
+        Image {
+            width: w,
+            height: h,
+            pixels,
+        }
+    }
+
+    fn solid(w: u32, h: u32, rgb: [u8; 3]) -> Image {
+        let mut px = Vec::with_capacity((w * h * 3) as usize);
+        for _ in 0..(w * h) {
+            px.extend_from_slice(&rgb);
+        }
+        img(w, h, px)
+    }
+
+    #[test]
+    fn init_time_step_floors_and_clamps() {
+        assert_eq!(init_time_step(48, 0.0), 0); // no strength → no edit steps
+        assert_eq!(init_time_step(48, 1.0), 48); // full strength → full range
+        assert_eq!(init_time_step(48, 0.5), 24); // floor(48·0.5)
+        assert_eq!(init_time_step(48, 0.6), 28); // floor(28.8)
+        assert_eq!(init_time_step(48, 0.001), 1); // tiny positive floors to ≥1
+        assert_eq!(init_time_step(8, 2.0), 8); // strength clamps to 1.0
+    }
+
+    #[test]
+    fn add_noise_by_interpolation_blends() {
+        let dev = Device::Cpu;
+        let clean = Tensor::from_vec(vec![2.0f32, 2.0], (1, 2, 1), &dev).unwrap();
+        let noise = Tensor::from_vec(vec![10.0f32, 10.0], (1, 2, 1), &dev).unwrap();
+        let at = |s: f32| {
+            add_noise_by_interpolation(&clean, &noise, s)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        assert_eq!(at(1.0), vec![2.0, 2.0]); // σ=1 → clean
+        assert_eq!(at(0.0), vec![10.0, 10.0]); // σ=0 → noise
+        assert_eq!(at(0.5), vec![6.0, 6.0]); // halfway
+    }
+
+    #[test]
+    fn rgb_to_luma_matches_pil() {
+        assert_eq!(rgb_to_luma(&[255, 255, 255]), vec![255]); // white
+        assert_eq!(rgb_to_luma(&[0, 0, 0]), vec![0]); // black
+                                                      // round(255·0.587) = round(149.685) = 150 for pure green.
+        assert_eq!(rgb_to_luma(&[0, 255, 0]), vec![150]);
+    }
+
+    #[test]
+    fn preprocess_mask_packed_binarizes_and_downsamples() {
+        // 32×16, patch 16 → grid 2×1 (gw=2, gh=1) → 2 tokens. Left 16 cols white, right 16 black.
+        let (w, h) = (32u32, 16u32);
+        let mut px = Vec::with_capacity((w * h * 3) as usize);
+        for _ in 0..h {
+            for x in 0..w {
+                let v = if x < 16 { 255 } else { 0 };
+                px.extend_from_slice(&[v, v, v]);
+            }
+        }
+        let m = preprocess_mask_packed(&img(w, h, px), w, h, &Device::Cpu).unwrap();
+        assert_eq!(m.dims(), &[1, 2, 1]); // [1, num_img, 1]
+        let v = m.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(v, vec![1.0, 0.0]); // left block repaint, right block keep
+    }
+
+    fn req_with(conditioning: Vec<Conditioning>, strength: Option<f32>) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "a fox".into(),
+            width: 512,
+            height: 512,
+            conditioning,
+            strength,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_edit_defaults_and_pairing() {
+        // No conditioning → no edit.
+        assert!(resolve_edit(&req_with(vec![], None)).unwrap().is_none());
+
+        // Reference only → img2img default strength.
+        let r = req_with(
+            vec![Conditioning::Reference {
+                image: solid(8, 8, [10, 20, 30]),
+                strength: None,
+            }],
+            None,
+        );
+        let (_, mask, strength) = resolve_edit(&r).unwrap().expect("edit");
+        assert!(mask.is_none());
+        assert_eq!(strength, DEFAULT_IMG2IMG_STRENGTH);
+
+        // Reference + Mask → inpaint default strength.
+        let r = req_with(
+            vec![
+                Conditioning::Reference {
+                    image: solid(8, 8, [10, 20, 30]),
+                    strength: None,
+                },
+                Conditioning::Mask {
+                    image: solid(8, 8, [255, 255, 255]),
+                },
+            ],
+            None,
+        );
+        let (_, mask, strength) = resolve_edit(&r).unwrap().expect("edit");
+        assert!(mask.is_some());
+        assert_eq!(strength, DEFAULT_INPAINT_STRENGTH);
+
+        // Per-reference strength wins over the default and over req.strength.
+        let r = req_with(
+            vec![Conditioning::Reference {
+                image: solid(8, 8, [10, 20, 30]),
+                strength: Some(0.42),
+            }],
+            Some(0.9),
+        );
+        assert_eq!(resolve_edit(&r).unwrap().unwrap().2, 0.42);
+        // req.strength is used when the reference carries none.
+        let r = req_with(
+            vec![Conditioning::Reference {
+                image: solid(8, 8, [10, 20, 30]),
+                strength: None,
+            }],
+            Some(0.33),
+        );
+        assert_eq!(resolve_edit(&r).unwrap().unwrap().2, 0.33);
+
+        // A second Reference is an error.
+        let r = req_with(
+            vec![
+                Conditioning::Reference {
+                    image: solid(8, 8, [1, 2, 3]),
+                    strength: None,
+                },
+                Conditioning::Reference {
+                    image: solid(8, 8, [4, 5, 6]),
+                    strength: None,
+                },
+            ],
+            None,
+        );
+        assert!(resolve_edit(&r).is_err());
+
+        // A Mask without a Reference is an error.
+        let r = req_with(
+            vec![Conditioning::Mask {
+                image: solid(8, 8, [255, 255, 255]),
+            }],
+            None,
+        );
+        assert!(resolve_edit(&r).is_err());
     }
 }

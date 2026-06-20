@@ -11,6 +11,54 @@ use candle_gen::gen_core::{
     registry, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 
+/// Wrap a plain prompt into Ideogram's minimal JSON caption (mirrors the worker's
+/// `ideogram_caption::ensure_caption_prompt`). Ideogram 4 expects a JSON caption; a raw plain-text
+/// prompt is out-of-distribution and stochastically renders the "Image blocked by safety filter"
+/// placeholder. An already-caption prompt passes through unchanged.
+fn to_caption(prompt: &str) -> String {
+    let p = prompt.trim();
+    if p.starts_with('{') && p.contains("compositional_deconstruction") {
+        return p.to_string();
+    }
+    let q: String = p
+        .chars()
+        .flat_map(|c| match c {
+            '"' => vec!['\\', '"'],
+            '\\' => vec!['\\', '\\'],
+            _ => vec![c],
+        })
+        .collect();
+    format!(
+        "{{\"high_level_description\": \"{q}\", \"compositional_deconstruction\": \
+         {{\"background\": \"{q}\", \"elements\": []}}}}"
+    )
+}
+
+/// Heuristic copy of the worker's `ideogram_caption::looks_like_placeholder`: detect Ideogram 4's
+/// "Image blocked by safety filter" placeholder (a flat gray card with baked text) so the harness can
+/// reseed past a residual one (sc-6501 — rare even with a JSON caption, but seed-dependent). Flat-gray
+/// mean/std band + near-zero colorful fraction.
+fn looks_like_placeholder(pixels: &[u8], width: u32, height: u32) -> bool {
+    let expected = (width as usize) * (height as usize) * 3;
+    if pixels.len() < 3 || pixels.len() != expected {
+        return false;
+    }
+    let n = (pixels.len() / 3) as f64;
+    let (mut sum, mut sum_sq, mut colorful) = (0.0f64, 0.0f64, 0usize);
+    for px in pixels.chunks_exact(3) {
+        let (r, g, b) = (px[0] as u16, px[1] as u16, px[2] as u16);
+        if r.max(g).max(b) - r.min(g).min(b) > 24 {
+            colorful += 1;
+        }
+        let luma = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
+        sum += luma;
+        sum_sq += luma * luma;
+    }
+    let mean = sum / n;
+    let std = ((sum_sq / n) - mean * mean).max(0.0).sqrt();
+    (colorful as f64 / n) <= 0.02 && (90.0..=165.0).contains(&mean) && (2.0..=30.0).contains(&std)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Force-link the crate so its `inventory::submit!` registrations aren't dead-stripped (the
     // example otherwise references no symbol from the lib).
@@ -41,16 +89,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         gen.descriptor().backend
     );
 
-    let req = GenerationRequest {
-        prompt,
-        width,
-        height,
-        steps: if steps == 0 { None } else { Some(steps) },
-        seed: Some(seed),
-        count: 1,
-        ..Default::default()
-    };
-
     let t0 = std::time::Instant::now();
     let mut last = 0u32;
     let mut on_progress = |p: Progress| {
@@ -67,11 +105,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let result = gen.generate(&req, &mut on_progress)?;
-    let GenerationOutput::Images(images) = result else {
-        return Err("expected images".into());
-    };
-    let img = images.into_iter().next().ok_or("no image")?;
+    // Reseed past a residual safety placeholder (sc-6501) so the harness emits a real image — the
+    // same detect-and-recover the worker's macOS Ideogram path does.
+    let caption = to_caption(&prompt);
+    let mut img = None;
+    for attempt in 0..6u64 {
+        let seed_try = seed.wrapping_add(attempt);
+        let req = GenerationRequest {
+            prompt: caption.clone(),
+            width,
+            height,
+            steps: if steps == 0 { None } else { Some(steps) },
+            seed: Some(seed_try),
+            count: 1,
+            ..Default::default()
+        };
+        let GenerationOutput::Images(images) = gen.generate(&req, &mut on_progress)? else {
+            return Err("expected images".into());
+        };
+        let candidate = images.into_iter().next().ok_or("no image")?;
+        if !looks_like_placeholder(&candidate.pixels, candidate.width, candidate.height) {
+            img = Some(candidate);
+            break;
+        }
+        println!(
+            "  Ideogram safety placeholder at seed {seed_try}; reseeding (attempt {})",
+            attempt + 1
+        );
+        img = Some(candidate);
+    }
+    let img = img.ok_or("no image")?;
     println!(
         "rendered {}x{} in {:.1}s",
         img.width,
