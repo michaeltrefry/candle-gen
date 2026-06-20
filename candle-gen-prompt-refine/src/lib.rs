@@ -21,15 +21,17 @@
 pub mod prompt;
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use candle_gen::candle_core::{Device, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::registry::TextLlmRegistration;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
+use candle_gen::gen_core::tokenizer::{
+    ChatTemplate, ConstraintDecodeTable, TextTokenizer, TokenizerConfig,
+};
 use candle_gen::gen_core::{
-    self, default_seed, LoadSpec, Progress, TextLlm, TextLlmDescriptor, TextLlmFinishReason,
-    TextLlmOutput, TextLlmRequest, WeightsSource,
+    self, default_seed, JsonState, LoadSpec, Progress, TextLlm, TextLlmConstraint,
+    TextLlmDescriptor, TextLlmFinishReason, TextLlmOutput, TextLlmRequest, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
@@ -49,6 +51,19 @@ struct Engine {
     stop_ids: Vec<u32>,
     device: Device,
     dtype: candle_gen::candle_core::DType,
+    /// Per-token decode table for grammar-constrained decoding (sc-6585), filled lazily on the first
+    /// constrained request — the Engine is shared via `Arc`, so the cache is a `OnceLock` and a plain
+    /// free-text refine never builds it.
+    constraint_table: OnceLock<ConstraintDecodeTable>,
+}
+
+/// How a token id behaves under a JSON constraint: never-content special/added tokens and the
+/// end-of-text stop token are handled outside the grammar; ordinary tokens are masked by it.
+#[derive(Clone, Copy, PartialEq)]
+enum TokenKind {
+    Ordinary,
+    Special,
+    Stop,
 }
 
 impl Engine {
@@ -105,6 +120,7 @@ impl Engine {
             tokenizer,
             device: device.clone(),
             dtype,
+            constraint_table: OnceLock::new(),
         })
     }
 }
@@ -182,6 +198,34 @@ impl PromptRefiner {
         let mut logits_processor = LogitsProcessor::new(seed, temperature, top_p);
         let mut cache = Cache::new(true, engine.dtype, &engine.cfg, &engine.device)?;
 
+        // Constraint setup (sc-6585): classify each token id once (stop / never-content special /
+        // grammar-masked ordinary) and start the JSON grammar; per-step masking only runs when a
+        // constraint is set.
+        let constraint = (req.constraint == Some(TextLlmConstraint::Json)).then(|| {
+            engine
+                .constraint_table
+                .get_or_init(|| engine.tokenizer.constraint_decode_table())
+        });
+        let kinds: Vec<TokenKind> = match constraint {
+            Some(table) => {
+                let vocab = table.pieces.len();
+                let mut kinds = vec![TokenKind::Ordinary; vocab];
+                for &id in &table.special {
+                    if (id as usize) < vocab {
+                        kinds[id as usize] = TokenKind::Special;
+                    }
+                }
+                for &id in &engine.stop_ids {
+                    if (id as usize) < vocab {
+                        kinds[id as usize] = TokenKind::Stop;
+                    }
+                }
+                kinds
+            }
+            None => Vec::new(),
+        };
+        let mut json_state = JsonState::start();
+
         let total = req.sampling.max_new_tokens;
         let mut generated: Vec<u32> = Vec::new();
         let mut index_pos = 0usize;
@@ -205,11 +249,41 @@ impl PromptRefiner {
             let logits = logits.squeeze(0)?; // (1, vocab) → (vocab,)
             index_pos += ctxt.len();
 
-            let next = logits_processor.sample(&logits)?;
+            let next = if let Some(table) = constraint {
+                // Mask the (vocab,) logits to grammar-valid tokens before sampling: the stop token
+                // only when the JSON value is already complete, never a non-stop special, otherwise
+                // gated by feeding the token's decoded text to the JSON grammar.
+                let can_stop = json_state.can_stop();
+                let mut v: Vec<f32> = logits.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                let vocab = v.len();
+                for (id, slot) in v.iter_mut().enumerate() {
+                    let allowed = match kinds[id] {
+                        TokenKind::Stop => can_stop,
+                        TokenKind::Special => false,
+                        TokenKind::Ordinary => json_state.advance(&table.pieces[id]).is_some(),
+                    };
+                    if !allowed {
+                        *slot = f32::NEG_INFINITY;
+                    }
+                }
+                let masked = Tensor::from_vec(v, vocab, &engine.device)?;
+                logits_processor.sample(&masked)?
+            } else {
+                logits_processor.sample(&logits)?
+            };
             tokens.push(next);
             if engine.stop_ids.contains(&next) {
                 finish = TextLlmFinishReason::StopToken;
                 break;
+            }
+            // Advance the JSON grammar by the accepted (non-stop) token's text — it was in the allowed
+            // set, so this never rejects.
+            if let Some(table) = constraint {
+                if let Some(piece) = table.pieces.get(next as usize) {
+                    if let Some(advanced) = json_state.advance(piece) {
+                        json_state = advanced;
+                    }
+                }
             }
             generated.push(next);
             // 1-based step count = tokens emitted so far (monotone, ≤ total).

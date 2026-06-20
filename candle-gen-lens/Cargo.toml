@@ -33,7 +33,7 @@ safetensors = "0.7"
 # Trainer contract harness. Both are `#[ignore]` + `cfg(feature = "cuda")` (need the real Lens weights +
 # a GPU); the testkit lib name is `gen_core_testkit`.
 image = { version = "0.25", default-features = false, features = ["png"] }
-sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "dc40c74ea6d364010a8e0198eab6fceba2422e2a" }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b" }
 
 [features]
 default = []
