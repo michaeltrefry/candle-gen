@@ -302,8 +302,12 @@ impl Scail2Dit {
             time_projection: linear(cfg.dim, 6 * cfg.dim, vb.pp("time_projection").pp("1"))?,
             img_ln0_w: vb.pp("img_emb").pp("proj").pp("0").get(1280, "weight")?,
             img_ln0_b: vb.pp("img_emb").pp("proj").pp("0").get(1280, "bias")?,
-            img_emb_1: linear(1280, cfg.dim, vb.pp("img_emb").pp("proj").pp("1"))?,
-            img_emb_3: linear(cfg.dim, cfg.dim, vb.pp("img_emb").pp("proj").pp("3"))?,
+            // Wan-I2V `img_emb` MLPProj (`proj.0` LN → `proj.1` Linear → GELU → `proj.3` Linear →
+            // `proj.4` LN): the intermediate Linear keeps the CLIP width (1280→1280); only `proj.3`
+            // projects up to the DiT `dim` (1280→5120). (Both were mis-sized to `dim` before, which the
+            // real-weight load rejected — the checkpoint has `proj.1 = [1280,1280]`, `proj.3 = [5120,1280]`.)
+            img_emb_1: linear(1280, 1280, vb.pp("img_emb").pp("proj").pp("1"))?,
+            img_emb_3: linear(1280, cfg.dim, vb.pp("img_emb").pp("proj").pp("3"))?,
             img_ln4_w: vb.pp("img_emb").pp("proj").pp("4").get(cfg.dim, "weight")?,
             img_ln4_b: vb.pp("img_emb").pp("proj").pp("4").get(cfg.dim, "bias")?,
             blocks,
