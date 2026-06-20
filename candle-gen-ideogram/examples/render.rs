@@ -12,6 +12,9 @@ use candle_gen::gen_core::{
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Force-link the crate so its `inventory::submit!` registrations aren't dead-stripped (the
+    // example otherwise references no symbol from the lib).
+    candle_gen_ideogram::force_link();
     let a: Vec<String> = std::env::args().collect();
     let model = a.get(1).cloned().unwrap_or_else(|| "ideogram_4".into());
     let snapshot = a

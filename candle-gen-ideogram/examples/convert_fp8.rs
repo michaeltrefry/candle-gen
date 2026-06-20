@@ -43,7 +43,10 @@ fn main() -> Result<()> {
     println!("src: {}\nout: {}", src.display(), out.display());
     std::fs::create_dir_all(&out).map_err(wrap)?;
 
-    let dev = Device::Cpu;
+    // Dequant on the default device — the GPU when built `--features cuda` (elementwise fp8→bf16 over
+    // ~9.3B params is far faster there than debug-mode CPU); falls back to CPU otherwise.
+    let dev = candle_gen::default_device().map_err(|e| wrap_msg(e.to_string()))?;
+    println!("device: {dev:?}");
     for comp in WEIGHT_COMPONENTS {
         if let Some(o) = &only {
             if o != comp {
@@ -155,4 +158,8 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
 
 fn wrap(e: std::io::Error) -> candle_gen::candle_core::Error {
     candle_gen::candle_core::Error::Msg(format!("io: {e}"))
+}
+
+fn wrap_msg(m: String) -> candle_gen::candle_core::Error {
+    candle_gen::candle_core::Error::Msg(m)
 }
