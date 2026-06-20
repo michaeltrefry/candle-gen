@@ -14,17 +14,23 @@
 //! text path ([`text_encoder`]) is adapted from flux2's Qwen3 encoder (θ=5e6, 13 interleaved
 //! captured states). The single-stream DiT + the denoise pipeline are ported here.
 //!
-//! **Status (sc-6596):** scaffold + text encoder + scheduler + config in place; the single-stream DiT
-//! (`transformer`) and the denoise `pipeline` are WIP, so [`Ideogram4Generator::generate`] currently
-//! returns [`gen_core::Error::Unsupported`]. T2I (both variants), then Remix/edit (sc-6598), follow.
+//! **Status (sc-6596):** `ideogram_4` (quality) T2I is wired end-to-end — Qwen3-VL text encode →
+//! single-stream DiT (asymmetric two-DiT CFG) → VAE decode — pending GPU validation vs MLX and the
+//! bf16 weight provisioning. `ideogram_4_turbo` is registered but [`Ideogram4Generator::generate`]
+//! rejects it until the bundled TurboTime LoRA merge lands (sc-6596 follow-up). Remix/edit is sc-6598.
 //! `backend = "candle"`, `mac_only = false`.
 
 pub mod config;
+pub mod loader;
+pub mod pipeline;
 pub mod scheduler;
 pub mod text_encoder;
+pub mod transformer;
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
+use candle_gen::candle_core::Device;
 use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
@@ -32,21 +38,32 @@ use candle_gen::gen_core::{
 };
 
 use config::{MODEL_ID, MODEL_ID_TURBO, SIZE_MULTIPLE};
-
-/// The two-DiT quality DiT is the bottleneck — bf16 (native checkpoint dtype). Encoder + VAE run f32.
-#[allow(dead_code)]
-const DIT_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
-#[allow(dead_code)]
-const ENC_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::F32;
+use pipeline::Components;
 
 /// A lazily-loaded Ideogram 4 generator. `turbo` selects the CFG-free single-DiT + TurboTime LoRA
-/// path; otherwise the asymmetric two-DiT quality path.
+/// path; otherwise the asymmetric two-DiT quality path. Components are loaded on the first
+/// `generate` and cached.
 pub struct Ideogram4Generator {
     descriptor: ModelDescriptor,
-    #[allow(dead_code)]
     root: PathBuf,
-    #[allow(dead_code)]
     turbo: bool,
+    device: Device,
+    components: Mutex<Option<Arc<Components>>>,
+}
+
+impl Ideogram4Generator {
+    fn components(&self) -> gen_core::Result<Arc<Components>> {
+        let mut guard = self
+            .components
+            .lock()
+            .expect("ideogram components cache mutex poisoned");
+        if let Some(c) = guard.as_ref() {
+            return Ok(c.clone());
+        }
+        let c = Arc::new(pipeline::load_components(&self.root, &self.device)?);
+        *guard = Some(c.clone());
+        Ok(c)
+    }
 }
 
 impl Generator for Ideogram4Generator {
@@ -82,16 +99,22 @@ impl Generator for Ideogram4Generator {
     fn generate(
         &self,
         req: &GenerationRequest,
-        _on_progress: &mut dyn FnMut(Progress),
+        on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        // WIP (sc-6596): the single-stream DiT + denoise pipeline are not wired yet. Config,
-        // scheduler, and the Qwen3-VL text encoder are in place; the transformer + pipeline land
-        // next, then GPU parity validation vs MLX.
-        Err(gen_core::Error::Unsupported(format!(
-            "candle {} render pipeline not yet implemented (single-stream DiT + pipeline WIP, sc-6596)",
-            self.descriptor.id
-        )))
+        if self.turbo {
+            // The CFG-free turbo path needs the bundled TurboTime LoRA merged into the conditional
+            // DiT; that merge (adapters) is the sc-6596 follow-up. Reject rather than emit a wrong
+            // (un-distilled) render. Quality (`ideogram_4`) is wired.
+            return Err(gen_core::Error::Unsupported(
+                "ideogram_4_turbo: TurboTime LoRA merge not yet wired (sc-6596 follow-up); \
+                 ideogram_4 (quality) is available"
+                    .into(),
+            ));
+        }
+        let comps = self.components()?;
+        let images = pipeline::render(&comps, req, &self.device, on_progress)?;
+        Ok(GenerationOutput::Images(images))
     }
 }
 
@@ -132,7 +155,11 @@ pub fn descriptor_turbo() -> ModelDescriptor {
     d
 }
 
-fn build(spec: &LoadSpec, descriptor: ModelDescriptor, turbo: bool) -> gen_core::Result<Box<dyn Generator>> {
+fn build(
+    spec: &LoadSpec,
+    descriptor: ModelDescriptor,
+    turbo: bool,
+) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
         WeightsSource::File(_) => {
@@ -163,10 +190,13 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor, turbo: bool) -> gen_core:
             descriptor.id
         )));
     }
+    let device = candle_gen::default_device()?;
     Ok(Box::new(Ideogram4Generator {
         descriptor,
         root,
         turbo,
+        device,
+        components: Mutex::new(None),
     }))
 }
 
@@ -253,17 +283,26 @@ mod tests {
     }
 
     #[test]
-    fn generate_is_wip_unsupported() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/snap".into()));
-        let g = registry::load(MODEL_ID, &spec).unwrap();
+    fn turbo_gated_quality_reaches_pipeline() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-ideogram-snap".into()));
         let req = GenerationRequest {
             prompt: "a fox".into(),
             ..Default::default()
         };
+        // Turbo is gated on the TurboTime LoRA merge (sc-6596 follow-up) → Unsupported.
+        let turbo = registry::load(MODEL_ID_TURBO, &spec).unwrap();
         assert!(matches!(
-            g.generate(&req, &mut |_| {}).err().expect("WIP error"),
+            turbo.generate(&req, &mut |_| {}).unwrap_err(),
             gen_core::Error::Unsupported(_)
         ));
+        // Quality is wired — it passes the gate and fails on the missing snapshot (a load error,
+        // NOT Unsupported), proving the pipeline path is reached.
+        let quality = registry::load(MODEL_ID, &spec).unwrap();
+        let err = quality.generate(&req, &mut |_| {}).unwrap_err();
+        assert!(
+            !matches!(err, gen_core::Error::Unsupported(_)),
+            "quality should reach the pipeline, got {err:?}"
+        );
     }
 
     #[test]

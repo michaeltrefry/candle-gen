@@ -20,8 +20,8 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::{
-    embedding, linear_no_bias, ops::softmax_last_dim, rms_norm, rotary_emb::rope, Embedding, Linear,
-    Module, RmsNorm, VarBuilder,
+    embedding, linear_no_bias, ops::softmax_last_dim, rms_norm, rotary_emb::rope, Embedding,
+    Linear, Module, RmsNorm, VarBuilder,
 };
 
 use crate::config::Ideogram4TextEncoderConfig;
@@ -172,7 +172,9 @@ impl DecoderLayer {
     }
 
     fn forward(&self, x: &Tensor, rotary: &Rotary, mask: &Tensor) -> Result<Tensor> {
-        let h = (x + self.attn.forward(&self.input_ln.forward(x)?, rotary, mask)?)?;
+        let h = (x + self
+            .attn
+            .forward(&self.input_ln.forward(x)?, rotary, mask)?)?;
         &h + self.mlp.forward(&self.post_ln.forward(&h)?)?
     }
 }

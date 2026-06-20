@@ -443,6 +443,25 @@ impl Flux2Vae {
             .broadcast_sub(&self.bn_mean)?
             .broadcast_div(&self.bn_std)
     }
+
+    /// The packed-space BatchNorm stats `(std, mean)`, each `[1, 128, 1, 1]`. Exposed for providers
+    /// whose transformer packs the 128 channels in a **different order** than FLUX.2's `(c,ph,pw)`
+    /// (e.g. Ideogram 4's `(ph,pw,c)`) and therefore must apply the de-normalize / normalize and the
+    /// (un)patchify themselves, then use [`Self::decode_latent`] / [`Self::encode`].
+    pub fn bn_stats(&self) -> (&Tensor, &Tensor) {
+        (&self.bn_std, &self.bn_mean)
+    }
+
+    /// Decode an already-unpatchified 32-ch latent `[B, 32, H/8, W/8]` (NCHW) → RGB `[B, 3, H, W]` in
+    /// `[-1, 1]`. The conv decode (`post_quant_conv → decoder`) **without** the bn de-normalize or the
+    /// 128→32 unpatchify — for providers that pack in a non-FLUX channel order and do those steps
+    /// themselves (see [`Self::bn_stats`]).
+    pub fn decode_latent(&self, latent: &Tensor) -> Result<Tensor> {
+        let z = self
+            .post_quant_conv
+            .forward(&latent.to_dtype(DType::F32)?)?;
+        self.decode(&z)
+    }
 }
 
 /// 2×2 unpatchify (NCHW): `[B, 128, h, w] → [B, 32, 2h, 2w]`. The 128 channel axis splits as
