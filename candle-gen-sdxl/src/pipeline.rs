@@ -58,7 +58,10 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::sampling::{AlphaSchedule, LightningPolicy, SamplerPolicy};
+use candle_gen::gen_core::sampling::{
+    schedule_sigmas, AlphaSchedule, DiscreteModelSampling, LightningPolicy, SamplerPolicy,
+    Scheduler, Solver,
+};
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, Progress};
 use candle_gen::{CandleError, Result};
@@ -364,9 +367,15 @@ impl Pipeline {
         vae: &AutoEncoderKL,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
-        // sc-6128: a `lightning` request runs the few-step Euler-trailing path; everything else keeps
-        // the proven DDIM path (zero regression). Lightning carries its own few-step default.
+        // sc-6128: a `lightning` request runs the few-step Euler-trailing path; the native DDIM path is
+        // the byte-exact default (zero regression). epic 7114 P4 (sc-7124) ADDS the curated EPS menu as
+        // NEW options: a curated solver name (≠ the native `ddim`/`lightning` defaults) routes the
+        // unified `Sampler` over `DiscreteModelSampling` (EPS) — the default path stays untouched (N1).
         let lightning = req.sampler.as_deref() == Some(LIGHTNING_SAMPLER);
+        let curated: Option<&str> = req
+            .sampler
+            .as_deref()
+            .filter(|n| Solver::from_name(n).is_some() && *n != "ddim");
         let steps = req.steps.map(|s| s as usize).unwrap_or(if lightning {
             LIGHTNING_DEFAULT_STEPS
         } else {
@@ -412,6 +421,19 @@ impl Pipeline {
 
             let latents = if let Some((policy, cond)) = &lightning_ctx {
                 self.denoise_lightning(&init, policy, cond, unet, &req.cancel, on_progress, total)?
+            } else if let Some(name) = curated {
+                self.denoise_curated(
+                    req,
+                    name,
+                    &init,
+                    text_embeddings,
+                    unet,
+                    steps,
+                    use_guide,
+                    guidance,
+                    seed,
+                    on_progress,
+                )?
             } else {
                 // DDIM (eta=0): non-ancestral / deterministic, vs candle's default Euler-ancestral
                 // (which injects fresh noise every step). SceneWorks/diffusers SDXL defaults to
@@ -502,6 +524,70 @@ impl Pipeline {
         }
         // The shared `decode` expects the compute dtype (f16), like the DDIM loop's latents.
         Ok(latents.to_dtype(self.dtype)?)
+    }
+
+    /// The **curated** ε/DDPM denoise (epic 7114 P4, sc-7124) — an ADDITIVE option alongside the native
+    /// DDIM default and Lightning. Drives the unified [`gen_core::sampling::Sampler`] (`euler` /
+    /// `euler_ancestral` / `heun` / `dpmpp_2m` / `dpmpp_sde` / `uni_pc` / `lcm`) over a
+    /// [`DiscreteModelSampling`] (SDXL ε-prediction, `scaled_linear` β over 1000 train steps). The
+    /// `scheduler` axis (`normal` default / `karras` / `sgm_uniform` / …) picks the σ schedule via
+    /// [`candle_gen::resolve_schedule`]. Latents live in k-diffusion VE σ-space (prior = unit noise ·
+    /// σ_max), kept f32 (like the Lightning path); the [`DiscreteModelSampling`] recombines ε → x0 and
+    /// supplies the `1/√(σ²+1)` input scaling, so the closure just runs the UNet + CFG and returns raw ε.
+    /// The native DDIM/Lightning defaults are untouched, so this never affects the N1 default-parity gate.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_curated(
+        &self,
+        req: &GenerationRequest,
+        sampler: &str,
+        init: &Tensor,
+        text_embeddings: &Tensor,
+        unet: &UNet2DConditionModel,
+        steps: usize,
+        use_guide: bool,
+        guidance: f64,
+        seed: u64,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Tensor> {
+        let sched = AlphaSchedule::scaled_linear(SDXL_TRAIN_STEPS, SDXL_BETA_START, SDXL_BETA_END)
+            .map_err(|e| CandleError::Msg(format!("sdxl curated schedule: {e}")))?;
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        // Native curated schedule = ComfyUI's SDXL default (`normal`); the scheduler axis overrides it.
+        let native = schedule_sigmas(Scheduler::Normal, &ms, steps);
+        let sigmas = candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
+        // VE prior: unit noise · σ_max (sigmas[0]); kept f32 through the sampler (cast to f16 per eval).
+        let latents = (init * sigmas[0] as f64)?;
+        let out = candle_gen::run_curated_sampler(
+            Some(sampler),
+            &ms,
+            &sigmas,
+            latents,
+            seed,
+            &req.cancel,
+            on_progress,
+            |x_in, t| -> Result<Tensor> {
+                // `x_in` is already `1/√(σ²+1)`-scaled by `denoise()`; `t` is the nearest training-step
+                // index the UNet embeds. CFG batches/combines exactly like the native DDIM path.
+                let model_in = if use_guide {
+                    Tensor::cat(&[x_in, x_in], 0)?
+                } else {
+                    x_in.clone()
+                };
+                let model_in = model_in.to_dtype(self.dtype)?;
+                let noise_pred = unet.forward(&model_in, t as f64, text_embeddings)?;
+                let eps = if use_guide {
+                    let chunks = noise_pred.chunk(2, 0)?;
+                    let (uncond, cond) = (&chunks[0], &chunks[1]);
+                    (uncond + ((cond - uncond)? * guidance)?)?
+                } else {
+                    noise_pred
+                };
+                // Raw ε in f32 so the DiscreteModelSampling x0 recombine + solver math stay f32.
+                Ok(eps.to_dtype(DType::F32)?)
+            },
+        )?;
+        // The shared `decode` expects the compute dtype (f16), like the DDIM/Lightning latents.
+        Ok(out.to_dtype(self.dtype)?)
     }
 
     /// VAE-decode latents to an RGB8 [`Image`] (un-scale by [`VAE_SCALE`], `x/2 + 0.5`, clamp, ×255).

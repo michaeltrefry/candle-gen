@@ -352,15 +352,21 @@ pub fn descriptor() -> ModelDescriptor {
             // rather than to the Python fallback.
             supports_lora: true,
             supports_lokr: true,
-            // DDIM (eta=0) — the deterministic, launch-portable default wired in sc-3673 (replacing
-            // the spike's Euler-ancestral). `lightning` (sc-6128) is the few-step Euler-trailing
-            // sampler for distilled Lightning checkpoints (RealVisXL Lightning / SDXL-Lightning): the
-            // whole checkpoint is the acceleration (no separate LoRA), so it IS advertised — the worker
-            // forces `sampler="lightning"` for the `realvisxl_lightning` id. The other accel samplers
-            // (lcm/hyper) still need their LoRAs and remain unadvertised. `validate` only rejects a
-            // *named* sampler not in this list.
-            samplers: vec!["ddim", "lightning"],
-            schedulers: vec!["discrete"],
+            // DDIM (eta=0) is the deterministic, launch-portable DEFAULT (sc-3673); `lightning`
+            // (sc-6128) is the few-step Euler-trailing path for distilled checkpoints. epic 7114 P4
+            // (sc-7124) ADDS the curated ε/DDPM menu (euler / euler_ancestral / heun / dpmpp_2m /
+            // dpmpp_sde / uni_pc / lcm + ddim) over `DiscreteModelSampling`, plus the curated σ-schedule
+            // axis (normal / karras / sgm_uniform / …); a curated solver name routes the new EPS path
+            // while `ddim` (== the native default) and `lightning` keep their byte-exact native paths
+            // (N1). The legacy `discrete` scheduler alias is retained (falls back to the native schedule).
+            samplers: candle_gen::menu_with_aliases(
+                candle_gen::curated_sampler_names(),
+                &["lightning"],
+            ),
+            schedulers: candle_gen::menu_with_aliases(
+                candle_gen::curated_scheduler_names(),
+                &["discrete"],
+            ),
             min_size: 512,
             max_size: 2048,
             max_count: 8,
@@ -452,8 +458,19 @@ mod tests {
         assert!(d.capabilities.conditioning.is_empty());
         assert!(d.capabilities.supports_lora);
         assert!(d.capabilities.supports_lokr);
-        // sc-3673: the deterministic DDIM default; sc-6128: + the few-step `lightning` sampler.
-        assert_eq!(d.capabilities.samplers, vec!["ddim", "lightning"]);
+        // sc-7124: the curated ε/DDPM sampler menu + the native `lightning` alias; `ddim` (== the
+        // native default) is part of the curated vocabulary. The curated scheduler axis + `discrete`.
+        assert_eq!(
+            d.capabilities.samplers,
+            candle_gen::menu_with_aliases(candle_gen::curated_sampler_names(), &["lightning"])
+        );
+        assert!(d.capabilities.samplers.contains(&"ddim"));
+        assert!(d.capabilities.samplers.contains(&"dpmpp_2m"));
+        assert!(d.capabilities.samplers.contains(&"lightning"));
+        assert_eq!(
+            d.capabilities.schedulers,
+            candle_gen::menu_with_aliases(candle_gen::curated_scheduler_names(), &["discrete"])
+        );
     }
 
     /// sc-3677 parity: the worker maps BOTH `sdxl` and `realvisxl` onto this single descriptor, so
@@ -471,7 +488,11 @@ mod tests {
         assert_eq!(d.capabilities.min_size, 512);
         assert_eq!(d.capabilities.max_size, 2048);
         assert_eq!(d.capabilities.max_count, 8);
-        assert_eq!(d.capabilities.samplers, vec!["ddim", "lightning"]);
+        // sc-7124: the curated sampler menu (incl. `ddim`) + the native `lightning` alias.
+        assert_eq!(
+            d.capabilities.samplers,
+            candle_gen::menu_with_aliases(candle_gen::curated_sampler_names(), &["lightning"])
+        );
         // SDXL works in latent space at /8 — the size policy both ids share (validate rejects
         // non-multiples). Anchored here so a change to the alignment is a parity-visible diff.
         assert_eq!(SIZE_MULTIPLE, 8);
@@ -566,10 +587,19 @@ mod tests {
         };
         assert!(g.validate(&lightning).is_ok());
 
+        // sc-7124: a curated ε/DDPM sampler is now advertised and accepted.
+        let curated = GenerationRequest {
+            prompt: "x".into(),
+            sampler: Some("dpmpp_2m".into()),
+            scheduler: Some("karras".into()),
+            ..Default::default()
+        };
+        assert!(g.validate(&curated).is_ok());
+
         // An unadvertised sampler is still rejected (not silently downgraded).
         let bogus = GenerationRequest {
             prompt: "x".into(),
-            sampler: Some("euler_ancestral".into()),
+            sampler: Some("not_a_sampler".into()),
             ..Default::default()
         };
         assert!(g.validate(&bogus).is_err());

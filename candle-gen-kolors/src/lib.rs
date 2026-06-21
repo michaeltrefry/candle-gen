@@ -251,6 +251,41 @@ mod tests {
         }
     }
 
+    /// sc-7124: the curated ε/DDPM menu is advertised, so `validate` accepts a curated sampler +
+    /// scheduler pair (the worker may send one) and the native `euler_discrete` default, while still
+    /// rejecting an unadvertised name — the shared `validate_request` only passes a named sampler that is
+    /// in `descriptor().samplers`. GPU-free (lazy generator).
+    #[test]
+    fn validate_accepts_curated_sampler_and_scheduler() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load(MODEL_ID, &spec).unwrap();
+
+        // The native default is still accepted.
+        let native = GenerationRequest {
+            prompt: "x".into(),
+            sampler: Some("euler_discrete".into()),
+            ..Default::default()
+        };
+        assert!(g.validate(&native).is_ok());
+
+        // A curated ε/DDPM sampler + curated scheduler validate OK.
+        let curated = GenerationRequest {
+            prompt: "x".into(),
+            sampler: Some("dpmpp_2m".into()),
+            scheduler: Some("karras".into()),
+            ..Default::default()
+        };
+        assert!(g.validate(&curated).is_ok());
+
+        // An unadvertised sampler is still rejected (not silently downgraded).
+        let bogus = GenerationRequest {
+            prompt: "x".into(),
+            sampler: Some("not_a_sampler".into()),
+            ..Default::default()
+        };
+        assert!(g.validate(&bogus).is_err());
+    }
+
     #[test]
     fn load_rejects_unwired_surfaces_and_single_file() {
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![

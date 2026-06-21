@@ -48,6 +48,7 @@ use candle_gen::gen_core::{
 };
 use candle_gen::{CandleError, Result as CResult};
 
+use candle_gen::gen_core::sampling::TimestepConvention;
 use config::{
     TextEncoderConfig, TransformerConfig, VaeConfig, DEFAULT_FPS, DEFAULT_FRAMES, DEFAULT_GUIDANCE,
     DEFAULT_STEPS, MODEL_ID, NEGATIVE_FALLBACK, SIZE_MULTIPLE,
@@ -205,29 +206,65 @@ impl Pipeline {
         let (ppf, pph, ppw) = (t_lat / pt, h_lat / ph, w_lat / pw);
         let (cos, sin) = WanRope::new(&self.dit_cfg).cos_sin(ppf, pph, ppw, &self.device)?;
 
-        let mut latents = pipeline::create_noise(seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
-        let mut sched = FlowScheduler::new(sampler, steps, shift);
-        let total = steps as u32;
+        let latents0 = pipeline::create_noise(seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
 
-        for i in 0..steps {
-            if req.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            let t = sched.timestep(i);
-            let v_pos = comps.dit.forward(&latents, &ctx_pos, t, &cos, &sin)?;
-            let v = match &ctx_neg {
-                Some(neg) => {
-                    let v_neg = comps.dit.forward(&latents, neg, t, &cos, &sin)?;
-                    pipeline::cfg(&v_pos, &v_neg, guidance)?
+        // epic 7114 P4 (sc-7124) Wan fold-in: the gen-core-only curated solvers (euler_ancestral /
+        // heun / dpmpp_sde / ddim) run over Wan's NATIVE flow σ schedule via the shared driver — one
+        // solver library. Wan's native `unipc`/`euler` (the diffusers FLOW-SNR multistep + flow Euler)
+        // stay the byte-exact default path; gen-core's VE-space `uni_pc`/`dpmpp_2m` are deliberately NOT
+        // exposed (they would diverge from Wan's diffusers parity). The DiT timestep is `σ·N` (Sigma
+        // convention, ×N applied in the closure); the model output is the velocity (CFG combined inside).
+        const FOLDIN: &[&str] = &["euler_ancestral", "heun", "dpmpp_sde", "ddim"];
+        let latents = if let Some(name) = req.sampler.as_deref().filter(|n| FOLDIN.contains(n)) {
+            let native = scheduler::flow_sigmas(steps, shift);
+            let n_train = config::NUM_TRAIN_TIMESTEPS as f64;
+            candle_gen::run_flow_sampler(
+                Some(name),
+                TimestepConvention::Sigma,
+                &native,
+                latents0,
+                seed,
+                &req.cancel,
+                on_progress,
+                |latents, t| -> CResult<Tensor> {
+                    let ts = t as f64 * n_train;
+                    let v_pos = comps.dit.forward(latents, &ctx_pos, ts, &cos, &sin)?;
+                    let v = match &ctx_neg {
+                        Some(neg) => {
+                            let v_neg = comps.dit.forward(latents, neg, ts, &cos, &sin)?;
+                            pipeline::cfg(&v_pos, &v_neg, guidance)?
+                        }
+                        None => v_pos,
+                    };
+                    Ok(v)
+                },
+            )?
+        } else {
+            // Native FlowScheduler (UniPC default / flow Euler) — the byte-exact N1 path, untouched.
+            let mut latents = latents0;
+            let mut sched = FlowScheduler::new(sampler, steps, shift);
+            let total = steps as u32;
+            for i in 0..steps {
+                if req.cancel.is_cancelled() {
+                    return Err(CandleError::Canceled);
                 }
-                None => v_pos,
-            };
-            latents = sched.step(&v, &latents)?;
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total,
-            });
-        }
+                let t = sched.timestep(i);
+                let v_pos = comps.dit.forward(&latents, &ctx_pos, t, &cos, &sin)?;
+                let v = match &ctx_neg {
+                    Some(neg) => {
+                        let v_neg = comps.dit.forward(&latents, neg, t, &cos, &sin)?;
+                        pipeline::cfg(&v_pos, &v_neg, guidance)?
+                    }
+                    None => v_pos,
+                };
+                latents = sched.step(&v, &latents)?;
+                on_progress(Progress::Step {
+                    current: i as u32 + 1,
+                    total,
+                });
+            }
+            latents
+        };
 
         on_progress(Progress::Decoding);
         // Memory-bounded z48 vae22 decode (sc-7111): the per-frame streaming `decode` already bounds
@@ -324,7 +361,18 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![],
             supports_lora: false,
             supports_lokr: false,
-            samplers: vec!["unipc", "euler"],
+            // Native flow samplers (`unipc` default / `euler`) + the epic 7114 P4 (sc-7124) curated
+            // fold-in: the gen-core-only solvers over Wan's native flow σ schedule. gen-core's VE-space
+            // `uni_pc`/`dpmpp_2m` are NOT advertised — they would diverge from Wan's diffusers FLOW-SNR
+            // multistep parity. No scheduler axis (the flow shift is the `scheduler_shift` knob).
+            samplers: vec![
+                "unipc",
+                "euler",
+                "euler_ancestral",
+                "heun",
+                "dpmpp_sde",
+                "ddim",
+            ],
             schedulers: vec![],
             min_size: 32,
             max_size: 1280,
