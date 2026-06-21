@@ -23,6 +23,6 @@ cuda = ["candle-gen/cuda"]
 flash-attn = ["candle-gen/flash-attn"]
 
 [dev-dependencies]
-sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b" }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "7b9754299223de37b3c1404773b3a018caa102fe" }
 # CUDA smoke harness (tests/cuda_smoke.rs): save the upscaled result as a PNG to eyeball.
 image = { version = "0.25", default-features = false, features = ["png"] }

@@ -300,7 +300,9 @@ impl Pipeline {
         }
 
         on_progress(Progress::Decoding);
-        let decoded = comps.vae.decode(&vlat)?;
+        // sc-7076 — memory-bounded + catchable VAE decode (budgeted tiling), replacing the single-pass
+        // full-video decode that OOMs the worker on large/long outputs.
+        let decoded = comps.vae.decode_budgeted(&vlat)?;
         let images = pipeline::frames_to_images(&decoded)?;
         let audio = pipeline::decode_audio_track(
             &comps.audio_decoder,
