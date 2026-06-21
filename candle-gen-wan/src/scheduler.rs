@@ -28,6 +28,37 @@ impl Sampler {
 
 const SOLVER_ORDER: usize = 2;
 
+/// The Wan flow-match σ schedule (f64): `σ_k = shift·s/(1+(shift−1)·s)` over
+/// `s = linspace(1, 1/N, steps+1)[:-1]`, with the `σ_0 -= 1e-6` guard (keeps `log(1−σ_0)` finite for
+/// UniPC) and a terminal `0`. Shared by the native [`FlowScheduler`] and the curated solver fold-in.
+fn flow_sigmas_f64(steps: usize, shift: f64) -> Vec<f64> {
+    let n = NUM_TRAIN_TIMESTEPS as f64;
+    let mut sigmas: Vec<f64> = (0..steps)
+        .map(|k| {
+            let s = 1.0 + (1.0 / n - 1.0) * (k as f64) / (steps as f64); // linspace(1, 1/N, steps+1)[k]
+            shift * s / (1.0 + (shift - 1.0) * s)
+        })
+        .collect();
+    if (sigmas[0] - 1.0).abs() < 1e-6 {
+        sigmas[0] -= 1e-6; // avoid log(1 - σ_0) = log(0)
+    }
+    sigmas.push(0.0);
+    sigmas
+}
+
+/// The Wan flow-match σ schedule as `f32` (descending, length `steps + 1`, trailing `0.0`) — the native
+/// schedule the unified curated solver fold-in (epic 7114 P4, sc-7124) integrates over via
+/// [`candle_gen::run_flow_sampler`]. The gen-core-only solvers (euler_ancestral / heun / dpmpp_sde /
+/// ddim) run over THIS schedule; Wan's native `unipc`/`dpmpp2m` are diffusers FLOW-SNR multistep
+/// solvers (λ = log((1−σ)/σ)) that the gen-core VE-space `uni_pc`/`dpmpp_2m` (λ = −ln σ) do NOT
+/// reproduce, so those are deliberately NOT exposed (they would diverge from Wan's diffusers parity).
+pub fn flow_sigmas(steps: usize, shift: f64) -> Vec<f32> {
+    flow_sigmas_f64(steps, shift)
+        .iter()
+        .map(|&s| s as f32)
+        .collect()
+}
+
 pub struct FlowScheduler {
     sampler: Sampler,
     sigmas: Vec<f64>, // len = steps + 1 (terminal 0)
@@ -41,17 +72,7 @@ pub struct FlowScheduler {
 
 impl FlowScheduler {
     pub fn new(sampler: Sampler, steps: usize, shift: f64) -> Self {
-        let n = NUM_TRAIN_TIMESTEPS as f64;
-        let mut sigmas: Vec<f64> = (0..steps)
-            .map(|k| {
-                let s = 1.0 + (1.0 / n - 1.0) * (k as f64) / (steps as f64); // linspace(1, 1/N, steps+1)[k]
-                shift * s / (1.0 + (shift - 1.0) * s)
-            })
-            .collect();
-        if (sigmas[0] - 1.0).abs() < 1e-6 {
-            sigmas[0] -= 1e-6; // avoid log(1 - σ_0) = log(0)
-        }
-        sigmas.push(0.0);
+        let sigmas = flow_sigmas_f64(steps, shift);
         Self {
             sampler,
             sigmas,

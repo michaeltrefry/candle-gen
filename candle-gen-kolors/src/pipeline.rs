@@ -22,6 +22,9 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::sampling::{
+    schedule_sigmas, AlphaSchedule, DiscreteModelSampling, Scheduler, Solver,
+};
 use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::stable_diffusion::vae::{AutoEncoderKL, AutoEncoderKLConfig};
@@ -38,6 +41,14 @@ use crate::unet::KolorsUNet;
 /// decode — the diffusers-correct SDXL value (NOT candle's hardcoded SD1.5 0.18215). `pub(crate)` so
 /// the IP-Adapter provider (sc-5488) shares the exact decode scale.
 pub(crate) const VAE_SCALE: f64 = 0.13025;
+
+/// Kolors' `scaled_linear` β endpoints + train-step count — the diffusers `EulerDiscreteScheduler`
+/// config the native [`KolorsEulerSampler`](crate::sampler) is built from (β₁ = **0.014**, NOT SDXL's
+/// 0.012; N = **1100**, NOT SDXL's 1000). The curated [`DiscreteModelSampling`] σ-table (sc-7124) is
+/// built from these same values so the ε/DDPM menu integrates over Kolors' own noise schedule.
+const KOLORS_BETA_START: f32 = 0.00085;
+const KOLORS_BETA_END: f32 = 0.014;
+const KOLORS_TRAIN_STEPS: usize = crate::sampler::NUM_TRAIN_TIMESTEPS;
 
 /// A light pipeline handle: the snapshot `root` and compute device. Heavy components load via
 /// [`load_components`](Self::load_components) and are owned/cached by the generator.
@@ -124,6 +135,15 @@ impl Pipeline {
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let (h, w) = (req.height, req.width);
 
+        // sc-7124 (epic 7114 P4): a curated solver name (≠ the native `euler_discrete` default / None)
+        // routes the unified `Sampler` over `DiscreteModelSampling` (EPS) as a NEW path. The native
+        // leading-Euler default stays byte-exact (N1) — Kolors' `steps_offset=1` leading timesteps can't
+        // be bit-reproduced by `DiscreteModelSampling::timestep`, so this is ADDITIVE, not a replacement.
+        let curated: Option<&str> = req
+            .sampler
+            .as_deref()
+            .filter(|n| Solver::from_name(n).is_some() && *n != crate::config::DEFAULT_SAMPLER);
+
         let sampler = KolorsEulerSampler::new(steps).map_err(CandleError::Msg)?;
 
         // Conditioning is seed-independent — encode once. CFG batch is [uncond, cond] (candle's chunk
@@ -147,25 +167,119 @@ impl Pipeline {
         for index in 0..req.count {
             let seed = image_seed(base_seed, index);
             let noise = self.initial_noise(seed, lat_h, lat_w)?;
-            let mut latents = (noise * sampler.init_noise_sigma() as f64)?;
 
-            for i in 0..sampler.num_steps() {
-                if req.cancel.is_cancelled() {
-                    return Err(CandleError::Canceled);
-                }
-                let scaled = (&latents / sampler.scale_in(i) as f64)?;
-                let model_in = if use_guide {
-                    Tensor::cat(&[&scaled, &scaled], 0)?
-                } else {
-                    scaled
-                };
-                let eps = components.unet.forward(
-                    &model_in,
-                    sampler.timestep(i) as f64,
+            let latents = if let Some(name) = curated {
+                self.denoise_curated(
+                    req,
+                    name,
+                    &noise,
+                    components,
                     &context,
                     &pooled,
                     &time_ids,
-                )?;
+                    steps,
+                    use_guide,
+                    guidance,
+                    seed,
+                    on_progress,
+                )?
+            } else {
+                let mut latents = (&noise * sampler.init_noise_sigma() as f64)?;
+                for i in 0..sampler.num_steps() {
+                    if req.cancel.is_cancelled() {
+                        return Err(CandleError::Canceled);
+                    }
+                    let scaled = (&latents / sampler.scale_in(i) as f64)?;
+                    let model_in = if use_guide {
+                        Tensor::cat(&[&scaled, &scaled], 0)?
+                    } else {
+                        scaled
+                    };
+                    let eps = components.unet.forward(
+                        &model_in,
+                        sampler.timestep(i) as f64,
+                        &context,
+                        &pooled,
+                        &time_ids,
+                    )?;
+                    let eps = if use_guide {
+                        let ch = eps.chunk(2, 0)?;
+                        let (uncond, cond) = (&ch[0], &ch[1]);
+                        (uncond + ((cond - uncond)? * guidance as f64)?)?
+                    } else {
+                        eps
+                    };
+                    latents = (&latents + (eps * sampler.step_dt(i) as f64)?)?;
+                    on_progress(Progress::Step {
+                        current: i as u32 + 1,
+                        total,
+                    });
+                }
+                latents
+            };
+
+            on_progress(Progress::Decoding);
+            images.push(self.decode(&components.vae, &latents)?);
+        }
+        Ok(images)
+    }
+
+    /// The **curated** ε/DDPM denoise (epic 7114 P4, sc-7124) — an ADDITIVE option alongside the native
+    /// leading-Euler default. Drives the unified [`gen_core::sampling`] solver menu (`euler` /
+    /// `euler_ancestral` / `heun` / `dpmpp_2m` / `dpmpp_sde` / `uni_pc` / `lcm` / `ddim`) over a
+    /// [`DiscreteModelSampling`] (Kolors ε-prediction, `scaled_linear` β over the 1100 train steps), with
+    /// the `scheduler` axis (`normal` default / `karras` / `sgm_uniform` / …) picking the σ schedule via
+    /// [`candle_gen::resolve_schedule`]. Latents live in k-diffusion VE σ-space (prior = unit noise ·
+    /// σ_max), kept f32 like the native path; the [`DiscreteModelSampling`] recombines ε → x0 and supplies
+    /// the `1/√(σ²+1)` input scaling, so the `predict` closure just runs the UNet + CFG and returns raw ε.
+    ///
+    /// The native leading-Euler default is untouched, so this never affects the N1 default-parity gate —
+    /// Kolors' `steps_offset=1` leading timesteps aren't bit-reproducible by `DiscreteModelSampling`, so a
+    /// curated request is its own (ComfyUI-style trailing/normal) path, not a re-derivation of the default.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_curated(
+        &self,
+        req: &GenerationRequest,
+        sampler: &str,
+        init: &Tensor,
+        components: &Components,
+        context: &Tensor,
+        pooled: &Tensor,
+        time_ids: &Tensor,
+        steps: usize,
+        use_guide: bool,
+        guidance: f32,
+        seed: u64,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Tensor> {
+        let sched =
+            AlphaSchedule::scaled_linear(KOLORS_TRAIN_STEPS, KOLORS_BETA_START, KOLORS_BETA_END)
+                .map_err(|e| CandleError::Msg(format!("kolors curated schedule: {e}")))?;
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        // Native curated schedule = ComfyUI's default (`normal`); the scheduler axis overrides it.
+        let native = schedule_sigmas(Scheduler::Normal, &ms, steps);
+        let sigmas = candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
+        // VE prior: unit noise · σ_max (sigmas[0]); kept f32 through the sampler.
+        let latents = (init * sigmas[0] as f64)?;
+        let out = candle_gen::run_curated_sampler(
+            Some(sampler),
+            &ms,
+            &sigmas,
+            latents,
+            seed,
+            &req.cancel,
+            on_progress,
+            |x_in, t| -> Result<Tensor> {
+                // `x_in` is already `1/√(σ²+1)`-scaled by `denoise()`; `t` is the nearest training-step
+                // index the UNet embeds. CFG batches/combines exactly like the native leading-Euler path.
+                let model_in = if use_guide {
+                    Tensor::cat(&[x_in, x_in], 0)?
+                } else {
+                    x_in.clone()
+                };
+                let eps = components
+                    .unet
+                    .forward(&model_in, t as f64, context, pooled, time_ids)?;
                 let eps = if use_guide {
                     let ch = eps.chunk(2, 0)?;
                     let (uncond, cond) = (&ch[0], &ch[1]);
@@ -173,17 +287,12 @@ impl Pipeline {
                 } else {
                     eps
                 };
-                latents = (&latents + (eps * sampler.step_dt(i) as f64)?)?;
-                on_progress(Progress::Step {
-                    current: i as u32 + 1,
-                    total,
-                });
-            }
-
-            on_progress(Progress::Decoding);
-            images.push(self.decode(&components.vae, &latents)?);
-        }
-        Ok(images)
+                // Raw ε in f32 so the DiscreteModelSampling x0 recombine + solver math stay f32.
+                Ok(eps.to_dtype(DType::F32)?)
+            },
+        )?;
+        // The shared `decode` consumes the compute dtype (f32 for Kolors), like the native latents.
+        Ok(out.to_dtype(DType::F32)?)
     }
 
     /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])` via the ChatGLM3 encoder.
