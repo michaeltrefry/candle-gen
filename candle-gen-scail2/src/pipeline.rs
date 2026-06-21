@@ -5,19 +5,22 @@
 //! the live [`crate::generate`] denoise pipeline: the primary **reference character** is a
 //! [`Conditioning::Reference`] image paired with its color-coded [`Conditioning::Mask`]; the **driving
 //! video + per-frame color masks** are a `ControlClip`; `video_mode == "replacement"` toggles the
-//! cross-identity `replace_flag` (else animation). Multi-reference and the LoRA path await the worker
-//! request contract (sc-6837) and the candle LoRA slice (sc-6838); [`crate::generate`] already supports
-//! extra characters via [`crate::generate::CharacterRef`].
+//! cross-identity `replace_flag` (else animation). Inference adapters (`spec.adapters`) — LoRA / LoKr /
+//! LoHa, the lightx2v lightning diff-patch, and the Bias-Aware DPO refinement LoRA — are folded into the
+//! dense DiT before build ([`crate::adapters`], sc-6838). Multi-reference awaits the worker request
+//! contract; [`crate::generate`] already supports extra characters via [`crate::generate::CharacterRef`].
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use candle_gen::candle_core::{DType, Device};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
-    self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
+    self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
+    WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 use candle_gen_wan::config::{TextEncoderConfig, Vae16Config};
@@ -66,10 +69,11 @@ pub fn descriptor() -> ModelDescriptor {
                 ConditioningKind::MultiReference,
                 ConditioningKind::ControlClip,
             ],
-            // LoRA (incl. the Bias-Aware DPO refinement LoRA + lightx2v lightning) is the candle LoRA
-            // slice sc-6838.
-            supports_lora: false,
-            supports_lokr: false,
+            // Inference LoRA / LoKr / LoHa + the lightx2v lightning diff-patch + the Bias-Aware DPO
+            // refinement LoRA, merged into the dense DiT before build (sc-6838,
+            // [`crate::adapters::merge_adapters`]).
+            supports_lora: true,
+            supports_lokr: true,
             // candle's FlowScheduler is UniPC/Euler; "dpm++" resolves to UniPC (bh2). Advertised to
             // match the mlx-gen-scail2 descriptor for cross-backend routing parity.
             samplers: vec!["unipc", "dpm++"],
@@ -119,19 +123,70 @@ pub struct Scail2 {
     config: Scail2Config,
     root: PathBuf,
     device: Device,
+    /// Inference adapters (LoRA / LoKr / LoHa / lightx2v lightning diff-patch) folded into the DiT
+    /// before build; empty for the stock path (sc-6838).
+    adapters: Vec<AdapterSpec>,
     components: Mutex<Option<Arc<Components>>>,
 }
 
 impl Scail2 {
+    /// Build the DiT [`VarBuilder`] over the `transformer/` snapshot. With no adapters this is the
+    /// stock f32 mmap build — **byte-identical** to the pre-sc-6838 path (the empty-adapter regression
+    /// gate). With adapters, the base tensors are loaded to a CPU map, each delta is folded in
+    /// ([`crate::adapters::merge_adapters`], f32 math — merge not residual, the chaos-sensitive-sampler
+    /// rationale), the **whole map is cast to f32 on the CPU**, then the DiT is built from it.
+    ///
+    /// The host-side f32 cast is load-bearing for memory: SCAIL-2's DiT is f32, so a bf16 base tensor
+    /// served through `from_tensors(F32, gpu)` would cast bf16→f32 *on the GPU*, and candle's CUDA
+    /// caching allocator retains the freed bf16 staging blocks — ~28 GiB piled on top of the ~56 GiB
+    /// f32 DiT, OOM-ing at the VAE-decode peak even on a 96 GiB card. Casting host-side (host RAM is
+    /// ample, the map is transient) makes `get` a pure f32 host→device move, so the GPU footprint
+    /// matches the stock mmap path exactly. (The Wan-14B merge path doesn't need this — its DiT is
+    /// bf16, so `from_tensors` never casts on the GPU.)
+    fn transformer_vb(&self) -> CResult<VarBuilder<'static>> {
+        if self.adapters.is_empty() {
+            return component_vb(&self.root, &self.device, "transformer");
+        }
+        let dir = self.root.join("transformer");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map_err(|e| CandleError::Msg(format!("scail2: read transformer/: {e}")))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .collect();
+        files.sort();
+        if files.is_empty() {
+            return Err(CandleError::Msg(format!(
+                "scail2: no .safetensors in transformer/ (at {})",
+                dir.display()
+            )));
+        }
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+        for f in &files {
+            let part = candle_gen::candle_core::safetensors::load(f, &Device::Cpu)?;
+            tensors.extend(part);
+        }
+        let report = crate::adapters::merge_adapters(&mut tensors, &self.adapters)?;
+        eprintln!(
+            "[scail2] merged {} adapter file(s): {} weight/bias deltas applied, {} keys off-surface/skipped",
+            self.adapters.len(),
+            report.merged,
+            report.skipped_keys
+        );
+        // Cast host-side so `from_tensors` does no GPU-side bf16→f32 staging (see the doc note above).
+        for v in tensors.values_mut() {
+            if v.dtype() != DType::F32 {
+                *v = v.to_dtype(DType::F32)?;
+            }
+        }
+        Ok(VarBuilder::from_tensors(tensors, DType::F32, &self.device))
+    }
+
     fn load_components(&self) -> CResult<Components> {
         let te = Umt5Encoder::new(
             &TextEncoderConfig::umt5_xxl(),
             component_vb(&self.root, &self.device, "text_encoder")?,
         )?;
-        let dit = Scail2Dit::new(
-            component_vb(&self.root, &self.device, "transformer")?,
-            &self.config,
-        )?;
+        let dit = Scail2Dit::new(self.transformer_vb()?, &self.config)?;
         let vae = WanVae16::new_with_encoder(
             &Vae16Config::wan21(),
             component_vb(&self.root, &self.device, "vae")?,
@@ -159,8 +214,9 @@ impl Scail2 {
 
 /// Construct a candle SCAIL-2 generator. `spec.weights` must be a [`WeightsSource::Dir`] pointing at a
 /// snapshot with `text_encoder/`, `transformer/` (the converted SCAIL2Model DiT), `vae/` (z16 Wan VAE
-/// with encoder), `clip/` (open-CLIP ViT-H/14 visual tower), and `tokenizer/tokenizer.json`. Adapters /
-/// quantization are rejected (the candle LoRA slice is sc-6838).
+/// with encoder), `clip/` (open-CLIP ViT-H/14 visual tower), and `tokenizer/tokenizer.json`. Inference
+/// adapters (`spec.adapters` — LoRA / LoKr / LoHa / lightx2v lightning diff-patch / Bias-Aware DPO) are
+/// merged into the dense DiT before build (sc-6838); on-the-fly quantization is still rejected.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -172,11 +228,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(
-            "candle scail2 does not support LoRA/LoKr yet (sc-6838)".into(),
-        ));
-    }
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(
             "candle scail2 does not support on-the-fly Q4/Q8 quantization yet".into(),
@@ -195,6 +246,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         config,
         root,
         device,
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
     }))
 }
@@ -344,7 +396,8 @@ mod tests {
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.supports_true_cfg);
-        assert!(!d.capabilities.supports_lora);
+        assert!(d.capabilities.supports_lora);
+        assert!(d.capabilities.supports_lokr);
         assert!(d.capabilities.accepts(ConditioningKind::Reference));
         assert!(d.capabilities.accepts(ConditioningKind::Mask));
         assert!(d.capabilities.accepts(ConditioningKind::ControlClip));
@@ -357,15 +410,18 @@ mod tests {
         // single-file source
         let f = LoadSpec::new(WeightsSource::File("/tmp/w.safetensors".into()));
         assert!(load(&f).is_err());
-        // LoRA adapters (sc-6838)
-        let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
+        // LoRA adapters are now ACCEPTED (sc-6838) — `load` proceeds past the adapter check and fails
+        // only on the missing snapshot dir, NOT with an Unsupported("LoRA") error.
+        let lora = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
-        assert!(matches!(
-            load(&lora).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
-        // on-the-fly quant
+        let err = load(&lora).err().expect("missing dir");
+        assert!(
+            !matches!(err, gen_core::Error::Unsupported(_)),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("does not exist"), "got: {err}");
+        // on-the-fly quant is still rejected
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
         assert!(matches!(
             load(&quant).err().expect("err"),

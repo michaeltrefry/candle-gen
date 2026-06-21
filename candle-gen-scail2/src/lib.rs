@@ -22,15 +22,17 @@
 //! Plain single-scale CFG; f32 DiT compute (bf16 overflows to NaN at high token length); temporal-tiled
 //! VAE decode for high-res clips. `backend = "candle"`, `mac_only = false`.
 //!
-//! ## Status (sc-6836, in progress)
-//! Landed: the per-chunk [`rope::ScailRope`], the open-CLIP [`clip::ScailClip`] image encoder, the
-//! 28-channel [`preprocess::extract_and_compress_mask_to_latent`] mask build, the PyTorch-faithful
-//! [`resize`] kernels, and the [`config::Scail2Config`] dims — each CPU-unit-tested. The [`model`]
-//! DiT forward, the [`generate`] denoise pipeline, and the provider registration are the remaining
-//! slices of sc-6836.
+//! ## Status
+//! The engine (sc-6836/sc-7078) is GPU-validated: the per-chunk [`rope::ScailRope`], the open-CLIP
+//! [`clip::ScailClip`] image encoder, the 28-channel
+//! [`preprocess::extract_and_compress_mask_to_latent`] mask build, the PyTorch-faithful [`resize`]
+//! kernels, the [`model`] DiT forward, the [`generate`] denoise pipeline, and the provider
+//! registration. Inference adapters — LoRA / LoKr / LoHa, the lightx2v lightning diff-patch, and the
+//! Bias-Aware DPO refinement LoRA — fold into the dense DiT via [`adapters::merge_adapters`] (sc-6838).
 
 mod common;
 
+pub mod adapters;
 pub mod clip;
 pub mod config;
 pub mod generate;
@@ -40,6 +42,7 @@ pub mod preprocess;
 pub mod resize;
 pub mod rope;
 
+pub use adapters::{has_diff_patch_keys, merge_adapters, MergeReport};
 pub use clip::{ClipVisionConfig, ScailClip};
 pub use config::Scail2Config;
 pub use generate::{generate, CharacterRef, Components, Scail2Job};

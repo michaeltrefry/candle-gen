@@ -213,7 +213,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "safetensors 0.7.0",
- "sceneworks-gen-core",
+ "sceneworks-gen-core 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
  "serde_json",
  "thiserror 2.0.18",
 ]
@@ -228,7 +228,7 @@ dependencies = [
  "inventory",
  "rand",
  "rand_distr",
- "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-testkit 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
  "serde_json",
  "tokenizers 0.22.2",
 ]
@@ -255,7 +255,7 @@ dependencies = [
  "inventory",
  "rand",
  "rand_distr",
- "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-testkit 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
  "serde_json",
  "tokenizers 0.22.2",
 ]
@@ -270,7 +270,7 @@ dependencies = [
  "inventory",
  "rand",
  "rand_distr",
- "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-testkit 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
  "serde_json",
  "tokenizers 0.22.2",
 ]
@@ -287,7 +287,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "safetensors 0.7.0",
- "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-testkit 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
  "serde_json",
  "tokenizers 0.22.2",
 ]
@@ -311,7 +311,7 @@ dependencies = [
  "image",
  "inventory",
  "rand",
- "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-testkit 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
  "tokenizers 0.22.2",
 ]
 
@@ -326,7 +326,7 @@ dependencies = [
  "inventory",
  "rand",
  "rand_distr",
- "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-testkit 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
  "tokenizers 0.22.2",
 ]
 
@@ -341,7 +341,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "safetensors 0.7.0",
- "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-testkit 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
 ]
 
 [[package]]
@@ -353,7 +353,7 @@ dependencies = [
  "inventory",
  "rand",
  "rand_distr",
- "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-testkit 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
  "tokenizers 0.22.2",
 ]
 
@@ -364,7 +364,7 @@ dependencies = [
  "candle-gen",
  "candle-transformers",
  "inventory",
- "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-testkit 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
  "serde_json",
 ]
 
@@ -395,7 +395,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "safetensors 0.7.0",
- "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-testkit 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
  "serde_json",
  "tokenizers 0.22.2",
 ]
@@ -421,7 +421,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "safetensors 0.7.0",
- "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-testkit 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=dc40c74ea6d364010a8e0198eab6fceba2422e2a)",
  "serde_json",
  "tokenizers 0.22.2",
 ]
@@ -440,7 +440,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "safetensors 0.7.0",
- "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-testkit 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
  "tokenizers 0.22.2",
  "tracing",
 ]
@@ -454,7 +454,7 @@ dependencies = [
  "inventory",
  "rand",
  "rand_distr",
- "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-testkit 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
 ]
 
 [[package]]
@@ -466,7 +466,7 @@ dependencies = [
  "inventory",
  "rand",
  "rand_distr",
- "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-testkit 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
  "serde_json",
  "tokenizers 0.22.2",
 ]
@@ -480,7 +480,7 @@ dependencies = [
  "inventory",
  "rand",
  "rand_distr",
- "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-testkit 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
 ]
 
 [[package]]
@@ -493,7 +493,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "safetensors 0.7.0",
- "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-testkit 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
  "tokenizers 0.22.2",
 ]
 
@@ -510,7 +510,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "safetensors 0.7.0",
- "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-testkit 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
  "tokenizers 0.22.2",
 ]
 
@@ -2612,11 +2612,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "sceneworks-gen-core"
+version = "0.1.0"
+source = "git+https://github.com/michaeltrefry/mlx-gen?rev=dc40c74ea6d364010a8e0198eab6fceba2422e2a#dc40c74ea6d364010a8e0198eab6fceba2422e2a"
+dependencies = [
+ "inventory",
+ "safetensors 0.4.5",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokenizers 0.21.4",
+]
+
+[[package]]
 name = "sceneworks-gen-core-testkit"
 version = "0.1.0"
 source = "git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b#4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b"
 dependencies = [
- "sceneworks-gen-core",
+ "sceneworks-gen-core 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=4d3aa49b84b9ecfdf6310ab708f1d4bf40a38e7b)",
+]
+
+[[package]]
+name = "sceneworks-gen-core-testkit"
+version = "0.1.0"
+source = "git+https://github.com/michaeltrefry/mlx-gen?rev=dc40c74ea6d364010a8e0198eab6fceba2422e2a#dc40c74ea6d364010a8e0198eab6fceba2422e2a"
+dependencies = [
+ "sceneworks-gen-core 0.1.0 (git+https://github.com/michaeltrefry/mlx-gen?rev=dc40c74ea6d364010a8e0198eab6fceba2422e2a)",
 ]
 
 [[package]]
