@@ -31,16 +31,20 @@
 //!   default is `euler_ancestral`. sc-3673 chose DDIM for launch-portable determinism (the spike's
 //!   ancestral path was non-reproducible across launches, sc-3498). Both are SDXL-correct solvers;
 //!   cross-backend *pixel* equality is explicitly NOT a goal (RNG algorithms differ).
-//! - **Surface:** txt2img only — conditioning / LoRA / accel samplers are not advertised, so the
-//!   worker keeps those shapes on the Python fallback (sc-3678) rather than the backend silently
-//!   dropping a control.
+//! - **Surface:** txt2img only — conditioning and the lcm/hyper accel samplers are not advertised, so
+//!   the worker keeps those shapes on the Python fallback (sc-3678) rather than the backend silently
+//!   dropping a control. (sc-6128 DID wire the few-step `lightning` sampler; the testkit's
+//!   validate-honesty check therefore now also exercises `validate(sampler="lightning")`, and
+//!   [`realvisxl_lightning_render`] is the real-weight non-degeneracy guard for the render itself.)
 //! - **dtype:** CLIP + UNet + VAE load f16 with the `madebyollin/sdxl-vae-fp16-fix` VAE; the VAE
 //!   un-scale is the diffusers-correct 0.13025. These match diffusers' fp16 path, not a deviation.
 #![cfg(feature = "cuda")]
 
 use std::path::PathBuf;
 
-use candle_gen::gen_core::{LoadSpec, WeightsSource};
+use candle_gen::gen_core::{
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+};
 use gen_core_testkit::{conformance, Profile};
 
 #[test]
@@ -95,4 +99,70 @@ fn realvisxl_conformance() {
     };
 
     conformance(|| candle_gen_sdxl::load(&spec).unwrap(), &profile);
+}
+
+/// sc-6128 acceptance: the candle SDXL lightning path renders a **non-degenerate** image at ~5 steps
+/// via `sampler="lightning"` — the automatable half of "RealVisXL Lightning renders correctly on
+/// Windows" (image *quality* is the human eyeball via `examples/sdxl-txt2img.rs --sampler lightning`).
+///
+/// Gated on `REALVISXL_LIGHTNING_SNAPSHOT` (a distilled RealVisXL Lightning / SDXL-Lightning diffusers
+/// snapshot dir) — base SDXL through this sampler at 5 steps would render undertrained mush, which is
+/// exactly the failure this story guards against, so the test demands a Lightning checkpoint. It
+/// asserts the output dims, that progress reaches the 5th step, and that the pixels are not a flat
+/// constant (a collapsed/blank decode), i.e. the few-step schedule actually produced structure.
+///
+/// ```text
+/// set REALVISXL_LIGHTNING_SNAPSHOT=C:\Users\…\models--…--RealVisXL-Lightning\snapshots\<hash>
+/// cargo test -p candle-gen-sdxl --features cuda --release --test conformance -- --ignored realvisxl_lightning_render
+/// ```
+#[test]
+#[ignore = "needs REALVISXL_LIGHTNING_SNAPSHOT (a distilled Lightning snapshot dir) + a CUDA GPU; run with --features cuda --ignored"]
+fn realvisxl_lightning_render() {
+    let snap = std::env::var("REALVISXL_LIGHTNING_SNAPSHOT").expect(
+        "set REALVISXL_LIGHTNING_SNAPSHOT to a distilled RealVisXL Lightning / SDXL-Lightning \
+         diffusers snapshot dir",
+    );
+    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(snap)));
+    let gen = candle_gen_sdxl::load(&spec).unwrap();
+
+    let req = GenerationRequest {
+        prompt: "a photo of a rusty robot holding a lit candle, cinematic lighting".into(),
+        width: 512,
+        height: 512,
+        count: 1,
+        seed: Some(42),
+        steps: Some(5),
+        // The worker forces this for `realvisxl_lightning`; CFG is off in the engine regardless.
+        sampler: Some("lightning".into()),
+        guidance: Some(1.0),
+        ..Default::default()
+    };
+
+    let mut last_step = (0u32, 0u32);
+    let mut on_progress = |p: Progress| {
+        if let Progress::Step { current, total } = p {
+            last_step = (current, total);
+        }
+    };
+    let out = gen
+        .generate(&req, &mut on_progress)
+        .expect("lightning render");
+
+    let images = match out {
+        GenerationOutput::Images(imgs) => imgs,
+        GenerationOutput::Video { .. } => panic!("expected images, got video"),
+    };
+    assert_eq!(images.len(), 1, "count=1 ⇒ one image");
+    let img = &images[0];
+    assert_eq!((img.width, img.height), (512, 512), "output dims = request");
+    assert_eq!(img.pixels.len(), 512 * 512 * 3, "RGB8 buffer = W·H·3");
+    // Progress reached the final (5th) step — the 5-step schedule actually ran.
+    assert_eq!(last_step, (5, 5), "Step progress should end at 5/5");
+    // Non-degenerate: a collapsed/blank decode is a flat constant. Real structure has spread.
+    let min = *img.pixels.iter().min().unwrap();
+    let max = *img.pixels.iter().max().unwrap();
+    assert!(
+        max - min > 16,
+        "lightning render looks degenerate (flat): min={min} max={max}"
+    );
 }

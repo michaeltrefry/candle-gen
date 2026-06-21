@@ -58,6 +58,7 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::sampling::{AlphaSchedule, LightningPolicy, SamplerPolicy};
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, Progress};
 use candle_gen::{CandleError, Result};
@@ -80,6 +81,23 @@ pub(crate) const VAE_SCALE: f64 = 0.13025;
 const DEFAULT_STEPS: usize = 30;
 const DEFAULT_GUIDANCE: f64 = 7.0;
 
+/// The few-step **Lightning** sampler id (sc-6128) — diffusers Euler-trailing, selected per request
+/// via `req.sampler` and advertised in [`crate::descriptor`]'s `samplers`. The SceneWorks worker forces
+/// it for the `realvisxl_lightning` model id; distilled Lightning checkpoints (RealVisXL Lightning /
+/// SDXL-Lightning) render correctly in 2–8 steps through this schedule, where DDIM at the same step
+/// count produces mush.
+pub(crate) const LIGHTNING_SAMPLER: &str = "lightning";
+/// Lightning's few-step default when the request omits `steps` — matches `mlx-gen-sdxl`'s
+/// `accel_defaults("lightning")` (4 steps, CFG off). The worker typically sends an explicit count
+/// (the AC eyeballs ~5).
+const LIGHTNING_DEFAULT_STEPS: usize = 4;
+/// SDXL's `scaled_linear` β endpoints + train-step count (the diffusers SDXL scheduler defaults — the
+/// same values `DDIMSchedulerConfig::default()` and `sampler::EulerAncestralSampler` carry). The
+/// Lightning policy's σ table is built from these.
+const SDXL_BETA_START: f32 = 0.00085;
+const SDXL_BETA_END: f32 = 0.012;
+const SDXL_TRAIN_STEPS: usize = 1000;
+
 /// The per-image seed within a batch: image `index` of a `count`-image request renders at
 /// `base_seed + index` (wrapping at the u64 ceiling). Mirrors the SceneWorks `SdxlDiffusersAdapter`'s
 /// per-image seed increment (sc-3677 parity), so the *n*-th image of a batch reproduces in isolation
@@ -87,6 +105,18 @@ const DEFAULT_GUIDANCE: f64 = 7.0;
 /// without a GPU.
 pub(crate) fn image_seed(base_seed: u64, index: u32) -> u64 {
     base_seed.wrapping_add(index as u64)
+}
+
+/// Build the SDXL-**Lightning** sampler *policy* (sc-6128) for `num_steps`: diffusers
+/// `EulerDiscreteScheduler(timestep_spacing="trailing", final_sigmas_type="zero")`, ε-prediction. The
+/// schedule math is the backend-neutral [`gen_core::sampling::LightningPolicy`] — the **same** policy
+/// the `mlx-gen-sdxl` `LightningSampler` drives, so no candle gen-core pin bump is needed and the two
+/// backends share the reference trailing-spacing + interpolated σ table. The candle side is only the
+/// ~5-line tensor application in [`Pipeline::denoise_lightning`].
+fn lightning_policy(num_steps: usize) -> Result<LightningPolicy> {
+    let sched = AlphaSchedule::scaled_linear(SDXL_TRAIN_STEPS, SDXL_BETA_START, SDXL_BETA_END)
+        .map_err(|e| CandleError::Msg(format!("sdxl lightning schedule: {e}")))?;
+    Ok(LightningPolicy::new(&sched, SDXL_TRAIN_STEPS, num_steps))
 }
 
 /// The fp16-stable SDXL VAE (the base VAE NaNs in f16). Model-agnostic across every SDXL checkpoint,
@@ -334,12 +364,34 @@ impl Pipeline {
         vae: &AutoEncoderKL,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
-        let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
+        // sc-6128: a `lightning` request runs the few-step Euler-trailing path; everything else keeps
+        // the proven DDIM path (zero regression). Lightning carries its own few-step default.
+        let lightning = req.sampler.as_deref() == Some(LIGHTNING_SAMPLER);
+        let steps = req.steps.map(|s| s as usize).unwrap_or(if lightning {
+            LIGHTNING_DEFAULT_STEPS
+        } else {
+            DEFAULT_STEPS
+        });
         let guidance = req.guidance.map(|g| g as f64).unwrap_or(DEFAULT_GUIDANCE);
-        let use_guide = guidance > 1.0;
+        // Lightning is a distilled, classifier-free sampler — it never runs CFG (the worker sends
+        // guidance 1.0 for `realvisxl_lightning`, and CFG on a CFG-free checkpoint degrades output).
+        // The DDIM path honors the request guidance exactly as before.
+        let use_guide = !lightning && guidance > 1.0;
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let total = steps as u32;
         let (lat_h, lat_w) = (self.config.height / 8, self.config.width / 8);
+
+        // Lightning precompute (seed-independent): the trailing-Euler policy + the cond-only text
+        // embedding (row 1 of the `[uncond, cond]` dual-CLIP stack — Lightning runs one conditioned
+        // forward per step, so the uncond row is unused). Built once, reused for every image.
+        let lightning_ctx = if lightning {
+            Some((
+                lightning_policy(steps)?,
+                text_embeddings.narrow(0, 1, 1)?.contiguous()?,
+            ))
+        } else {
+            None
+        };
 
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
@@ -350,52 +402,106 @@ impl Pipeline {
             // CPU, then move it to the compute device. This replaces candle's CUDA `device.set_seed`
             // + on-device `randn`, whose seed→noise mapping was NOT portable across launch
             // environments and occasionally collapsed the sample to garbage (sc-3498). Paired with the
-            // non-ancestral DDIM scheduler below (no per-step stochastic noise), the whole generation
-            // is now a pure function of `(seed, request)` — same seed ⇒ same image, any launch.
+            // non-ancestral solver (DDIM, or the deterministic Lightning Euler), the whole generation
+            // is a pure function of `(seed, request)` — same seed ⇒ same image, any launch.
             let n = 4 * lat_h * lat_w;
             let mut rng = StdRng::seed_from_u64(seed);
             let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
             let init = Tensor::from_vec(noise, (1, 4, lat_h, lat_w), &Device::Cpu)?
                 .to_device(&self.device)?;
 
-            // DDIM (eta=0): non-ancestral / deterministic, vs candle's default Euler-ancestral (which
-            // injects fresh noise every step). SceneWorks/diffusers SDXL defaults to EulerDiscrete —
-            // also non-ancestral, deterministic; DDIM is the closest deterministic solver candle ships
-            // and gives portable, collapse-free output. Its config defaults ARE the SDXL values
-            // (scaled_linear β 0.00085→0.012, epsilon prediction, 1000 train steps).
-            let mut scheduler = DDIMSchedulerConfig::default().build(steps)?;
-            let timesteps = scheduler.timesteps().to_vec();
-            let mut latents = (init * scheduler.init_noise_sigma())?.to_dtype(self.dtype)?;
+            let latents = if let Some((policy, cond)) = &lightning_ctx {
+                self.denoise_lightning(&init, policy, cond, unet, &req.cancel, on_progress, total)?
+            } else {
+                // DDIM (eta=0): non-ancestral / deterministic, vs candle's default Euler-ancestral
+                // (which injects fresh noise every step). SceneWorks/diffusers SDXL defaults to
+                // EulerDiscrete — also non-ancestral, deterministic; DDIM is the closest deterministic
+                // solver candle ships and gives portable, collapse-free output. Its config defaults
+                // ARE the SDXL values (scaled_linear β 0.00085→0.012, epsilon prediction, 1000 train
+                // steps).
+                let mut scheduler = DDIMSchedulerConfig::default().build(steps)?;
+                let timesteps = scheduler.timesteps().to_vec();
+                let mut latents = (init * scheduler.init_noise_sigma())?.to_dtype(self.dtype)?;
 
-            for (step_i, &timestep) in timesteps.iter().enumerate() {
-                if req.cancel.is_cancelled() {
-                    return Err(CandleError::Canceled);
+                for (step_i, &timestep) in timesteps.iter().enumerate() {
+                    if req.cancel.is_cancelled() {
+                        return Err(CandleError::Canceled);
+                    }
+                    let model_in = if use_guide {
+                        Tensor::cat(&[&latents, &latents], 0)?
+                    } else {
+                        latents.clone()
+                    };
+                    let model_in = scheduler.scale_model_input(model_in, timestep)?;
+                    let noise_pred = unet.forward(&model_in, timestep as f64, text_embeddings)?;
+                    let noise_pred = if use_guide {
+                        let chunks = noise_pred.chunk(2, 0)?;
+                        let (uncond, cond) = (&chunks[0], &chunks[1]);
+                        (uncond + ((cond - uncond)? * guidance)?)?
+                    } else {
+                        noise_pred
+                    };
+                    latents = scheduler.step(&noise_pred, timestep, &latents)?;
+                    on_progress(Progress::Step {
+                        current: step_i as u32 + 1,
+                        total,
+                    });
                 }
-                let model_in = if use_guide {
-                    Tensor::cat(&[&latents, &latents], 0)?
-                } else {
-                    latents.clone()
-                };
-                let model_in = scheduler.scale_model_input(model_in, timestep)?;
-                let noise_pred = unet.forward(&model_in, timestep as f64, text_embeddings)?;
-                let noise_pred = if use_guide {
-                    let chunks = noise_pred.chunk(2, 0)?;
-                    let (uncond, cond) = (&chunks[0], &chunks[1]);
-                    (uncond + ((cond - uncond)? * guidance)?)?
-                } else {
-                    noise_pred
-                };
-                latents = scheduler.step(&noise_pred, timestep, &latents)?;
-                on_progress(Progress::Step {
-                    current: step_i as u32 + 1,
-                    total,
-                });
-            }
+                latents
+            };
 
             on_progress(Progress::Decoding);
             images.push(self.decode(vae, &latents)?);
         }
         Ok(images)
+    }
+
+    /// The SDXL-**Lightning** few-step denoise (sc-6128) — diffusers Euler-trailing, ε-prediction,
+    /// **CFG-off**. Distilled Lightning checkpoints are trained classifier-free, so this runs a single
+    /// conditioned UNet forward per step (no uncond batch, no CFG combine).
+    ///
+    /// The latents live in diffusers' un-normalized **σ-space** (kept f32, unlike the DDIM path's f16
+    /// latents): the prior is `unit_noise · σ_max`, the model input is `x/√(σ²+1)` cast to the UNet
+    /// dtype, and each step is the deterministic Euler update `x ← x + ε·(σ_{i+1} − σ_i)` in f32. That
+    /// update is the candle tensor application of [`gen_core::sampling`]'s neutral [`LightningPolicy`]
+    /// coefficients (`a_x = 1`, `a_noise = 0`), mirroring `mlx-gen-sdxl`'s `apply_step` — so the two
+    /// backends share one reference schedule.
+    ///
+    /// `init` is the seeded unit-normal noise (CPU `StdRng` → device, f32; the sc-3673 launch-portable
+    /// contract); `cond` is the cond-only text embedding `[1, T, 2048]`. Returns latents in the compute
+    /// dtype (f16) for the shared [`decode`](Self::decode).
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_lightning(
+        &self,
+        init: &Tensor,
+        policy: &LightningPolicy,
+        cond: &Tensor,
+        unet: &UNet2DConditionModel,
+        cancel: &gen_core::runtime::CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        total: u32,
+    ) -> Result<Tensor> {
+        // σ-space prior: unit noise · the largest σ (init_noise_sigma for trailing spacing).
+        let mut latents = init.affine(policy.init_noise_scale() as f64, 0.0)?;
+        for i in 0..policy.num_steps() {
+            if cancel.is_cancelled() {
+                return Err(CandleError::Canceled);
+            }
+            let c = policy.coeffs(i);
+            // Model-input scaling x/√(σ²+1), cast to the UNet compute dtype (f16). CFG-off ⇒ batch 1.
+            let x_in = latents.affine(c.c_in as f64, 0.0)?.to_dtype(self.dtype)?;
+            let eps = unet
+                .forward(&x_in, c.timestep as f64, cond)?
+                .to_dtype(DType::F32)?;
+            // Euler ε-pred step in f32: x + ε·(σ_{i+1} − σ_i) (a_x = 1, a_noise = 0, deterministic).
+            latents = (latents + eps.affine(c.a_out as f64, 0.0)?)?;
+            on_progress(Progress::Step {
+                current: i as u32 + 1,
+                total,
+            });
+        }
+        // The shared `decode` expects the compute dtype (f16), like the DDIM loop's latents.
+        Ok(latents.to_dtype(self.dtype)?)
     }
 
     /// VAE-decode latents to an RGB8 [`Image`] (un-scale by [`VAE_SCALE`], `x/2 + 0.5`, clamp, ×255).
@@ -619,6 +725,46 @@ mod tests {
         assert_eq!(image_seed(42, 7), 49);
         // Wraps rather than panicking at the u64 ceiling (a non-default high base seed + a batch).
         assert_eq!(image_seed(u64::MAX, 1), 0);
+    }
+
+    /// sc-6128: the Lightning policy is diffusers `EulerDiscreteScheduler(timestep_spacing="trailing",
+    /// final_sigmas_type="zero")` built from the SDXL `scaled_linear` betas. Pin the trailing timesteps
+    /// (the hand-computable `round(arange(N, 0, −N/steps)) − 1`), the σ-max prior scale, and the
+    /// final-step zero-σ landing — the candle wrapper of the gen-core policy (no GPU/weights).
+    #[test]
+    fn lightning_policy_is_trailing_euler_with_zero_final() {
+        let p = lightning_policy(5).unwrap();
+        assert_eq!(p.num_steps(), 5);
+        // Trailing spacing for 5 steps over 1000 train timesteps: round([1000,800,600,400,200]) − 1.
+        let ts: Vec<f32> = (0..5).map(|i| p.coeffs(i).timestep).collect();
+        assert_eq!(ts, vec![999.0, 799.0, 599.0, 399.0, 199.0]);
+        // init_noise_scale = the largest σ (σ at the near-train-end first step) — well above 1 for SDXL.
+        assert!(
+            p.init_noise_scale() > 10.0,
+            "σ_max should be the large trailing σ, got {}",
+            p.init_noise_scale()
+        );
+        // c_in = 1/√(σ²+1) ∈ (0, 1] and the conditioning timestep descends across the schedule.
+        let c0 = p.coeffs(0);
+        assert!(c0.c_in > 0.0 && c0.c_in <= 1.0);
+        assert!(c0.timestep > p.coeffs(4).timestep);
+        // `final_sigmas_type="zero"`: the last step's σ_{i+1} is 0, so a_out = 0 − σ_last < 0 — the
+        // step drives the latent the rest of the way to the clean sample.
+        assert!(
+            p.coeffs(4).a_out < 0.0,
+            "final a_out should bring σ→0, got {}",
+            p.coeffs(4).a_out
+        );
+        // The deterministic Euler step injects no noise.
+        assert!((0..5).all(|i| p.coeffs(i).a_noise == 0.0));
+    }
+
+    /// sc-6128: the policy guards a degenerate 0-step request (the real `steps>=1` floor is the
+    /// generator's `validate`), so `lightning_policy(0)` still yields a usable 1-step schedule rather
+    /// than panicking on a `/0`.
+    #[test]
+    fn lightning_policy_clamps_zero_steps() {
+        assert_eq!(lightning_policy(0).unwrap().num_steps(), 1);
     }
 
     /// The tiled blend (slice → mask → pad → accumulate → normalize) must exactly reconstruct the

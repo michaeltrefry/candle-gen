@@ -13,10 +13,17 @@
 //! **LoRA/LoKr (sc-5165):** [`load`] accepts `spec.adapters` and merges a trained adapter's delta into
 //! the UNet weights at component load ([`adapters`] + [`pipeline`]) — the inference half of the native
 //! candle trainer, closing the train→infer loop. The descriptor advertises the wired surface
-//! (txt2img, negative prompt, guidance, `ddim`, **LoRA/LoKr**) — NOT the full mlx-gen-sdxl
-//! conditioning / accel-sampler surface — so the worker routes the rest to the Python fallback
-//! (sc-3678) rather than the candle backend silently dropping a control. The descriptor's `backend`
-//! is `"candle"` and `mac_only` is `false` (Windows/CUDA target).
+//! (txt2img, negative prompt, guidance, `ddim`, the few-step `lightning` sampler, **LoRA/LoKr**) — NOT
+//! the full mlx-gen-sdxl conditioning / accel-sampler surface — so the worker routes the rest to the
+//! Python fallback (sc-3678) rather than the candle backend silently dropping a control. The
+//! descriptor's `backend` is `"candle"` and `mac_only` is `false` (Windows/CUDA target).
+//!
+//! **Lightning (sc-6128):** a `req.sampler == "lightning"` request runs the few-step Euler-trailing
+//! denoise ([`pipeline`]) — diffusers `EulerDiscreteScheduler(timestep_spacing="trailing")`, ε-pred,
+//! `final_sigmas_type="zero"`, **CFG-off** — reusing the backend-neutral `gen_core::sampling`
+//! `LightningPolicy` (the same schedule `mlx-gen-sdxl`'s `LightningSampler` drives). This makes the
+//! `realvisxl_lightning` model id renderable on the candle (Windows) lane at ~5 steps; base SDXL is
+//! unaffected (it keeps the DDIM default).
 //!
 //! Perf (sc-3674): CLIP loads f16 and the UNet attention runs through fused **flash-attention** when
 //! built `--features flash-attn` and the runtime toggle ([`set_flash_attn`], default on) is set.
@@ -317,11 +324,13 @@ impl Generator for SdxlGenerator {
 }
 
 /// SDXL's identity + the surface candle wires: real classifier-free guidance (negative prompt + CFG
-/// scale), txt2img, `ddim`, and **LoRA/LoKr** (sc-5165 — load-time merge of a trained adapter into the
-/// UNet weights, see [`load`] + [`pipeline`]). No conditioning / acceleration samplers are advertised —
-/// those remain the Python fallback's job (sc-3678) until candle wires them — so the descriptor never
-/// promises a path `generate` can't serve (the false-capability trap). Two backend-correct deviations
-/// from `mlx-gen-sdxl`: `backend = "candle"` and `mac_only = false`.
+/// scale), txt2img, `ddim`, the few-step **`lightning`** sampler (sc-6128 — Euler-trailing, CFG-off,
+/// for distilled Lightning checkpoints), and **LoRA/LoKr** (sc-5165 — load-time merge of a trained
+/// adapter into the UNet weights, see [`load`] + [`pipeline`]). No conditioning is advertised, and the
+/// other acceleration samplers (lcm/hyper) remain the Python fallback's job (sc-3678) until candle
+/// wires them — so the descriptor never promises a path `generate` can't serve (the false-capability
+/// trap). Two backend-correct deviations from `mlx-gen-sdxl`: `backend = "candle"` and
+/// `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
@@ -343,12 +352,14 @@ pub fn descriptor() -> ModelDescriptor {
             // rather than to the Python fallback.
             supports_lora: true,
             supports_lokr: true,
-            // DDIM (eta=0) — the deterministic, launch-portable sampler wired in sc-3673 (replacing
-            // the spike's Euler-ancestral). The few-step accel samplers need their acceleration LoRAs
-            // (not yet supported), so they are not advertised. The worker sends no `sampler` for SDXL,
-            // so this list is capability introspection (`validate` only rejects a *named* sampler not
-            // in it).
-            samplers: vec!["ddim"],
+            // DDIM (eta=0) — the deterministic, launch-portable default wired in sc-3673 (replacing
+            // the spike's Euler-ancestral). `lightning` (sc-6128) is the few-step Euler-trailing
+            // sampler for distilled Lightning checkpoints (RealVisXL Lightning / SDXL-Lightning): the
+            // whole checkpoint is the acceleration (no separate LoRA), so it IS advertised — the worker
+            // forces `sampler="lightning"` for the `realvisxl_lightning` id. The other accel samplers
+            // (lcm/hyper) still need their LoRAs and remain unadvertised. `validate` only rejects a
+            // *named* sampler not in this list.
+            samplers: vec!["ddim", "lightning"],
             schedulers: vec!["discrete"],
             min_size: 512,
             max_size: 2048,
@@ -435,13 +446,14 @@ mod tests {
         assert!(d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_true_cfg);
         assert!(!d.capabilities.mac_only);
-        // txt2img: no conditioning / accel samplers advertised. sc-5165: LoRA/LoKr ARE now wired
-        // (load-time merge), so they are advertised — the worker routes adapter jobs to candle.
+        // txt2img: no conditioning advertised. sc-5165: LoRA/LoKr ARE now wired (load-time merge), so
+        // they are advertised — the worker routes adapter jobs to candle. sc-6128: the few-step
+        // `lightning` accel sampler is wired too (the lcm/hyper accel samplers still are not).
         assert!(d.capabilities.conditioning.is_empty());
         assert!(d.capabilities.supports_lora);
         assert!(d.capabilities.supports_lokr);
-        // sc-3673: the wired sampler is the deterministic DDIM (not the spike's euler-ancestral).
-        assert_eq!(d.capabilities.samplers, vec!["ddim"]);
+        // sc-3673: the deterministic DDIM default; sc-6128: + the few-step `lightning` sampler.
+        assert_eq!(d.capabilities.samplers, vec!["ddim", "lightning"]);
     }
 
     /// sc-3677 parity: the worker maps BOTH `sdxl` and `realvisxl` onto this single descriptor, so
@@ -459,7 +471,7 @@ mod tests {
         assert_eq!(d.capabilities.min_size, 512);
         assert_eq!(d.capabilities.max_size, 2048);
         assert_eq!(d.capabilities.max_count, 8);
-        assert_eq!(d.capabilities.samplers, vec!["ddim"]);
+        assert_eq!(d.capabilities.samplers, vec!["ddim", "lightning"]);
         // SDXL works in latent space at /8 — the size policy both ids share (validate rejects
         // non-multiples). Anchored here so a change to the alignment is a parity-visible diff.
         assert_eq!(SIZE_MULTIPLE, 8);
@@ -535,6 +547,32 @@ mod tests {
         assert!(!descriptor()
             .capabilities
             .accepts(ConditioningKind::Reference));
+    }
+
+    /// sc-6128: `validate` accepts the advertised `lightning` sampler (the worker forces it for
+    /// `realvisxl_lightning`) and still rejects an unadvertised one — the shared `validate_request`
+    /// only passes a named sampler that is in `descriptor().samplers`. GPU-free (lazy generator).
+    #[test]
+    fn validate_accepts_lightning_sampler() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load("sdxl", &spec).unwrap();
+
+        let lightning = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle".into(),
+            sampler: Some("lightning".into()),
+            steps: Some(5),
+            guidance: Some(1.0),
+            ..Default::default()
+        };
+        assert!(g.validate(&lightning).is_ok());
+
+        // An unadvertised sampler is still rejected (not silently downgraded).
+        let bogus = GenerationRequest {
+            prompt: "x".into(),
+            sampler: Some("euler_ancestral".into()),
+            ..Default::default()
+        };
+        assert!(g.validate(&bogus).is_err());
     }
 
     /// sc-5165: `load` now ACCEPTS LoRA/LoKr adapters — it carries them for a load-time merge into the

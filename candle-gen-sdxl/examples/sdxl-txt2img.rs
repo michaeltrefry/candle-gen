@@ -11,6 +11,14 @@
 //!   --prompt "a photo of a rusty robot holding a lit candle" --steps 30 --seed 42 --out out.png
 //! ```
 //!
+//! For the sc-6128 few-step **Lightning** eyeball, point `--snapshot` at a RealVisXL Lightning (or
+//! SDXL-Lightning) checkpoint and select the sampler — CFG is forced off, so guidance is ignored:
+//!
+//! ```text
+//! cargo run --release --example sdxl-txt2img --features cuda -- \
+//!   --snapshot "…\RealVisXL Lightning snapshot…" --sampler lightning --steps 5 --out lightning.png
+//! ```
+//!
 //! The snapshot must be the diffusers multi-component tree (`unet/`, `text_encoder/`,
 //! `text_encoder_2/`); the model-agnostic CLIP tokenizers + fp16-VAE-fix resolve from the HF cache.
 
@@ -46,6 +54,9 @@ fn main() -> Result<()> {
     let guidance: f32 = arg(&args, "--guidance")
         .and_then(|s| s.parse().ok())
         .unwrap_or(7.0);
+    // `--sampler lightning` exercises the sc-6128 few-step Euler-trailing path (CFG-off) — the
+    // RealVisXL Lightning eyeball: `--sampler lightning --steps 5`. Omitted ⇒ the DDIM default.
+    let sampler = arg(&args, "--sampler");
     let seed: u64 = arg(&args, "--seed")
         .and_then(|s| s.parse().ok())
         .unwrap_or(42);
@@ -69,7 +80,7 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("sdxl_smoke.png"));
 
     println!(
-        "[smoke] snapshot={snapshot}\n[smoke] {width}x{height} steps={steps} guidance={guidance} seed={seed} count={count}\n[smoke] prompt={prompt:?}"
+        "[smoke] snapshot={snapshot}\n[smoke] {width}x{height} steps={steps} guidance={guidance} sampler={sampler:?} seed={seed} count={count}\n[smoke] prompt={prompt:?}"
     );
 
     // Force-link the provider so its `inventory::submit!` registration survives the linker (we reach
@@ -109,6 +120,7 @@ fn main() -> Result<()> {
         seed: Some(seed),
         steps: Some(steps),
         guidance: Some(guidance),
+        sampler: sampler.clone(),
         ..Default::default()
     };
 
