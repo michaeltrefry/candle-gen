@@ -28,6 +28,12 @@ pub use candle_nn;
 // Provider crates (sdxl/z-image/wan/lens) build their `gen_core::Trainer` on top of this.
 pub mod train;
 
+// The unified sampler/scheduler framework backend (epic 7114 P2, sc-7119): the gen-core `LatentOps`
+// impl over `candle_core::Tensor`. The candle twin of `mlx_gen::MlxLatentOps`; lets every candle
+// provider crate drive the shared gen-core callback samplers.
+pub mod sampler;
+pub use sampler::CandleLatentOps;
+
 use thiserror::Error;
 
 /// The candle-backed crate error. gen-core cannot name candle types, so device/tensor failures

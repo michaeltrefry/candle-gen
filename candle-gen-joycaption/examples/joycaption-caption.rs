@@ -83,6 +83,9 @@ fn main() -> Result<()> {
             top_p,
             max_new_tokens,
             seed,
+            // gen-core's CaptionSampling grew `repetition_penalty`/`repetition_context` (the
+            // sc-7119 gen-core bump); default them so the example keeps the reference behavior.
+            ..Default::default()
         },
         trigger_words: Vec::new(),
         cancel: Default::default(),

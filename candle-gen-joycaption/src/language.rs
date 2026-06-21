@@ -722,6 +722,7 @@ mod tests {
                 top_p: 1.0,
                 max_new_tokens: 1,
                 seed: None,
+                ..Default::default()
             },
             &mut rng,
         )
@@ -741,6 +742,7 @@ mod tests {
                 top_p: 0.0,
                 max_new_tokens: 1,
                 seed: None,
+                ..Default::default()
             },
             &mut rng,
         )

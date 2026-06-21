@@ -128,7 +128,15 @@ resolver = "2"
 # worker re-pins to MATCH at its next backend-candle cutover (normal pattern — see the bumps above);
 # until then the worker's combined build would resolve two gen-core revs, so land the worker bump in
 # lockstep when this merges. mlx-rs unchanged 44929a0.
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "7b9754299223de37b3c1404773b3a018caa102fe" }
+# Bumped `7b97542` -> `d8038be` (epic 7114 P2 / sc-7119): pulls the new ADDITIVE unified
+# sampler/scheduler framework into gen-core — `gen_core::sampling::{LatentOps, ModelSampling, Sampler,
+# the curated solver/scheduler library}` (mlx-gen #525/#526/#527, sc-7115/7116/7117). sc-7119 needs the
+# `LatentOps` trait to implement `CandleLatentOps` for `candle_core::Tensor`. The `7b97542..d8038be` range
+# is purely additive gen-core (the sampling module grew; no API removed), so the existing candle surface
+# compiles unchanged. candle-gen **leads this rev**: the worker re-pins to MATCH at its next
+# backend-candle cutover (the P5 lockstep story, sc-7129). The 17 per-crate `gen-core-testkit` dev-deps
+# below are bumped in lockstep so the skew gate resolves a SINGLE gen-core rev. mlx-rs unchanged 44929a0.
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "d8038beb3d81b8edce3e084078e2fc6d356a0081" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels
