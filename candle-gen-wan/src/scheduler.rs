@@ -21,7 +21,7 @@ impl Sampler {
     pub fn parse(name: Option<&str>) -> Self {
         match name {
             Some("euler") => Sampler::Euler,
-            _ => Sampler::UniPC, // "unipc" (default) / anything else
+            _ => Sampler::UniPC, // uni_pc (curated, sc-7296) / unipc (legacy) / any unknown -> UniPC
         }
     }
 }

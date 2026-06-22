@@ -211,9 +211,10 @@ impl Pipeline {
         // epic 7114 P4 (sc-7124) Wan fold-in: the gen-core-only curated solvers (euler_ancestral /
         // heun / dpmpp_sde / ddim) run over Wan's NATIVE flow σ schedule via the shared driver — one
         // solver library. Wan's native `unipc`/`euler` (the diffusers FLOW-SNR multistep + flow Euler)
-        // stay the byte-exact default path; gen-core's VE-space `uni_pc`/`dpmpp_2m` are deliberately NOT
-        // exposed (they would diverge from Wan's diffusers parity). The DiT timestep is `σ·N` (Sigma
-        // convention, ×N applied in the closure); the model output is the velocity (CFG combined inside).
+        // stay the byte-exact default path — advertised under the curated `uni_pc` name (sc-7296), which
+        // routes HERE to the native solver, NOT gen-core's VE-space `uni_pc` (different λ; would diverge).
+        // The DiT timestep is `σ·N` (Sigma convention, ×N applied in the closure); the model output is
+        // the velocity (CFG combined inside).
         const FOLDIN: &[&str] = &["euler_ancestral", "heun", "dpmpp_sde", "ddim"];
         let latents = if let Some(name) = req.sampler.as_deref().filter(|n| FOLDIN.contains(n)) {
             let native = scheduler::flow_sigmas(steps, shift);
@@ -361,17 +362,20 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![],
             supports_lora: false,
             supports_lokr: false,
-            // Native flow samplers (`unipc` default / `euler`) + the epic 7114 P4 (sc-7124) curated
-            // fold-in: the gen-core-only solvers over Wan's native flow σ schedule. gen-core's VE-space
-            // `uni_pc`/`dpmpp_2m` are NOT advertised — they would diverge from Wan's diffusers FLOW-SNR
-            // multistep parity. No scheduler axis (the flow shift is the `scheduler_shift` knob).
+            // Native flow samplers under the curated gen-core vocabulary (epic 7114 sc-7296): `uni_pc`
+            // routes to Wan's NATIVE FLOW-SNR UniPC (NOT the gen-core VE-space `uni_pc`, a different λ
+            // that would diverge from Wan's diffusers parity) + the sc-7124 fold-in (gen-core-only
+            // solvers over Wan's native flow σ schedule). Legacy `unipc` kept as an alias for old
+            // recipes. `dpmpp_2m` is NOT advertised — candle Wan has no native DPM++2M (mlx-only by
+            // capability). No scheduler axis (the flow shift is the `scheduler_shift` knob).
             samplers: vec![
-                "unipc",
+                "uni_pc",
                 "euler",
                 "euler_ancestral",
                 "heun",
                 "dpmpp_sde",
                 "ddim",
+                "unipc",
             ],
             schedulers: vec![],
             min_size: 32,
@@ -456,6 +460,8 @@ mod tests {
         assert!(!d.capabilities.mac_only);
         assert!(d.capabilities.conditioning.is_empty());
         assert!(!d.capabilities.accepts(ConditioningKind::Reference));
+        // sc-7296: advertised under the curated `uni_pc` (routes to native UniPC); legacy `unipc` alias kept.
+        assert!(d.capabilities.samplers.contains(&"uni_pc"));
         assert!(d.capabilities.samplers.contains(&"unipc"));
         assert!(d.capabilities.samplers.contains(&"euler"));
     }

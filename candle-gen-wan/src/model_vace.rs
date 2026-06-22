@@ -387,7 +387,8 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![ConditioningKind::ControlClip, ConditioningKind::Reference],
             supports_lora: false,
             supports_lokr: false,
-            samplers: vec!["unipc", "euler"],
+            // sc-7296: curated `uni_pc` (native UniPC) + `euler`; legacy `unipc` alias for old recipes.
+            samplers: vec!["uni_pc", "euler", "unipc"],
             schedulers: vec![],
             min_size: 16,
             max_size: 1280,
@@ -495,7 +496,8 @@ mod tests {
         assert!(d.capabilities.supports_negative_prompt);
         assert!(d.capabilities.accepts(ConditioningKind::ControlClip));
         assert!(d.capabilities.accepts(ConditioningKind::Reference));
-        assert!(d.capabilities.samplers.contains(&"unipc"));
+        assert!(d.capabilities.samplers.contains(&"uni_pc")); // sc-7296 curated
+        assert!(d.capabilities.samplers.contains(&"unipc")); // legacy alias
         assert!(!d.capabilities.supports_lora);
     }
 
