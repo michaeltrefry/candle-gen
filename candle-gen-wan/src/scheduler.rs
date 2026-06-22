@@ -18,10 +18,14 @@ pub enum Sampler {
 }
 
 impl Sampler {
+    /// Map a curated sampler name (epic 7114) to Wan's native integrator. The curated `uni_pc` and the
+    /// legacy `unipc` spelling both select Wan's OWN native diffusers FLOW-SNR UniPC multistep — NOT
+    /// gen-core's VE-space `uni_pc` solver, which would diverge from Wan's parity. `euler` is flow Euler.
+    /// Any unknown name falls back to the UniPC default (N3 — never hard-fail over a sampling knob).
     pub fn parse(name: Option<&str>) -> Self {
         match name {
             Some("euler") => Sampler::Euler,
-            _ => Sampler::UniPC, // "unipc" (default) / anything else
+            _ => Sampler::UniPC, // "uni_pc" (curated) / "unipc" (legacy) / default / anything else
         }
     }
 }
@@ -49,9 +53,9 @@ fn flow_sigmas_f64(steps: usize, shift: f64) -> Vec<f64> {
 /// The Wan flow-match σ schedule as `f32` (descending, length `steps + 1`, trailing `0.0`) — the native
 /// schedule the unified curated solver fold-in (epic 7114 P4, sc-7124) integrates over via
 /// [`candle_gen::run_flow_sampler`]. The gen-core-only solvers (euler_ancestral / heun / dpmpp_sde /
-/// ddim) run over THIS schedule; Wan's native `unipc`/`dpmpp2m` are diffusers FLOW-SNR multistep
-/// solvers (λ = log((1−σ)/σ)) that the gen-core VE-space `uni_pc`/`dpmpp_2m` (λ = −ln σ) do NOT
-/// reproduce, so those are deliberately NOT exposed (they would diverge from Wan's diffusers parity).
+/// ddim) run over THIS schedule. The curated `uni_pc` name (sc-7296) maps to Wan's OWN native UniPC
+/// (a diffusers FLOW-SNR multistep, λ = log((1−σ)/σ)); gen-core's VE-space `uni_pc`/`dpmpp_2m`
+/// (λ = −ln σ) are deliberately NOT routed through the fold-in — they would diverge from Wan's parity.
 pub fn flow_sigmas(steps: usize, shift: f64) -> Vec<f32> {
     flow_sigmas_f64(steps, shift)
         .iter()
@@ -210,4 +214,20 @@ impl FlowScheduler {
 /// Default flow-shift unless the request overrides it.
 pub fn flow_shift(req_shift: Option<f32>) -> f64 {
     req_shift.map(|s| s as f64).unwrap_or(FLOW_SHIFT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Sampler;
+
+    #[test]
+    fn parse_maps_curated_and_legacy_names() {
+        // Curated `uni_pc` (sc-7296) and the legacy `unipc` spelling both select Wan's native UniPC;
+        // the default (None) is UniPC; `euler` is flow Euler; unknown falls back to UniPC (N3).
+        assert_eq!(Sampler::parse(Some("uni_pc")), Sampler::UniPC);
+        assert_eq!(Sampler::parse(Some("unipc")), Sampler::UniPC);
+        assert_eq!(Sampler::parse(None), Sampler::UniPC);
+        assert_eq!(Sampler::parse(Some("euler")), Sampler::Euler);
+        assert_eq!(Sampler::parse(Some("something_else")), Sampler::UniPC);
+    }
 }

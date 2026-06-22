@@ -586,7 +586,8 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             },
             supports_lora: true,
             supports_lokr: true,
-            samplers: vec!["unipc", "euler"],
+            // Curated `uni_pc` (sc-7296) → Wan's native UniPC; `euler` flow Euler. Legacy `unipc` alias.
+            samplers: vec!["uni_pc", "euler", "unipc"],
             schedulers: vec![],
             min_size: 16,
             max_size: 1280,
@@ -692,7 +693,8 @@ mod tests {
         assert!(t2v.capabilities.supports_negative_prompt);
         assert!(!t2v.capabilities.supports_true_cfg);
         assert!(t2v.capabilities.conditioning.is_empty());
-        assert!(t2v.capabilities.samplers.contains(&"unipc"));
+        assert!(t2v.capabilities.samplers.contains(&"uni_pc")); // curated spelling (sc-7296)
+        assert!(t2v.capabilities.samplers.contains(&"unipc")); // legacy alias retained
 
         let i2v = descriptor_i2v_14b();
         assert!(i2v.capabilities.accepts(ConditioningKind::Reference));
@@ -708,10 +710,17 @@ mod tests {
             height: 256,
             guidance: Some(4.0),
             frames: Some(17),
-            sampler: Some("unipc".into()),
+            sampler: Some("uni_pc".into()),
             ..Default::default()
         };
         assert!(t2v.validate(&ok).is_ok());
+        // Legacy `unipc` spelling stays accepted (sc-7296 alias).
+        assert!(t2v
+            .validate(&GenerationRequest {
+                sampler: Some("unipc".into()),
+                ..ok.clone()
+            })
+            .is_ok());
         for bad in [
             // empty prompt
             GenerationRequest::default(),
