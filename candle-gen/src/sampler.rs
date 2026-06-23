@@ -141,7 +141,7 @@ pub fn run_curated_sampler(
     };
 
     sampler
-        .sample(&ops, &mut denoise_fn, latents, sigmas, seed)
+        .sample(&ops, ms, &mut denoise_fn, latents, sigmas, seed)
         .map_err(CandleError::from)
 }
 
@@ -372,7 +372,7 @@ pub fn run_av_curated_sampler(
     };
 
     sampler
-        .sample(&ops, &mut denoise_fn, latents, sigmas, seed)
+        .sample(&ops, &ms, &mut denoise_fn, latents, sigmas, seed)
         .map_err(CandleError::from)
 }
 
@@ -454,7 +454,7 @@ mod tests {
         let x_init = t(&[0.3, -1.1, 2.0, 0.05]);
         let mut dn = |x: &Tensor, s: f32| denoise(&ops, &ms, x, s, |_xin, _t| Ok(v.clone()));
         let out = Euler
-            .sample(&ops, &mut dn, x_init.clone(), &sigmas, 0)
+            .sample(&ops, &ms, &mut dn, x_init.clone(), &sigmas, 0)
             .unwrap();
         let want = x_init
             .sub(&v.affine(sigmas[0] as f64, 0.0).unwrap())
@@ -484,7 +484,7 @@ mod tests {
             let mut dn =
                 |x: &Tensor, s: f32| denoise(&ops, &ms, x, s, |xin, _t| ge(xin.affine(0.25, 0.1)));
             let out = sampler
-                .sample(&ops, &mut dn, x_init.clone(), &sigmas, 7)
+                .sample(&ops, &ms, &mut dn, x_init.clone(), &sigmas, 7)
                 .unwrap();
             assert!(
                 vec1(&out).iter().all(|v| v.is_finite()),

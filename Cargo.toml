@@ -162,7 +162,17 @@ resolver = "2"
 # for the sc-7432 worker integration (which threads the candle `sampler`/`scheduler` fields #130 added to
 # `KolorsControlRequest` / `IpAdapterKolorsRequest` / `PulidFluxRequest` / `InstantIdRequest`). The 17
 # per-crate + `sceneworks-gen-core-testkit` dev-deps are bumped in lockstep. mlx-rs unchanged 44929a0.
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "04aa4aa1f498f00a854f6a34ae5978f929fc163a" }
+# Bumped `04aa4aa` -> `a986025` (sc-7491, epic 7114): a REAL gen-core change this time, not a rev-align.
+# gen-core gains `ModelSampling::noise_scaling_coeffs` (default VE `x0 + σ·noise`; FLOW overrides to the
+# convex blend `σ·noise + (1−σ)·x0`, mirroring ComfyUI `noise_scaling`) and threads `ms` into
+# `Sampler::sample` so the `lcm` consistency solver re-noises in the model's convention — fixing the flow
+# `lcm` blur (Boogu Turbo on mlx, and the whole flow cohort). Non-flow `lcm` is byte-unchanged; no engine
+# defaults to `lcm`, so no N1-default regression. candle mirrors the 4 `ms`-threaded `.sample` call sites
+# in `candle-gen/src/sampler.rs`; the `noise_scaling_coeffs` fix is inherited from gen-core, so
+# `CandleLatentOps` needs no new method. PROVISIONAL pin: `a986025` is the HEAD of mlx-gen PR #541 (green,
+# not yet merged; `a986025 = 04aa4aa + the gen-core change`). Re-pin to #541's MERGE rev when it lands so
+# the worker `--features backend-candle` skew gate resolves one gen-core rev (worker lockstep, sc-7491).
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "a986025f9fb8742bd39704885bc30fde31e594d2" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels
