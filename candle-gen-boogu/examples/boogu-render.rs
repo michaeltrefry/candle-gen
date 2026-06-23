@@ -2,7 +2,7 @@
 //! image from a prompt, write a PNG.
 //!
 //! ```text
-//! cargo run -p candle-gen-boogu --example render --features cuda --release -- \
+//! cargo run -p candle-gen-boogu --example boogu-render --features cuda --release -- \
 //!   boogu_image D:\models\Boogu-Image-0.1-Base "a red apple on a wooden table" 1024 1024 0 42 out.png
 //! ```
 //! Arg order: <model_id> <snapshot_dir> <prompt> [width] [height] [steps(0=default)] [seed] [out.png]

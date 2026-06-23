@@ -1,7 +1,7 @@
 //! GPU validation harness for the candle Ideogram 4 provider (sc-6596). Loads a bf16 snapshot (see
 //! `convert_fp8`), renders one image via the registered generator, and writes a PNG.
 //!
-//!   cargo run -p candle-gen-ideogram --example render --features cuda -- \
+//!   cargo run -p candle-gen-ideogram --example ideogram-render --features cuda -- \
 //!       ideogram_4 /d/ideogram-4-bf16 "a neon city skyline at dusk" 1024 1024 0 42 out.png
 //!
 //! Args: <model_id> <snapshot_dir> <prompt> [width=1024] [height=1024] [steps=0→default] [seed=42]
