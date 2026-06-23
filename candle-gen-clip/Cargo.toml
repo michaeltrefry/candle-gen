@@ -1,0 +1,36 @@
+[package]
+name = "candle-gen-clip"
+version = "0.0.0"
+edition = "2021"
+description = "CLIP ViT-L/14 image-embedding provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-clip (Dataset Doctor, sc-6535)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "clip", "embedding", "inference"]
+categories = ["science"]
+
+[dependencies]
+# Core crate — re-exports gen_core + candle, so this provider links exactly one gen-core / candle
+# build (single resolution; see scripts/check-gen-core-skew.sh).
+candle-gen = { path = "../candle-gen" }
+# Reuse the CLIP ViT-L/14 vision tower + preprocessing (same crate-reuse pattern mlx-gen-clip uses
+# with mlx-gen-sdxl, and candle-gen-flux's IP image encoder uses here; no dependency cycle). The
+# 1024→768 `visual_projection` head is the only piece local to this crate — it mirrors the head in
+# `candle-gen-flux::ip_image_encoder::FluxIpImageEncoder`, lifted here behind the neutral contract.
+candle-gen-sdxl = { path = "../candle-gen-sdxl" }
+# Direct candle deps for the local pooling + projection head (LayerNorm / Linear / class-token index).
+# Same workspace pin candle-gen uses → one candle build (no skew).
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+tokenizers = { workspace = true }
+# Link-time self-registration into gen-core's image-embedder registry (the `inventory::submit!` below).
+inventory = { workspace = true }
+
+[features]
+# Pass the backend selection through to the core + sdxl crates so a downstream `--features cuda`/`metal`
+# on this crate selects the matching candle backend everywhere (the embedder runs f32, but the device
+# follows the build so the worker's dataset-analysis job keeps one device).
+default = []
+metal = ["candle-gen/metal", "candle-gen-sdxl/metal", "candle-transformers/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-sdxl/cuda", "candle-transformers/cuda"]
+flash-attn = ["candle-gen/flash-attn", "candle-gen-sdxl/flash-attn", "candle-transformers/flash-attn"]
