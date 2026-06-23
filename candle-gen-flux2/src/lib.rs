@@ -35,6 +35,7 @@
 //! needs the packed path). `backend = "candle"`, `mac_only = false`.
 
 pub mod config;
+pub mod convert;
 pub mod edit_provider;
 pub mod pipeline;
 pub mod pos_embed;
@@ -43,6 +44,7 @@ pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
 
+pub use convert::convert_and_assemble;
 pub use edit_provider::{Flux2Edit, Flux2EditPaths, Flux2EditRequest};
 
 use std::path::{Path, PathBuf};
