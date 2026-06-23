@@ -38,6 +38,7 @@ pub mod config;
 pub mod edit_provider;
 pub mod pipeline;
 pub mod pos_embed;
+pub mod quant;
 pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
@@ -84,10 +85,18 @@ pub(crate) struct Pipeline {
     pub(crate) root: PathBuf,
     pub(crate) device: Device,
     pub(crate) dtype: DType,
+    /// When `Some`, the quantizable components (TE + DiT) are staged dense in CPU RAM and quantized
+    /// onto `device` (the dev 32B path; klein leaves this `None`).
+    pub(crate) quant: Option<Quant>,
 }
 
 impl Pipeline {
-    pub(crate) fn load(variant: Flux2Variant, root: &Path, device: &Device) -> Self {
+    pub(crate) fn load(
+        variant: Flux2Variant,
+        quant: Option<Quant>,
+        root: &Path,
+        device: &Device,
+    ) -> Self {
         Self {
             variant,
             cfg: variant.config(),
@@ -96,15 +105,26 @@ impl Pipeline {
             // FLUX.2 runs the reference math in f32 (the TE + the MMDiT). The weights are large but
             // the math is parity-sensitive; a bf16 pass is a follow-up optimization.
             dtype: DType::F32,
+            quant,
         }
     }
 
-    /// mmap a VarBuilder over every `.safetensors` in the snapshot subdir `sub`.
+    /// mmap a VarBuilder over every `.safetensors` in the snapshot subdir `sub`, on `self.device`.
     pub(crate) fn component_vb(&self, sub: &str) -> CResult<VarBuilder<'static>> {
+        self.component_vb_on(sub, &self.device)
+    }
+
+    /// [`Self::component_vb`] but on an explicit `device` — the quant path stages the TE + DiT on the
+    /// CPU (system RAM) before quantizing onto the GPU, so the dense 32B never lands on the GPU.
+    pub(crate) fn component_vb_on(
+        &self,
+        sub: &str,
+        device: &Device,
+    ) -> CResult<VarBuilder<'static>> {
         let dir = self.root.join(sub);
         if !dir.is_dir() {
             return Err(CandleError::Msg(format!(
-                "flux2 snapshot is missing the {sub}/ component dir (expected a FLUX.2-klein \
+                "flux2 snapshot is missing the {sub}/ component dir (expected a FLUX.2 \
                  diffusers snapshot at {})",
                 self.root.display()
             )));
@@ -122,13 +142,31 @@ impl Pipeline {
             )));
         }
         // SAFETY: mmap of read-only weight files; standard candle loading path.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, self.dtype, &self.device)? };
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, self.dtype, device)? };
         Ok(vb)
     }
 
     fn load_components(&self) -> CResult<Components> {
-        let te = Qwen3TextEncoder::new(&self.cfg, self.component_vb("text_encoder")?)?;
-        let transformer = Flux2Transformer::new(&self.cfg, self.component_vb("transformer")?)?;
+        let (te, transformer) = match self.quant {
+            // Quant path (dev 32B): stage the TE + DiT dense in CPU RAM (~105 GB; the box has 512),
+            // then quantize each projection onto the GPU and move the small dense leaves there too —
+            // the dense weights never land on the GPU. The VAE is small and loads directly on-device.
+            Some(q) => {
+                let cpu = Device::Cpu;
+                let mut te =
+                    Qwen3TextEncoder::new(&self.cfg, self.component_vb_on("text_encoder", &cpu)?)?;
+                te.quantize(q, &self.device)?;
+                let mut transformer =
+                    Flux2Transformer::new(&self.cfg, self.component_vb_on("transformer", &cpu)?)?;
+                transformer.quantize(q, &self.device)?;
+                (te, transformer)
+            }
+            // Dense path (klein, and dev on a fixture small enough to fit): load on-device directly.
+            None => (
+                Qwen3TextEncoder::new(&self.cfg, self.component_vb("text_encoder")?)?,
+                Flux2Transformer::new(&self.cfg, self.component_vb("transformer")?)?,
+            ),
+        };
         let vae = Flux2Vae::new(self.component_vb("vae")?)?;
         Ok(Components {
             te: Arc::new(te),
@@ -183,6 +221,7 @@ impl Pipeline {
 
         // Prompt embeds are seed-independent: encode once.
         let prompt_embeds = self.encode(&comps.te, &req.prompt)?;
+        dbg_stats("prompt_embeds", &prompt_embeds);
         // Two guidance regimes. dev is guidance-distilled: a single forward feeds the guidance scalar
         // to the DiT's embedded-guidance embedder (no negative pass). klein is distilled / true-CFG:
         // a classifier-free negative pass only when guidance > 1 (it runs CFG-free at 1.0).
@@ -216,6 +255,7 @@ impl Pipeline {
             // The driver does cancel + progress + the euler/curated integrator step. The forward (and the
             // guidance>1 CFG blend) lives inside `predict` so a multi-eval solver re-runs it. FLUX.2 uses
             // the Sigma convention but the model embeds σ×1000, so feed `sigma * 1000.0` to the transformer.
+            let mut dbg_first = true;
             let latents = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::Sigma,
@@ -226,44 +266,82 @@ impl Pipeline {
                 on_progress,
                 |latents, sigma| -> CResult<Tensor> {
                     let ts = sigma * 1000.0;
-                    if embedded_guidance {
+                    let out = if embedded_guidance {
                         // dev: single forward feeding the embedded guidance scalar to the DiT.
-                        return Ok(comps.transformer.forward(
+                        comps.transformer.forward(
                             latents,
                             &prompt_embeds,
                             &img_ids,
                             &txt_ids,
                             ts,
                             Some(guidance),
-                        )?);
-                    }
-                    let v = comps.transformer.forward(
-                        latents,
-                        &prompt_embeds,
-                        &img_ids,
-                        &txt_ids,
-                        ts,
-                        None,
-                    )?;
-                    match &negative {
-                        Some(neg) => {
-                            let vn = comps
-                                .transformer
-                                .forward(latents, neg, &img_ids, &txt_ids, ts, None)?;
-                            // vn + guidance·(v − vn)
-                            Ok((&vn + ((&v - &vn)? * guidance as f64)?)?)
+                        )?
+                    } else {
+                        let v = comps.transformer.forward(
+                            latents,
+                            &prompt_embeds,
+                            &img_ids,
+                            &txt_ids,
+                            ts,
+                            None,
+                        )?;
+                        match &negative {
+                            Some(neg) => {
+                                let vn = comps
+                                    .transformer
+                                    .forward(latents, neg, &img_ids, &txt_ids, ts, None)?;
+                                // vn + guidance·(v − vn)
+                                (&vn + ((&v - &vn)? * guidance as f64)?)?
+                            }
+                            None => v,
                         }
-                        None => Ok(v),
+                    };
+                    if dbg_first {
+                        dbg_stats("latents_in@step0", latents);
+                        dbg_stats("velocity@step0", &out);
+                        dbg_first = false;
                     }
+                    Ok(out)
                 },
             )?;
+            dbg_stats("final_latents", &latents);
 
             on_progress(Progress::Decoding);
             let packed = pipeline::unpack_latents(&latents, req.width, req.height)?;
             let decoded = comps.vae.decode_packed(&packed)?; // [1,3,H,W] in [-1,1]
+            dbg_stats("decoded", &decoded);
             images.push(to_image(&decoded)?);
         }
         Ok(images)
+    }
+}
+
+/// Debug probe (sc-7457 dev-quant black-image hunt): print tensor stats to stderr when `FLUX2_DEBUG`
+/// is set. Localizes the first non-finite / degenerate stage without changing normal-run behavior.
+pub(crate) fn dbg_stats(name: &str, t: &Tensor) {
+    if std::env::var_os("FLUX2_DEBUG").is_none() {
+        return;
+    }
+    let dims = t.dims().to_vec();
+    let r = (|| -> CResult<(f32, f32, f64, bool)> {
+        let v = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let (mut mn, mut mx, mut s, mut bad) = (f32::INFINITY, f32::NEG_INFINITY, 0f64, false);
+        for &x in &v {
+            if x.is_finite() {
+                mn = mn.min(x);
+                mx = mx.max(x);
+            } else {
+                bad = true;
+            }
+            s += x as f64;
+        }
+        Ok((mn, mx, s / v.len().max(1) as f64, bad))
+    })();
+    match r {
+        Ok((mn, mx, me, bad)) => eprintln!(
+            "[dbg] {name} shape={dims:?} min={mn:.4} max={mx:.4} mean={me:.4} nonfinite={bad}"
+        ),
+        Err(e) => eprintln!("[dbg] {name}: stats err {e}"),
     }
 }
 
@@ -290,6 +368,8 @@ pub struct Flux2Generator {
     descriptor: ModelDescriptor,
     root: PathBuf,
     device: Device,
+    /// `Some` ⇒ CPU-stage → quantize-onto-GPU at load (dev Q4/Q8); `None` ⇒ dense.
+    quant: Option<Quant>,
     components: Mutex<Option<Components>>,
 }
 
@@ -341,7 +421,7 @@ impl Generator for Flux2Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let pipe = Pipeline::load(self.variant, &self.root, &self.device);
+        let pipe = Pipeline::load(self.variant, self.quant, &self.root, &self.device);
         let components = self.components(&pipe)?;
         let images = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Images(images))
@@ -379,10 +459,13 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             max_size: 2048,
             max_count: 8,
             mac_only: false,
-            // dev's deployment is a Q4 pre-quantized snapshot (assembled by an install-time convert
-            // job, detected via the on-disk `quantization` manifest), NOT on-the-fly `spec.quantize`;
-            // the packed loader is the epic 6564 story-1 follow-on, so advertise no quant levels yet.
-            supported_quants: &[] as &[Quant],
+            // dev quantizes (CPU-stage → quantize-onto-GPU) to fit the 32B under the memory ceiling;
+            // klein is small and runs dense.
+            supported_quants: if variant.is_dev() {
+                &[Quant::Q4, Quant::Q8]
+            } else {
+                &[] as &[Quant]
+            },
             supports_kv_cache: false,
             // FLUX.2 uses the empirical-mu shifted flow-match schedule.
             requires_sigma_shift: true,
@@ -403,10 +486,10 @@ pub fn descriptor_dev() -> ModelDescriptor {
 /// Construct a lazy candle FLUX.2 generator for `variant`. `spec.weights` must be a
 /// [`WeightsSource::Dir`] pointing at a diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`,
 /// `tokenizer/`) — klein at `black-forest-labs/FLUX.2-klein-9B`, dev at `black-forest-labs/FLUX.2-dev`
-/// (whose `text_encoder/` is the Mistral3 checkpoint). Adapters / on-the-fly quantization / control
-/// overlays are rejected (not wired). A dev snapshot pre-quantized to Q4 (the `quantization` manifest,
-/// epic 6564 story-1 follow-on) is detected at load time; until that lands, dev loads dense (which
-/// fits only a small model / fixture — the full 32B needs the packed loader).
+/// (whose `text_encoder/` is the Mistral3 checkpoint). Adapters / control overlays are rejected (not
+/// wired). `spec.quantize` (Q4/Q8) is honored for **dev** — the 32B is staged dense in CPU RAM and
+/// quantized onto the GPU at load (it does not fit the GPU dense); for **klein** quantization is not
+/// wired and is rejected. dev without quant loads dense (fixture-only — the full 32B needs the quant).
 fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let id = variant.id();
     let root = match &spec.weights {
@@ -423,11 +506,16 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<
             "candle {id} does not support LoRA/LoKr yet"
         )));
     }
-    if spec.quantize.is_some() {
+    // dev honors Q4/Q8 (CPU-stage → quantize-onto-GPU); klein has no candle quant path yet.
+    let quant = if variant.is_dev() {
+        spec.quantize
+    } else if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {id} does not support on-the-fly Q4/Q8 quantization yet"
         )));
-    }
+    } else {
+        None
+    };
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {id} does not support control / IP-adapter / edit yet (txt2img only)"
@@ -439,6 +527,7 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<
         descriptor: descriptor(variant),
         root,
         device,
+        quant,
         components: Mutex::new(None),
     }))
 }
@@ -514,6 +603,9 @@ mod tests {
         assert!(!d.capabilities.mac_only);
         assert!(d.capabilities.conditioning.is_empty());
         assert!(d.capabilities.requires_sigma_shift);
+        // dev advertises Q4/Q8 (CPU-stage → quantize-onto-GPU); klein advertises none.
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert!(descriptor_klein().capabilities.supported_quants.is_empty());
     }
 
     #[test]
@@ -557,13 +649,16 @@ mod tests {
             load_klein(&quant).err().expect("err"),
             gen_core::Error::Unsupported(_)
         ));
-        // dev rejects the same unwired surfaces (on-the-fly quant in particular — its quant path is
-        // the pre-quantized snapshot manifest, not `spec.quantize`).
-        let dev_quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q4);
+        // klein has no candle quant path — on-the-fly quant is rejected.
+        let klein_quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q4);
         assert!(matches!(
-            load_dev(&dev_quant).err().expect("err"),
+            load_klein(&klein_quant).err().expect("err"),
             gen_core::Error::Unsupported(_)
         ));
+        // dev DOES accept Q4/Q8 (CPU-stage → quantize-onto-GPU); the generator builds lazily, so this
+        // succeeds without touching the (nonexistent) weights.
+        let dev_quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q4);
+        assert!(load_dev(&dev_quant).is_ok());
     }
 
     #[test]

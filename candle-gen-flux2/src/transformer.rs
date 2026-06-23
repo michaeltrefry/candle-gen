@@ -12,12 +12,12 @@
 //! sigma `σ·1000`** and the velocity is applied with a negative `dt` (no negation, in the pipeline).
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
-use candle_gen::candle_nn::{
-    linear_no_bias, ops::softmax_last_dim, rms_norm, Linear, Module, RmsNorm, VarBuilder,
-};
+use candle_gen::candle_nn::{ops::softmax_last_dim, rms_norm, Module, RmsNorm, VarBuilder};
+use candle_gen::gen_core::Quant;
 
 use crate::config::Flux2Config;
 use crate::pos_embed::Flux2PosEmbed;
+use crate::quant::{rms_norm_to, QLinear};
 
 const LN_EPS: f64 = 1e-6;
 const RMS_EPS: f64 = 1e-5;
@@ -141,8 +141,8 @@ fn to_heads(x: &Tensor, heads: usize, head_dim: usize, norm: Option<&RmsNorm>) -
 /// A sinusoidal-scalar embedding MLP: `timestep_embedding → linear_1 → silu → linear_2` → `[1, inner]`.
 /// Shared by the timestep and (dev) guidance branches of `time_guidance_embed`.
 struct SinEmbed {
-    linear_1: Linear,
-    linear_2: Linear,
+    linear_1: QLinear,
+    linear_2: QLinear,
     channels: usize,
 }
 
@@ -150,8 +150,8 @@ impl SinEmbed {
     fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
         let inner = cfg.inner_dim();
         Ok(Self {
-            linear_1: linear_no_bias(cfg.timestep_channels, inner, vb.pp("linear_1"))?,
-            linear_2: linear_no_bias(inner, inner, vb.pp("linear_2"))?,
+            linear_1: QLinear::linear_no_bias(cfg.timestep_channels, inner, vb.pp("linear_1"))?,
+            linear_2: QLinear::linear_no_bias(inner, inner, vb.pp("linear_2"))?,
             channels: cfg.timestep_channels,
         })
     }
@@ -160,6 +160,11 @@ impl SinEmbed {
         let emb = timestep_embedding(scalar, self.channels, device)?;
         let h = self.linear_1.forward(&emb)?.silu()?;
         self.linear_2.forward(&h)
+    }
+
+    fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.linear_1.quantize_onto(quant, device)?;
+        self.linear_2.quantize_onto(quant, device)
     }
 }
 
@@ -195,12 +200,20 @@ impl TimeGuidanceEmbed {
         }
         Ok(temb)
     }
+
+    fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.timestep.quantize_onto(quant, device)?;
+        if let Some(g) = self.guidance.as_mut() {
+            g.quantize_onto(quant, device)?;
+        }
+        Ok(())
+    }
 }
 
 /// Global modulation: `silu(temb) → linear → split 3·sets` → `sets × (shift, scale, gate)` (each
 /// `[B,1,inner]`).
 struct Modulation {
-    linear: Linear,
+    linear: QLinear,
     sets: usize,
 }
 
@@ -208,9 +221,13 @@ impl Modulation {
     fn new(cfg: &Flux2Config, sets: usize, vb: VarBuilder) -> Result<Self> {
         let inner = cfg.inner_dim();
         Ok(Self {
-            linear: linear_no_bias(inner, 3 * sets * inner, vb.pp("linear"))?,
+            linear: QLinear::linear_no_bias(inner, 3 * sets * inner, vb.pp("linear"))?,
             sets,
         })
+    }
+
+    fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.linear.quantize_onto(quant, device)
     }
 
     fn forward(&self, temb: &Tensor) -> Result<Vec<(Tensor, Tensor, Tensor)>> {
@@ -231,16 +248,16 @@ impl Modulation {
 /// Joint attention for a double block: separate img/txt q/k/v with per-head q/k RMSNorm, attention
 /// over the concatenated `[txt, img]` sequence with interleaved RoPE, split back.
 struct DoubleAttention {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
-    to_out: Linear,
+    to_q: QLinear,
+    to_k: QLinear,
+    to_v: QLinear,
+    to_out: QLinear,
     norm_q: RmsNorm,
     norm_k: RmsNorm,
-    add_q: Linear,
-    add_k: Linear,
-    add_v: Linear,
-    to_add_out: Linear,
+    add_q: QLinear,
+    add_k: QLinear,
+    add_v: QLinear,
+    to_add_out: QLinear,
     norm_added_q: RmsNorm,
     norm_added_k: RmsNorm,
     heads: usize,
@@ -252,21 +269,41 @@ impl DoubleAttention {
         let inner = cfg.inner_dim();
         let hd = cfg.head_dim;
         Ok(Self {
-            to_q: linear_no_bias(inner, inner, vb.pp("to_q"))?,
-            to_k: linear_no_bias(inner, inner, vb.pp("to_k"))?,
-            to_v: linear_no_bias(inner, inner, vb.pp("to_v"))?,
-            to_out: linear_no_bias(inner, inner, vb.pp("to_out").pp("0"))?,
+            to_q: QLinear::linear_no_bias(inner, inner, vb.pp("to_q"))?,
+            to_k: QLinear::linear_no_bias(inner, inner, vb.pp("to_k"))?,
+            to_v: QLinear::linear_no_bias(inner, inner, vb.pp("to_v"))?,
+            to_out: QLinear::linear_no_bias(inner, inner, vb.pp("to_out").pp("0"))?,
             norm_q: rms_norm(hd, RMS_EPS, vb.pp("norm_q"))?,
             norm_k: rms_norm(hd, RMS_EPS, vb.pp("norm_k"))?,
-            add_q: linear_no_bias(inner, inner, vb.pp("add_q_proj"))?,
-            add_k: linear_no_bias(inner, inner, vb.pp("add_k_proj"))?,
-            add_v: linear_no_bias(inner, inner, vb.pp("add_v_proj"))?,
-            to_add_out: linear_no_bias(inner, inner, vb.pp("to_add_out"))?,
+            add_q: QLinear::linear_no_bias(inner, inner, vb.pp("add_q_proj"))?,
+            add_k: QLinear::linear_no_bias(inner, inner, vb.pp("add_k_proj"))?,
+            add_v: QLinear::linear_no_bias(inner, inner, vb.pp("add_v_proj"))?,
+            to_add_out: QLinear::linear_no_bias(inner, inner, vb.pp("to_add_out"))?,
             norm_added_q: rms_norm(hd, RMS_EPS, vb.pp("norm_added_q"))?,
             norm_added_k: rms_norm(hd, RMS_EPS, vb.pp("norm_added_k"))?,
             heads: cfg.num_heads,
             head_dim: hd,
         })
+    }
+
+    fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        for l in [
+            &mut self.to_q,
+            &mut self.to_k,
+            &mut self.to_v,
+            &mut self.to_out,
+            &mut self.add_q,
+            &mut self.add_k,
+            &mut self.add_v,
+            &mut self.to_add_out,
+        ] {
+            l.quantize_onto(quant, device)?;
+        }
+        self.norm_q = rms_norm_to(&self.norm_q, RMS_EPS, device)?;
+        self.norm_k = rms_norm_to(&self.norm_k, RMS_EPS, device)?;
+        self.norm_added_q = rms_norm_to(&self.norm_added_q, RMS_EPS, device)?;
+        self.norm_added_k = rms_norm_to(&self.norm_added_k, RMS_EPS, device)?;
+        Ok(())
     }
 
     /// `norm_img` / `norm_txt`: the modulated, normed streams. Returns `(img_out, txt_out)`.
@@ -317,16 +354,21 @@ impl DoubleAttention {
 
 /// SwiGLU feed-forward: `linear_in → swiglu → linear_out`.
 struct FeedForward {
-    linear_in: Linear,
-    linear_out: Linear,
+    linear_in: QLinear,
+    linear_out: QLinear,
 }
 
 impl FeedForward {
     fn new(in_dim: usize, hidden: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            linear_in: linear_no_bias(in_dim, 2 * hidden, vb.pp("linear_in"))?,
-            linear_out: linear_no_bias(hidden, in_dim, vb.pp("linear_out"))?,
+            linear_in: QLinear::linear_no_bias(in_dim, 2 * hidden, vb.pp("linear_in"))?,
+            linear_out: QLinear::linear_no_bias(hidden, in_dim, vb.pp("linear_out"))?,
         })
+    }
+
+    fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.linear_in.quantize_onto(quant, device)?;
+        self.linear_out.quantize_onto(quant, device)
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -350,6 +392,12 @@ impl DoubleBlock {
             ff: FeedForward::new(inner, ff_hidden, vb.pp("ff"))?,
             ff_context: FeedForward::new(inner, ff_hidden, vb.pp("ff_context"))?,
         })
+    }
+
+    fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.attn.quantize_onto(quant, device)?;
+        self.ff.quantize_onto(quant, device)?;
+        self.ff_context.quantize_onto(quant, device)
     }
 
     /// Returns `(txt, img)` (note order).
@@ -388,8 +436,8 @@ impl DoubleBlock {
 
 /// Single (fused parallel attention + SwiGLU) block: one projection produces q/k/v and the MLP input.
 struct SingleBlock {
-    to_qkv_mlp: Linear,
-    to_out: Linear,
+    to_qkv_mlp: QLinear,
+    to_out: QLinear,
     norm_q: RmsNorm,
     norm_k: RmsNorm,
     inner: usize,
@@ -405,14 +453,22 @@ impl SingleBlock {
         // The single block's projections nest under `attn.` in the diffusers checkpoint.
         let attn = vb.pp("attn");
         Ok(Self {
-            to_qkv_mlp: linear_no_bias(inner, proj_out, attn.pp("to_qkv_mlp_proj"))?,
-            to_out: linear_no_bias(inner + mlp_hidden, inner, attn.pp("to_out"))?,
+            to_qkv_mlp: QLinear::linear_no_bias(inner, proj_out, attn.pp("to_qkv_mlp_proj"))?,
+            to_out: QLinear::linear_no_bias(inner + mlp_hidden, inner, attn.pp("to_out"))?,
             norm_q: rms_norm(cfg.head_dim, RMS_EPS, attn.pp("norm_q"))?,
             norm_k: rms_norm(cfg.head_dim, RMS_EPS, attn.pp("norm_k"))?,
             inner,
             heads: cfg.num_heads,
             head_dim: cfg.head_dim,
         })
+    }
+
+    fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.to_qkv_mlp.quantize_onto(quant, device)?;
+        self.to_out.quantize_onto(quant, device)?;
+        self.norm_q = rms_norm_to(&self.norm_q, RMS_EPS, device)?;
+        self.norm_k = rms_norm_to(&self.norm_k, RMS_EPS, device)?;
+        Ok(())
     }
 
     fn forward(
@@ -448,15 +504,19 @@ impl SingleBlock {
 /// AdaLayerNorm-Continuous output head: `silu(temb) → linear → (scale, shift)`, then
 /// `(1+scale)·LN(x) + shift`.
 struct NormOut {
-    linear: Linear,
+    linear: QLinear,
 }
 
 impl NormOut {
     fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
         let inner = cfg.inner_dim();
         Ok(Self {
-            linear: linear_no_bias(inner, 2 * inner, vb.pp("linear"))?,
+            linear: QLinear::linear_no_bias(inner, 2 * inner, vb.pp("linear"))?,
         })
+    }
+
+    fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.linear.quantize_onto(quant, device)
     }
 
     fn forward(&self, x: &Tensor, temb: &Tensor) -> Result<Tensor> {
@@ -470,8 +530,8 @@ impl NormOut {
 
 /// The FLUX.2 MMDiT.
 pub struct Flux2Transformer {
-    x_embedder: Linear,
-    context_embedder: Linear,
+    x_embedder: QLinear,
+    context_embedder: QLinear,
     time_embed: TimeGuidanceEmbed,
     mod_img: Modulation,
     mod_txt: Modulation,
@@ -479,7 +539,7 @@ pub struct Flux2Transformer {
     double_blocks: Vec<DoubleBlock>,
     single_blocks: Vec<SingleBlock>,
     norm_out: NormOut,
-    proj_out: Linear,
+    proj_out: QLinear,
     pos_embed: Flux2PosEmbed,
     device: Device,
 }
@@ -499,8 +559,8 @@ impl Flux2Transformer {
             )?);
         }
         Ok(Self {
-            x_embedder: linear_no_bias(cfg.in_channels, inner, vb.pp("x_embedder"))?,
-            context_embedder: linear_no_bias(
+            x_embedder: QLinear::linear_no_bias(cfg.in_channels, inner, vb.pp("x_embedder"))?,
+            context_embedder: QLinear::linear_no_bias(
                 cfg.joint_attention_dim,
                 inner,
                 vb.pp("context_embedder"),
@@ -512,10 +572,34 @@ impl Flux2Transformer {
             double_blocks,
             single_blocks,
             norm_out: NormOut::new(cfg, vb.pp("norm_out"))?,
-            proj_out: linear_no_bias(inner, cfg.out_channels, vb.pp("proj_out"))?,
+            proj_out: QLinear::linear_no_bias(inner, cfg.out_channels, vb.pp("proj_out"))?,
             pos_embed: Flux2PosEmbed::new(cfg),
             device: vb.device().clone(),
         })
+    }
+
+    /// Fold every projection to `Q4_0`/`Q8_0` **onto `device`** and carry the full-precision norms
+    /// there too (CPU-staged dev quant path, sc-7457). Call after building the dense transformer on
+    /// the CPU; afterwards the transformer's compute device is `device` (the GPU). Idempotent per
+    /// `QLinear`. The affine-free LayerNorms hold no weights, and `pos_embed` builds its RoPE tables on
+    /// `self.device` at forward time, so updating `self.device` is enough to move them.
+    pub fn quantize(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.x_embedder.quantize_onto(quant, device)?;
+        self.context_embedder.quantize_onto(quant, device)?;
+        self.time_embed.quantize_onto(quant, device)?;
+        self.mod_img.quantize_onto(quant, device)?;
+        self.mod_txt.quantize_onto(quant, device)?;
+        self.mod_single.quantize_onto(quant, device)?;
+        for b in &mut self.double_blocks {
+            b.quantize_onto(quant, device)?;
+        }
+        for b in &mut self.single_blocks {
+            b.quantize_onto(quant, device)?;
+        }
+        self.norm_out.quantize_onto(quant, device)?;
+        self.proj_out.quantize_onto(quant, device)?;
+        self.device = device.clone();
+        Ok(())
     }
 
     /// Predict velocity. `hidden_states` `[B, seq_img, 128]`, `encoder_hidden_states`

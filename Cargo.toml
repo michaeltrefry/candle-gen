@@ -1,5 +1,5 @@
 [workspace]
-members = ["candle-gen", "candle-gen-sdxl", "candle-gen-z-image", "candle-gen-flux", "candle-gen-flux2", "candle-gen-qwen-image", "candle-gen-wan", "candle-gen-scail2", "candle-gen-ltx", "candle-gen-svd", "candle-gen-joycaption", "candle-gen-lens", "candle-gen-chroma", "candle-gen-prompt-refine", "candle-gen-kolors", "candle-gen-sensenova", "candle-gen-face", "candle-gen-instantid", "candle-gen-seedvr2", "candle-gen-pulid", "candle-gen-sam3", "candle-gen-ideogram", "candle-gen-clip"]
+members = ["candle-gen", "candle-gen-sdxl", "candle-gen-z-image", "candle-gen-flux", "candle-gen-flux2", "candle-gen-qwen-image", "candle-gen-wan", "candle-gen-scail2", "candle-gen-ltx", "candle-gen-svd", "candle-gen-joycaption", "candle-gen-lens", "candle-gen-chroma", "candle-gen-prompt-refine", "candle-gen-kolors", "candle-gen-sensenova", "candle-gen-face", "candle-gen-instantid", "candle-gen-seedvr2", "candle-gen-pulid", "candle-gen-sam3", "candle-gen-ideogram", "candle-gen-boogu", "candle-gen-clip"]
 resolver = "2"
 
 # Single source of truth for the deps shared across the workspace (mirrors mlx-gen's F-151). The
@@ -204,3 +204,18 @@ thiserror = "2"
 # adapter merge reads `lora_alpha`/`r` (+ per-module `alpha_pattern`/`rank_pattern`) out of it when a
 # file carries no per-target `.alpha` tensor. Already in the lock via `safetensors`; surfaced direct.
 serde_json = "1"
+
+# sc-7544 (epic 6564): multi-arch fatbin for candle's CUDA *quantized* kernels on Blackwell.
+# candle-kernels compiles its GGUF `QMatMul`/MoE kernels into a static `libmoe.a` via `nvcc -c`
+# (SASS object, NOT `--ptx`). cudaforge emits ONE `-gencode` from `CUDA_COMPUTE_CAP`, so the cap=80
+# packaging baseline embeds only an sm_80 cubin — which cannot load on Blackwell sm_120, where every
+# Q4/Q8 matmul then silently returns zeros (dense PTX kernels JIT up fine; this is why dense models
+# render but quantized models came out black). cudaforge has no multi-target/cap-list support and the
+# candle pin is upstream (huggingface/candle, not a fork), so the fix is a LOCAL fork of candle-kernels
+# (`vendor/candle-kernels`, identical to the pinned rev except for three `-gencode` lines in build.rs)
+# patched in here. It emits sm_80 + sm_90 + sm_120 SASS + compute_120 PTX — one binary that runs
+# natively Ampere → Ada → Hopper → Blackwell and JITs forward. The patch key is the candle git URL so
+# it overrides the candle-kernels that `candle-core` (above) pulls transitively from that source.
+# RE-VENDOR THIS WHEN THE candle PIN BUMPS — see vendor/candle-kernels/VENDORED.md.
+[patch."https://github.com/huggingface/candle"]
+candle-kernels = { path = "vendor/candle-kernels" }

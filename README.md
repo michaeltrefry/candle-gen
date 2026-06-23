@@ -166,30 +166,36 @@ need the separate `candle-flash-attn` crate, wired in a later slice on the Windo
 The goal is **one distributable CUDA worker that runs on every NVIDIA GPU we support, not just the
 build box's Blackwell** — the "central fat binary, like torch" model.
 
-### How portability actually works here: baseline PTX, not a fatbin
+### How portability works: PTX-JIT for dense kernels, a multi-arch fatbin for quantized kernels
 
-The spike (sc-3495) assumed candle compiles a multi-arch **SASS fatbin** at build time and that we
-would feed it a multi-cap list (`CUDA_COMPUTE_CAP=80;86;89;90;120`). **That is not how candle 0.10.2
-works**, and this was verified against the vendored sources:
+candle-kernels has **two** compile paths, and they need different portability treatments (verified
+against the vendored sources):
 
-- candle-kernels 0.10.2 builds via **cudaforge 0.1.5** `.build_ptx()` → `nvcc --ptx`, emitting **one
-  PTX (virtual ISA) per kernel**, embedded in the binary. No `.cubin`/fatbin is produced.
-- cudaforge parses `CUDA_COMPUTE_CAP` as a **single** value (`GpuArch::parse` runs `parse::<usize>()`
-  on the whole string). A `;`-separated list **fails to parse** — candle does not accept a cap list.
+- **Dense kernels** build via cudaforge `.build_ptx()` → `nvcc --ptx`, emitting one **`compute_80`
+  PTX** (virtual ISA) per kernel. The driver JIT-compiles that PTX to the runtime GPU's native SASS
+  at first load, so it runs on **every NVIDIA arch ≥ sm_80** — Ampere (sm_80/86) → Ada (sm_89) →
+  Hopper (sm_90) → Blackwell (sm_120) — from a single embedded PTX. (Tradeoff: it does not use
+  sm_90a/sm_120a arch-accelerated tensor features, and the first run is slower while the driver JITs;
+  the result caches per-GPU under `%APPDATA%\NVIDIA\ComputeCache`.)
+- **Quantized + MoE kernels** (`mmq_gguf/*`, `moe/*`, `mmvq_gguf` — the GGUF `QMatMul`) build via
+  cudaforge `.build_lib()` → `nvcc -c`: a **static `libmoe.a` of SASS, _not_ PTX**. cudaforge emits
+  one `-gencode` from `CUDA_COMPUTE_CAP` (`GpuArch::parse` runs `parse::<usize>()` on the whole
+  string, so a `;`-list does **not** parse — there is no multi-cap support). At the `=80` baseline the
+  archive held only an **sm_80 cubin**; SASS is not forward-compatible across major arches and there
+  is no PTX to JIT, so on **Blackwell sm_120 every quant matmul silently returned zeros** — dense
+  models rendered but quantized models came out black (**sc-7544**; the dense PTX path masked it).
 
-So portability comes from **PTX forward-compatibility** instead: we build at a **baseline virtual
-arch, `CUDA_COMPUTE_CAP=80`** (Ampere). The embedded `compute_80` PTX is **JIT-compiled by the
-driver** to the runtime GPU's native SASS at first load, so a **single binary runs on every NVIDIA
-arch ≥ sm_80** — Ampere (sm_80/86) → Ada (sm_89) → Hopper (sm_90) → Blackwell (sm_120). This is
-broader coverage than any fixed fatbin cap list, with no candle fork.
-
-Tradeoffs (acceptable for SDXL): `compute_80` PTX does **not** use sm_90a/sm_120a arch-accelerated
-tensor features, and **first run is slower** while the driver JIT-compiles the PTX. The driver caches
-the result per-GPU under `%APPDATA%\NVIDIA\ComputeCache`, so subsequent launches load cached SASS.
-
-> If we ever need true per-arch SASS (e.g. to use sm_90a/sm_120a features), the path is to **fork
-> candle-kernels' `build.rs`** to emit `-gencode` for a cap list (a real fatbin) — deliberately out
-> of scope here; baseline PTX is the lighter, more portable default.
+**The fix (sc-7544): a multi-arch fatbin for the quant path.** cudaforge can't emit a cap list and the
+candle pin is upstream (not a fork), so candle-kernels is **locally forked** in `vendor/candle-kernels`
+(identical to the pinned rev except three `-gencode` lines in `build.rs`) and patched in via the
+workspace `[patch]`. nvcc accumulates `-gencode` flags, so `libmoe.a` becomes a real fatbin embedding
+**sm_80 + sm_90 + sm_120 SASS + `compute_120` PTX** — one binary that runs natively Ampere → Ada →
+Hopper → Blackwell and JITs forward to newer archs. Keep `CUDA_COMPUTE_CAP=80` in the recipes (it
+seeds the sm_80 baseline for both paths). Verified on RTX PRO 6000 (sm_120): `cuobjdump --list-elf`
+shows sm_80/sm_90/sm_120 cubin per kernel, and `candle-gen`'s `cuda_quant_smoke` test has the Q4/Q8
+`QMatMul` matching the CPU reference (cos ≈ 1.0, vs cos ≈ 0 / all-zeros before). That smoke runs in
+the CUDA gate so the regression can't return silently. **Re-vendor on every candle pin bump** — see
+`vendor/candle-kernels/VENDORED.md`.
 
 ### Build
 

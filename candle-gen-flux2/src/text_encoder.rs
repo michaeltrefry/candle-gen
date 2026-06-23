@@ -15,11 +15,13 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::{
-    embedding, linear_no_bias, ops::softmax_last_dim, rms_norm, rotary_emb::rope, Embedding,
-    Linear, Module, RmsNorm, VarBuilder,
+    embedding, ops::softmax_last_dim, rms_norm, rotary_emb::rope, Embedding, Module, RmsNorm,
+    VarBuilder,
 };
+use candle_gen::gen_core::Quant;
 
 use crate::config::Flux2Config;
+use crate::quant::{rms_norm_to, QLinear};
 
 /// HF half-split RoPE table (θ over `head_dim`), built once for the max sequence length.
 struct Rotary {
@@ -53,19 +55,29 @@ impl Rotary {
         let k = rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q, k))
     }
+
+    /// Move the precomputed RoPE tables to `device` (CPU-staged dev quant path).
+    fn to_device(&self, device: &Device) -> Result<Self> {
+        Ok(Self {
+            cos: self.cos.to_device(device)?,
+            sin: self.sin.to_device(device)?,
+        })
+    }
 }
 
 struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: QLinear,
+    k_proj: QLinear,
+    v_proj: QLinear,
+    o_proj: QLinear,
     /// Per-head q/k RMSNorm over the head dim — `Some` for Qwen3 (klein), `None` for Mistral (dev).
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    /// RMSNorm eps, kept so the q/k norms can be rebuilt on the GPU by the CPU-staged quant path.
+    eps: f64,
 }
 
 impl Attention {
@@ -83,16 +95,31 @@ impl Attention {
             (None, None)
         };
         Ok(Self {
-            q_proj: linear_no_bias(h, nh * hd, vb.pp("q_proj"))?,
-            k_proj: linear_no_bias(h, nkv * hd, vb.pp("k_proj"))?,
-            v_proj: linear_no_bias(h, nkv * hd, vb.pp("v_proj"))?,
-            o_proj: linear_no_bias(nh * hd, h, vb.pp("o_proj"))?,
+            q_proj: QLinear::linear_no_bias(h, nh * hd, vb.pp("q_proj"))?,
+            k_proj: QLinear::linear_no_bias(h, nkv * hd, vb.pp("k_proj"))?,
+            v_proj: QLinear::linear_no_bias(h, nkv * hd, vb.pp("v_proj"))?,
+            o_proj: QLinear::linear_no_bias(nh * hd, h, vb.pp("o_proj"))?,
             q_norm,
             k_norm,
             n_heads: nh,
             n_kv_heads: nkv,
             head_dim: hd,
+            eps: cfg.te_rms_norm_eps,
         })
+    }
+
+    fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.q_proj.quantize_onto(quant, device)?;
+        self.k_proj.quantize_onto(quant, device)?;
+        self.v_proj.quantize_onto(quant, device)?;
+        self.o_proj.quantize_onto(quant, device)?;
+        if let Some(n) = &self.q_norm {
+            self.q_norm = Some(rms_norm_to(n, self.eps, device)?);
+        }
+        if let Some(n) = &self.k_norm {
+            self.k_norm = Some(rms_norm_to(n, self.eps, device)?);
+        }
+        Ok(())
     }
 
     fn forward(&self, x: &Tensor, rotary: &Rotary, mask: &Tensor) -> Result<Tensor> {
@@ -143,19 +170,25 @@ fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
 }
 
 struct Mlp {
-    gate: Linear,
-    up: Linear,
-    down: Linear,
+    gate: QLinear,
+    up: QLinear,
+    down: QLinear,
 }
 
 impl Mlp {
     fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
         let (h, i) = (cfg.te_hidden_size, cfg.te_intermediate_size);
         Ok(Self {
-            gate: linear_no_bias(h, i, vb.pp("gate_proj"))?,
-            up: linear_no_bias(h, i, vb.pp("up_proj"))?,
-            down: linear_no_bias(i, h, vb.pp("down_proj"))?,
+            gate: QLinear::linear_no_bias(h, i, vb.pp("gate_proj"))?,
+            up: QLinear::linear_no_bias(h, i, vb.pp("up_proj"))?,
+            down: QLinear::linear_no_bias(i, h, vb.pp("down_proj"))?,
         })
+    }
+
+    fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.gate.quantize_onto(quant, device)?;
+        self.up.quantize_onto(quant, device)?;
+        self.down.quantize_onto(quant, device)
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -170,6 +203,7 @@ struct DecoderLayer {
     post_ln: RmsNorm,
     attn: Attention,
     mlp: Mlp,
+    eps: f64,
 }
 
 impl DecoderLayer {
@@ -187,7 +221,16 @@ impl DecoderLayer {
             )?,
             attn: Attention::new(cfg, vb.pp("self_attn"))?,
             mlp: Mlp::new(cfg, vb.pp("mlp"))?,
+            eps: cfg.te_rms_norm_eps,
         })
+    }
+
+    fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.attn.quantize_onto(quant, device)?;
+        self.mlp.quantize_onto(quant, device)?;
+        self.input_ln = rms_norm_to(&self.input_ln, self.eps, device)?;
+        self.post_ln = rms_norm_to(&self.post_ln, self.eps, device)?;
+        Ok(())
     }
 
     fn forward(&self, x: &Tensor, rotary: &Rotary, mask: &Tensor) -> Result<Tensor> {
@@ -198,7 +241,7 @@ impl DecoderLayer {
     }
 }
 
-/// The FLUX.2 Qwen3 prompt-embeds encoder.
+/// The FLUX.2 decoder-LM prompt-embeds encoder (Qwen3 for klein, Mistral for dev).
 pub struct Qwen3TextEncoder {
     embed_tokens: Embedding,
     layers: Vec<DecoderLayer>,
@@ -238,6 +281,22 @@ impl Qwen3TextEncoder {
             out_layers: cfg.te_out_layers,
             max_run,
         })
+    }
+
+    /// Fold every projection to `Q4_0`/`Q8_0` **onto `device`** and carry the token embedding, RoPE
+    /// tables, and RMSNorms there too (CPU-staged dev quant path, sc-7457). Call after building the
+    /// dense encoder on the CPU; afterwards the encoder runs on `device`. The token embedding stays
+    /// full precision (a lookup, not a matmul) and is only moved to `device`.
+    pub fn quantize(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.embed_tokens = Embedding::new(
+            self.embed_tokens.embeddings().to_device(device)?,
+            self.embed_tokens.hidden_size(),
+        );
+        self.rotary = self.rotary.to_device(device)?;
+        for layer in &mut self.layers {
+            layer.quantize_onto(quant, device)?;
+        }
+        Ok(())
     }
 
     /// `input_ids` / `attention_mask`: `[B, S]` (ids u32, mask 1=real/0=pad). Returns `prompt_embeds`

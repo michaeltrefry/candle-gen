@@ -68,18 +68,22 @@ jobs:
   # v143 (MSVC 14.4x) Build Tools. GitHub-hosted runners have no GPU/CUDA, and their GPU larger-runners
   # are Tesla T4 (sm_75) — below our sm_80 baseline — so they cannot run this build either.
   #
-  # Packaging model (sc-3676): candle 0.10.2 compiles its kernels to **PTX**, not a SASS fatbin, and
-  # cudaforge reads CUDA_COMPUTE_CAP as a SINGLE value (a `;`-list does not parse). So portability is
-  # achieved with a **baseline virtual arch** — CUDA_COMPUTE_CAP=80 emits compute_80 PTX that the
-  # driver JIT-compiles to the runtime GPU's SASS (one binary runs on sm_80 Ampere → sm_120 Blackwell).
-  # Keep this in lockstep with README "Packaging", scripts/check-cuda.ps1 and scripts/package-cuda.ps1.
+  # Packaging model (sc-3676, sc-7544): CUDA_COMPUTE_CAP is a SINGLE value (cudaforge `GpuArch::parse`;
+  # a `;`-list does not parse), so portability comes from a **baseline virtual arch** =80. The DENSE
+  # kernels emit compute_80 PTX the driver JIT-compiles to the runtime GPU's SASS; the QUANTIZED + MoE
+  # kernels (`nvcc -c` into libmoe.a) ship a multi-arch fatbin — native sm_80/sm_90/sm_120 SASS +
+  # forward PTX, via vendor/candle-kernels — because a single-arch sm_80-only cubin silently no-ops the
+  # quant matmuls on Blackwell sm_120 (sc-7544). One binary still runs sm_80 Ampere → sm_120 Blackwell.
+  # The `cargo test` step runs candle-gen's `cuda_quant_smoke` regression guard. Keep this in lockstep
+  # with README "Packaging", scripts/check-cuda.ps1 and scripts/package-cuda.ps1.
   windows-cuda:
-    name: build + test (Windows / CUDA, baseline PTX sm_80)
+    name: build + test (Windows / CUDA, sm_80 baseline + quant fatbin)
     # Manual dispatch only — never auto-runs, so no runner is required for normal CI.
     if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, windows, cuda]
     env:
-      # Baseline virtual arch: compute_80 PTX, driver-JIT'd up to the runtime GPU. NOT a hardware pin.
+      # Baseline virtual arch =80: seeds dense compute_80 PTX (driver-JIT'd up) + the quant fatbin's
+      # sm_80 baseline (vendor/candle-kernels layers sm_90/sm_120 SASS on top). NOT a hardware pin.
       CUDA_COMPUTE_CAP: "80"
       # Toolchain locations on the runner. Override here (not in code) if the runner layout changes —
       # this keeps the build reproducible without a hand-set local shell.

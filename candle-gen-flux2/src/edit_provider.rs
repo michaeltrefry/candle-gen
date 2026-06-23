@@ -90,8 +90,8 @@ impl Flux2Edit {
     /// the txt2img load (f32 compute, parity-sensitive).
     pub fn load(paths: &Flux2EditPaths) -> Result<Self> {
         let device = candle_gen::default_device()?;
-        // The klein edit path loads the klein snapshot (dev edit is epic 6564 story 4).
-        let pipe = Pipeline::load(Flux2Variant::Klein9b, &paths.root, &device);
+        // The klein edit path loads the klein snapshot dense (dev edit is epic 6564 story 4).
+        let pipe = Pipeline::load(Flux2Variant::Klein9b, None, &paths.root, &device);
         let te = Qwen3TextEncoder::new(&pipe.cfg, pipe.component_vb("text_encoder")?)?;
         let transformer = Flux2Transformer::new(&pipe.cfg, pipe.component_vb("transformer")?)?;
         let vae = Flux2Vae::new_with_encoder(pipe.component_vb("vae")?)?;

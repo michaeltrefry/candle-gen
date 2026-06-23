@@ -4,13 +4,16 @@
   self-contained dist/ folder — the "fat binary, like torch" distribution model (sc-3676).
 
 .DESCRIPTION
-  candle 0.10.2 compiles its kernels to PTX (virtual ISA), not a SASS fatbin, and the worker is built
-  at the baseline virtual arch CUDA_COMPUTE_CAP=80 (see README "Packaging"). The driver JIT-compiles
-  that compute_80 PTX to the runtime GPU's SASS, so ONE binary runs on every NVIDIA arch >= sm_80
-  (Ampere -> Ada -> Hopper -> Blackwell). What the target machine still needs at runtime is the CUDA
-  runtime libraries (cudart/cublas/cublasLt/curand/nvrtc). Rather than require a CUDA Toolkit install
-  on every target, we copy the redistributable DLLs next to the binary (cudarc links them dynamically,
-  found via the exe's directory on the default DLL search path).
+  The worker is built at the baseline virtual arch CUDA_COMPUTE_CAP=80 (see README "Packaging"), and
+  ONE binary runs on every NVIDIA arch >= sm_80 (Ampere -> Ada -> Hopper -> Blackwell). candle's two
+  kernel families get there differently: the DENSE kernels embed `compute_80` PTX that the driver
+  JIT-compiles to the runtime GPU's SASS, while the QUANTIZED + MoE kernels (GGUF QMatMul) ship a
+  multi-arch fatbin with native sm_80/sm_90/sm_120 SASS + forward PTX (sc-7544, via vendor/candle-
+  kernels — a single-arch sm_80-only build silently no-ops the quant matmuls on Blackwell). What the
+  target machine still needs at runtime is the CUDA runtime libraries (cudart/cublas/cublasLt/curand/
+  nvrtc). Rather than require a CUDA Toolkit install on every target, we copy the redistributable DLLs
+  next to the binary (cudarc links them dynamically, found via the exe's directory on the default DLL
+  search path).
 
   This does NOT bundle the NVIDIA *driver* — the user must have a driver new enough for the CUDA 12.9
   runtime: Windows >= 576.02 (CUDA 12.9 GA). The driver is what JIT-compiles the PTX and provides
@@ -89,11 +92,13 @@ foreach ($pattern in $DllPatterns) {
 
 # Drop a RUNTIME.txt manifest documenting the driver floor next to the bundle.
 $manifest = @"
-candle-gen CUDA bundle (sc-3676)
-================================
-Binary built at baseline virtual arch CUDA_COMPUTE_CAP=80 (compute_80 PTX). The NVIDIA driver
-JIT-compiles this PTX to your GPU's native SASS at first load, so this single bundle runs on any
-NVIDIA GPU of compute capability 8.0 (Ampere) or newer, through 12.x (Blackwell).
+candle-gen CUDA bundle (sc-3676, sc-7544)
+=========================================
+Built at baseline virtual arch CUDA_COMPUTE_CAP=80, this single bundle runs on any NVIDIA GPU of
+compute capability 8.0 (Ampere) or newer, through 12.x (Blackwell). Dense kernels embed compute_80
+PTX that the NVIDIA driver JIT-compiles to your GPU's native SASS at first load; the quantized + MoE
+kernels ship a multi-arch fatbin with native sm_80/sm_90/sm_120 SASS + forward PTX (sc-7544), so Q4/Q8
+models run correctly on Blackwell sm_120 instead of silently producing black/NaN output.
 
 Requirements on the target machine:
   * NVIDIA GPU, compute capability >= 8.0 (Ampere / RTX 30-series or newer).
@@ -101,8 +106,9 @@ Requirements on the target machine:
 The CUDA runtime DLLs are bundled here; do NOT install a separate CUDA Toolkit. The driver is NOT
 bundled (it is not redistributable) — install/update it from nvidia.com if older than the above.
 
-First run is slower while the driver JIT-compiles + caches the PTX (per-GPU, under %APPDATA%\NVIDIA\
-ComputeCache). Subsequent runs load the cached SASS.
+First run is slower while the driver JIT-compiles + caches the dense PTX (per-GPU, under
+%APPDATA%\NVIDIA\ComputeCache). Subsequent runs load the cached SASS. The quant kernels' native cubin
+is used directly on sm_80/sm_90/sm_120 (no JIT).
 
 Bundled redist DLLs:
 $($copied | ForEach-Object { "  - $_" } | Out-String)

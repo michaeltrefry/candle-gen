@@ -10,9 +10,16 @@
   arch CUDA_COMPUTE_CAP=80 (see README "Packaging"). This is the same recipe the (manual) windows-cuda
   workflow runs; keep the three in sync (here, .github/workflows/ci.yml, scripts/package-cuda.ps1).
 
+  The `--test` run includes candle-gen's `cuda_quant_smoke` (sc-7544): a weightless Q4/Q8 `QMatMul`
+  CPU-vs-CUDA check that guards the multi-arch fatbin so the Blackwell quant regression (quant kernels
+  silently no-op'ing to zeros at the sm_80-only baseline) can't return silently. Don't run with
+  -SkipTests when validating a CUDA/packaging change.
+
 .PARAMETER ComputeCap
-  Baseline virtual arch for the embedded PTX. Default 80 (Ampere); the driver JIT-compiles up to the
-  runtime GPU. NOT a hardware pin.
+  Baseline virtual arch. Default 80 (Ampere). Seeds the dense kernels' embedded `compute_80` PTX (the
+  driver JIT-compiles it up to the runtime GPU) AND the sm_80 baseline of the quantized kernels'
+  multi-arch fatbin (vendor/candle-kernels adds native sm_90/sm_120 SASS + forward PTX on top). Keep
+  =80; NOT a hardware pin.
 
 .PARAMETER CudaPath
   CUDA Toolkit root. Default: $env:CUDA_PATH, else the v12.9 default install path.

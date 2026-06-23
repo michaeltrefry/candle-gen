@@ -1,0 +1,32 @@
+[package]
+name = "candle-gen-boogu"
+version = "0.0.0"
+edition = "2021"
+description = "Boogu-Image-0.1 provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-boogu."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "diffusion", "boogu", "inference"]
+categories = ["science"]
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+# Boogu's VAE is the FLUX.1 16-channel `AutoencoderKL` (scaling 0.3611 / shift 0.1159, latent 16) —
+# byte-identical to the VAE Z-Image ships, so reuse `candle-transformers`' `z_image::vae` verbatim
+# exactly as `mlx-gen-boogu` reuses `mlx-gen-z-image`'s `Vae`.
+candle-transformers = { workspace = true }
+inventory = { workspace = true }
+# Qwen3-VL `tokenizer.json` loading is via gen-core's `TextTokenizer` (re-exported through
+# `candle_gen::gen_core`); the Boogu chat templates are rendered here, like the mlx provider.
+# Deterministic CPU-seeded initial noise (sc-3673 parity, shared with z-image/ideogram).
+rand = { workspace = true }
+rand_distr = { workspace = true }
+serde_json = "1"
+
+[features]
+default = []
+metal = ["candle-gen/metal", "candle-transformers/metal"]
+cuda = ["candle-gen/cuda", "candle-transformers/cuda"]
+flash-attn = ["candle-gen/flash-attn", "candle-transformers/flash-attn"]
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
