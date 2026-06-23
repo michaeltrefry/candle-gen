@@ -138,28 +138,62 @@ fn to_heads(x: &Tensor, heads: usize, head_dim: usize, norm: Option<&RmsNorm>) -
     x.transpose(1, 2)?.contiguous() // [B,H,S,head_dim]
 }
 
-/// The time embedding MLP: `timestep_embedding → linear_1 → silu → linear_2` → `[1, inner]`.
-struct TimeEmbed {
+/// A sinusoidal-scalar embedding MLP: `timestep_embedding → linear_1 → silu → linear_2` → `[1, inner]`.
+/// Shared by the timestep and (dev) guidance branches of `time_guidance_embed`.
+struct SinEmbed {
     linear_1: Linear,
     linear_2: Linear,
     channels: usize,
 }
 
-impl TimeEmbed {
+impl SinEmbed {
     fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
         let inner = cfg.inner_dim();
-        let te = vb.pp("timestep_embedder");
         Ok(Self {
-            linear_1: linear_no_bias(cfg.timestep_channels, inner, te.pp("linear_1"))?,
-            linear_2: linear_no_bias(inner, inner, te.pp("linear_2"))?,
+            linear_1: linear_no_bias(cfg.timestep_channels, inner, vb.pp("linear_1"))?,
+            linear_2: linear_no_bias(inner, inner, vb.pp("linear_2"))?,
             channels: cfg.timestep_channels,
         })
     }
 
-    fn forward(&self, timestep: f32, device: &Device) -> Result<Tensor> {
-        let emb = timestep_embedding(timestep, self.channels, device)?;
+    fn forward(&self, scalar: f32, device: &Device) -> Result<Tensor> {
+        let emb = timestep_embedding(scalar, self.channels, device)?;
         let h = self.linear_1.forward(&emb)?.silu()?;
         self.linear_2.forward(&h)
+    }
+}
+
+/// FLUX.2 `time_guidance_embed`: the timestep embedder (`timestep_embedder.*`, always present) plus —
+/// on the guidance-distilled **dev** checkpoint only — a guidance embedder (`guidance_embedder.*`).
+/// `temb = time_emb(σ·1000) + guidance_emb(guidance·1000)` (diffusers `Flux2TimestepGuidanceEmbeddings`,
+/// no pooled-CLIP term); klein has no guidance embedder, so `temb` is the timestep embedding alone.
+struct TimeGuidanceEmbed {
+    timestep: SinEmbed,
+    guidance: Option<SinEmbed>,
+}
+
+impl TimeGuidanceEmbed {
+    fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+        let timestep = SinEmbed::new(cfg, vb.pp("timestep_embedder"))?;
+        // The guidance embedder exists only on dev; gate on the weight (mirrors the mlx `w.get(...)`
+        // presence check) so a klein checkpoint loads without looking for absent keys.
+        let guidance = if vb.contains_tensor("guidance_embedder.linear_1.weight") {
+            Some(SinEmbed::new(cfg, vb.pp("guidance_embedder"))?)
+        } else {
+            None
+        };
+        Ok(Self { timestep, guidance })
+    }
+
+    /// `timestep` is fed as σ·1000 (the caller scales it). `guidance` is the raw guidance scale (e.g.
+    /// 4.0); it is scaled ×1000 here (the diffusers `guidance = guidance * 1000` step) and added only
+    /// when this is a dev transformer. A `Some(guidance)` on klein (no embedder) is silently ignored.
+    fn forward(&self, timestep: f32, guidance: Option<f32>, device: &Device) -> Result<Tensor> {
+        let mut temb = self.timestep.forward(timestep, device)?;
+        if let (Some(g), Some(gemb)) = (guidance, &self.guidance) {
+            temb = (temb + gemb.forward(g * 1000.0, device)?)?;
+        }
+        Ok(temb)
     }
 }
 
@@ -438,7 +472,7 @@ impl NormOut {
 pub struct Flux2Transformer {
     x_embedder: Linear,
     context_embedder: Linear,
-    time_embed: TimeEmbed,
+    time_embed: TimeGuidanceEmbed,
     mod_img: Modulation,
     mod_txt: Modulation,
     mod_single: Modulation,
@@ -471,7 +505,7 @@ impl Flux2Transformer {
                 inner,
                 vb.pp("context_embedder"),
             )?,
-            time_embed: TimeEmbed::new(cfg, vb.pp("time_guidance_embed"))?,
+            time_embed: TimeGuidanceEmbed::new(cfg, vb.pp("time_guidance_embed"))?,
             mod_img: Modulation::new(cfg, 2, vb.pp("double_stream_modulation_img"))?,
             mod_txt: Modulation::new(cfg, 2, vb.pp("double_stream_modulation_txt"))?,
             mod_single: Modulation::new(cfg, 1, vb.pp("single_stream_modulation"))?,
@@ -485,7 +519,10 @@ impl Flux2Transformer {
     }
 
     /// Predict velocity. `hidden_states` `[B, seq_img, 128]`, `encoder_hidden_states`
-    /// `[B, seq_txt, 12288]`, `img_ids`/`txt_ids` the 4-axis position ids, `timestep` = `σ·1000`.
+    /// `[B, seq_txt, joint]`, `img_ids`/`txt_ids` the 4-axis position ids, `timestep` = `σ·1000`.
+    /// `guidance` is the raw embedded-guidance scale for the guidance-distilled **dev** path (e.g.
+    /// 4.0), or `None` for klein (distilled / true-CFG); it is ignored unless this transformer carries
+    /// the dev guidance embedder.
     pub fn forward(
         &self,
         hidden_states: &Tensor,
@@ -493,8 +530,9 @@ impl Flux2Transformer {
         img_ids: &[[i64; 4]],
         txt_ids: &[[i64; 4]],
         timestep: f32,
+        guidance: Option<f32>,
     ) -> Result<Tensor> {
-        let temb = self.time_embed.forward(timestep, &self.device)?;
+        let temb = self.time_embed.forward(timestep, guidance, &self.device)?;
         let mut img = self
             .x_embedder
             .forward(&hidden_states.to_dtype(DType::F32)?)?;

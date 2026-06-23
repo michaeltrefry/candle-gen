@@ -1,30 +1,38 @@
 //! # candle-gen-flux2
 //!
-//! The **FLUX.2-klein** provider crate for [`candle-gen`](candle_gen) — the candle (Windows/CUDA)
-//! sibling of `mlx-gen-flux2`. Unlike FLUX.1 (sc-3694), FLUX.2 has **no** `candle-transformers`
-//! reference: the MMDiT transformer ([`transformer`]), the 32-channel 2×2-patchify VAE ([`vae`]), the
-//! Qwen3 prompt-embeds text path ([`text_encoder`]), the 4-axis RoPE ([`pos_embed`]) and the
-//! flow-match geometry ([`pipeline`]) are all ported here from the macOS provider.
+//! The **FLUX.2** provider crate for [`candle-gen`](candle_gen) — the candle (Windows/CUDA) sibling of
+//! `mlx-gen-flux2`. Unlike FLUX.1 (sc-3694), FLUX.2 has **no** `candle-transformers` reference: the
+//! MMDiT transformer ([`transformer`]), the 32-channel 2×2-patchify VAE ([`vae`]), the decoder-LM
+//! prompt-embeds text path ([`text_encoder`]), the 4-axis RoPE ([`pos_embed`]) and the flow-match
+//! geometry ([`pipeline`]) are all ported here from the macOS provider.
 //!
-//! **txt2img (sc-3695):** [`Flux2Generator::generate`] runs Qwen3 (hidden states 9/18/27 → 12288-wide
-//! `prompt_embeds`) → the MMDiT (8 joint + 24 fused-single blocks, distilled **4-step** flow-match
-//! Euler, guidance 1.0) → the AutoencoderKL-Flux2 decoder, registered under `"flux2_klein_9b"`. Same
-//! deterministic CPU-seeded-noise contract (sc-3673); the Qwen chat-template tokenization reuses
-//! gen-core's [`TextTokenizer`] with [`ChatTemplate::QwenInstructNoThink`].
+//! **Two txt2img variants** are registered, selected by [`config::Flux2Variant`]:
+//! - **`flux2_klein_9b`** (sc-3695): Qwen3 TE (hidden states 9/18/27 → 12288-wide `prompt_embeds`) →
+//!   the MMDiT (8 joint + 24 fused-single blocks) → the AutoencoderKL-Flux2 decoder. Distilled
+//!   **4-step** flow-match Euler, CFG-free at guidance 1.0 (>1 runs a classifier-free negative pass).
+//! - **`flux2_dev`** (epic 6564 sc-7457): the 32B flagship. **Mistral** TE (layers 10/20/30 →
+//!   15360-wide `prompt_embeds`) → a wider/deeper MMDiT (8 joint + **48** single blocks, **48** heads,
+//!   joint 15360). Guidance-**distilled** (embedded scalar, the FLUX.1-dev pattern): ~28 steps at
+//!   guidance ~4 via a single forward feeding the DiT's guidance embedder — **not** true CFG.
+//!
+//! Same deterministic CPU-seeded-noise contract (sc-3673). Tokenization reuses gen-core's
+//! [`TextTokenizer`]: klein with [`ChatTemplate::QwenInstructNoThink`], dev with
+//! [`ChatTemplate::Flux2DevMistral`].
 //!
 //! **Sampling (epic 7114 P4, sc-7123):** both denoise loops (txt2img [`Pipeline::render`] and the edit
 //! path [`Flux2Edit`]) route through the unified curated sampler/scheduler driver
 //! (`candle_gen::run_flow_sampler` / `resolve_flow_schedule`). FLUX.2 is a rectified-flow engine using
 //! the `Sigma` convention but embeds σ×1000, so the predict closure feeds `sigma * 1000.0` to the
-//! transformer; the guidance>1 CFG blend (and, on the edit path, the joint `[target, refs]` concat)
-//! lives inside that closure. The descriptor advertises the curated sampler/scheduler menus; the default
-//! (unset sampler/scheduler) path is the N1 no-op — euler over the native empirical-mu flow-match schedule.
+//! transformer; the klein guidance>1 CFG blend / the dev embedded-guidance scalar (and, on the edit
+//! path, the joint `[target, refs]` concat) live inside that closure. The descriptor advertises the
+//! curated sampler/scheduler menus; the default (unset sampler/scheduler) path is the N1 no-op — euler
+//! over the native empirical-mu flow-match schedule.
 //!
-//! **First-slice surface:** txt2img only. The mlx provider's edit variants (`flux2_klein_9b_edit`,
-//! `flux2_klein_9b_kv_edit` — single/multi Reference, the reference-K/V cache), LoRA/LoKr, and Q4/Q8
-//! quantization are **not** wired here; they are a follow-up. The descriptor advertises only the
-//! txt2img surface so the worker routes the rest to the Python fallback. `backend = "candle"`,
-//! `mac_only = false`.
+//! **Surface:** txt2img for both variants. The mlx provider's edit variants (`flux2_klein_9b_edit`,
+//! `flux2_klein_9b_kv_edit`, `flux2_dev_edit`/`flux2_dev_control`), LoRA/LoKr, and the **Q4 pre-quant
+//! packed loader** dev needs to fit under the memory ceiling are **not** wired yet (epic 6564 stories
+//! 1 follow-on / 4); until the packed loader lands, dev loads **dense** (fixture-only — the full 32B
+//! needs the packed path). `backend = "candle"`, `mac_only = false`.
 
 pub mod config;
 pub mod edit_provider;
@@ -50,13 +58,15 @@ use candle_gen::gen_core::{
 };
 use candle_gen::{CandleError, Result as CResult};
 
-use config::{Flux2Config, DEFAULT_GUIDANCE, DEFAULT_STEPS, FLUX2_KLEIN_9B_ID, SIZE_MULTIPLE};
+use config::{Flux2Config, Flux2Variant, SIZE_MULTIPLE};
 use text_encoder::Qwen3TextEncoder;
 use transformer::Flux2Transformer;
 use vae::Flux2Vae;
 
-/// Qwen3 `<|endoftext|>` pad token id (FLUX.2 text encoder).
+/// Qwen3 `<|endoftext|>` pad token id (klein FLUX.2 text encoder).
 const QWEN_PAD_TOKEN_ID: i32 = 151643;
+/// Mistral `<pad>` pad token id (dev FLUX.2 text encoder).
+const MISTRAL_PAD_TOKEN_ID: i32 = 11;
 
 /// The loaded FLUX.2 components, `Arc`-shared so the generator caches them across `generate` calls.
 #[derive(Clone)]
@@ -69,6 +79,7 @@ struct Components {
 /// A txt2img pipeline handle: snapshot root + device + the f32 compute dtype. `pub(crate)` so the
 /// edit provider ([`edit_provider`]) reuses the snapshot mmap + prompt-encode scaffolding.
 pub(crate) struct Pipeline {
+    pub(crate) variant: Flux2Variant,
     pub(crate) cfg: Flux2Config,
     pub(crate) root: PathBuf,
     pub(crate) device: Device,
@@ -76,13 +87,14 @@ pub(crate) struct Pipeline {
 }
 
 impl Pipeline {
-    pub(crate) fn load(root: &Path, device: &Device) -> Self {
+    pub(crate) fn load(variant: Flux2Variant, root: &Path, device: &Device) -> Self {
         Self {
-            cfg: Flux2Config::klein_9b(),
+            variant,
+            cfg: variant.config(),
             root: root.to_path_buf(),
             device: device.clone(),
-            // FLUX.2 runs the reference math in f32 (the Qwen3 encoder + the MMDiT). The 9b weights
-            // are large but the math is parity-sensitive; a bf16 pass is a follow-up optimization.
+            // FLUX.2 runs the reference math in f32 (the TE + the MMDiT). The weights are large but
+            // the math is parity-sensitive; a bf16 pass is a follow-up optimization.
             dtype: DType::F32,
         }
     }
@@ -125,14 +137,21 @@ impl Pipeline {
         })
     }
 
-    /// Tokenize + encode the prompt to `prompt_embeds` `[1, 512, 12288]` (f32).
+    /// Tokenize + encode the prompt to `prompt_embeds` `[1, 512, 3·hidden]` (f32). The tokenizer
+    /// (pad token + chat template) is variant-specific: klein uses the Qwen2 `<|endoftext|>` pad +
+    /// the Qwen no-think chat template; dev uses the Mistral `<pad>` + the `[INST]…[/INST]` template.
     pub(crate) fn encode(&self, te: &Qwen3TextEncoder, prompt: &str) -> CResult<Tensor> {
+        let (pad_token_id, chat_template) = if self.variant.is_dev() {
+            (MISTRAL_PAD_TOKEN_ID, ChatTemplate::Flux2DevMistral)
+        } else {
+            (QWEN_PAD_TOKEN_ID, ChatTemplate::QwenInstructNoThink)
+        };
         let tok = TextTokenizer::from_file(
             self.root.join("tokenizer/tokenizer.json"),
             TokenizerConfig {
                 max_length: self.cfg.max_sequence_length,
-                pad_token_id: QWEN_PAD_TOKEN_ID,
-                chat_template: ChatTemplate::QwenInstructNoThink,
+                pad_token_id,
+                chat_template,
                 pad_to_max_length: true,
             },
         )
@@ -157,15 +176,18 @@ impl Pipeline {
         let steps = req
             .steps
             .map(|s| s as usize)
-            .unwrap_or(DEFAULT_STEPS as usize);
+            .unwrap_or(self.variant.default_steps() as usize);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
 
         // Prompt embeds are seed-independent: encode once.
         let prompt_embeds = self.encode(&comps.te, &req.prompt)?;
-        // Classifier-free negative only when guidance > 1 (distilled klein runs CFG-free at 1.0).
-        let negative = if guidance > 1.0 {
+        // Two guidance regimes. dev is guidance-distilled: a single forward feeds the guidance scalar
+        // to the DiT's embedded-guidance embedder (no negative pass). klein is distilled / true-CFG:
+        // a classifier-free negative pass only when guidance > 1 (it runs CFG-free at 1.0).
+        let embedded_guidance = self.variant.uses_embedded_guidance();
+        let negative = if !embedded_guidance && guidance > 1.0 {
             let neg = req.negative_prompt.as_deref().unwrap_or(" ");
             Some(self.encode(&comps.te, neg)?)
         } else {
@@ -204,18 +226,30 @@ impl Pipeline {
                 on_progress,
                 |latents, sigma| -> CResult<Tensor> {
                     let ts = sigma * 1000.0;
+                    if embedded_guidance {
+                        // dev: single forward feeding the embedded guidance scalar to the DiT.
+                        return Ok(comps.transformer.forward(
+                            latents,
+                            &prompt_embeds,
+                            &img_ids,
+                            &txt_ids,
+                            ts,
+                            Some(guidance),
+                        )?);
+                    }
                     let v = comps.transformer.forward(
                         latents,
                         &prompt_embeds,
                         &img_ids,
                         &txt_ids,
                         ts,
+                        None,
                     )?;
                     match &negative {
                         Some(neg) => {
                             let vn = comps
                                 .transformer
-                                .forward(latents, neg, &img_ids, &txt_ids, ts)?;
+                                .forward(latents, neg, &img_ids, &txt_ids, ts, None)?;
                             // vn + guidance·(v − vn)
                             Ok((&vn + ((&v - &vn)? * guidance as f64)?)?)
                         }
@@ -250,8 +284,9 @@ pub(crate) fn to_image(decoded: &Tensor) -> CResult<Image> {
 }
 
 /// A loaded candle FLUX.2 generator. Loading is lazy; components build on the first `generate` and
-/// are cached.
+/// are cached. `variant` selects klein vs dev (config, text encoder, tokenizer, guidance regime).
 pub struct Flux2Generator {
+    variant: Flux2Variant,
     descriptor: ModelDescriptor,
     root: PathBuf,
     device: Device,
@@ -279,23 +314,21 @@ impl Generator for Flux2Generator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(FLUX2_KLEIN_9B_ID, req)?;
+        let id = self.descriptor.id;
+        self.descriptor.capabilities.validate_request(id, req)?;
         if req.prompt.is_empty() {
-            return Err(gen_core::Error::Msg(
-                "flux2_klein_9b: prompt must not be empty".into(),
-            ));
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: prompt must not be empty"
+            )));
         }
         if req.steps == Some(0) {
-            return Err(gen_core::Error::Msg(
-                "flux2_klein_9b: steps must be >= 1 (an explicit 0 renders undenoised noise)"
-                    .into(),
-            ));
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: steps must be >= 1 (an explicit 0 renders undenoised noise)"
+            )));
         }
         if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
             return Err(gen_core::Error::Msg(format!(
-                "flux2_klein_9b: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+                "{id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
                 req.width, req.height
             )));
         }
@@ -308,24 +341,27 @@ impl Generator for Flux2Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let pipe = Pipeline::load(&self.root, &self.device);
+        let pipe = Pipeline::load(self.variant, &self.root, &self.device);
         let components = self.components(&pipe)?;
         let images = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Images(images))
     }
 }
 
-/// FLUX.2-klein-9b txt2img descriptor — the surface sc-3695 wires. Guidance is advertised (klein
-/// defaults to 1.0 / CFG-free, but >1.0 runs a classifier-free negative pass); no negative-prompt-
-/// only, no conditioning (edit/Reference deferred), no LoRA/quant.
-pub fn descriptor() -> ModelDescriptor {
+/// The txt2img descriptor for `variant`. **klein**: guidance advertised (defaults to 1.0 / CFG-free,
+/// but >1.0 runs a classifier-free negative pass), so `supports_negative_prompt`. **dev**: guidance is
+/// the embedded scalar (single forward, no negative pass), so `supports_negative_prompt = false`.
+/// Both: txt2img only (edit/Reference deferred to epic 6564 story 4), no LoRA, no on-the-fly quant.
+fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
     ModelDescriptor {
-        id: FLUX2_KLEIN_9B_ID,
+        id: variant.id(),
         family: "flux2",
         backend: "candle",
         modality: Modality::Image,
         capabilities: Capabilities {
-            supports_negative_prompt: true,
+            // dev is guidance-distilled (embedded scalar, no negative pass); klein runs a
+            // classifier-free negative pass when guidance > 1.
+            supports_negative_prompt: !variant.uses_embedded_guidance(),
             supports_guidance: true,
             supports_true_cfg: false,
             // txt2img only in this slice — the mlx edit/Reference surface is deferred.
@@ -343,6 +379,9 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: 2048,
             max_count: 8,
             mac_only: false,
+            // dev's deployment is a Q4 pre-quantized snapshot (assembled by an install-time convert
+            // job, detected via the on-disk `quantization` manifest), NOT on-the-fly `spec.quantize`;
+            // the packed loader is the epic 6564 story-1 follow-on, so advertise no quant levels yet.
             supported_quants: &[] as &[Quant],
             supports_kv_cache: false,
             // FLUX.2 uses the empirical-mu shifted flow-match schedule.
@@ -351,48 +390,75 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// Construct a lazy candle FLUX.2 generator. `spec.weights` must be a [`WeightsSource::Dir`] pointing
-/// at a `black-forest-labs/FLUX.2-klein-9B` diffusers snapshot (`text_encoder/`, `transformer/`,
-/// `vae/`, `tokenizer/`). Adapters / quantization / control overlays are rejected (not wired).
-pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+/// FLUX.2-klein-9b txt2img descriptor (the surface sc-3695 wired).
+pub fn descriptor_klein() -> ModelDescriptor {
+    descriptor(Flux2Variant::Klein9b)
+}
+
+/// FLUX.2-dev txt2img descriptor (epic 6564 story 1): the guidance-distilled 32B flagship.
+pub fn descriptor_dev() -> ModelDescriptor {
+    descriptor(Flux2Variant::Dev)
+}
+
+/// Construct a lazy candle FLUX.2 generator for `variant`. `spec.weights` must be a
+/// [`WeightsSource::Dir`] pointing at a diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`,
+/// `tokenizer/`) — klein at `black-forest-labs/FLUX.2-klein-9B`, dev at `black-forest-labs/FLUX.2-dev`
+/// (whose `text_encoder/` is the Mistral3 checkpoint). Adapters / on-the-fly quantization / control
+/// overlays are rejected (not wired). A dev snapshot pre-quantized to Q4 (the `quantization` manifest,
+/// epic 6564 story-1 follow-on) is detected at load time; until that lands, dev loads dense (which
+/// fits only a small model / fixture — the full 32B needs the packed loader).
+fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    let id = variant.id();
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
         WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(
-                "flux2_klein_9b expects a snapshot directory (text_encoder/ transformer/ vae/ \
-                 tokenizer/), not a single .safetensors file"
-                    .into(),
-            ));
+            return Err(gen_core::Error::Msg(format!(
+                "{id} expects a snapshot directory (text_encoder/ transformer/ vae/ tokenizer/), \
+                 not a single .safetensors file"
+            )));
         }
     };
     if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(
-            "candle flux2_klein_9b does not support LoRA/LoKr yet".into(),
-        ));
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {id} does not support LoRA/LoKr yet"
+        )));
     }
     if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(
-            "candle flux2_klein_9b does not support on-the-fly Q4/Q8 quantization yet".into(),
-        ));
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {id} does not support on-the-fly Q4/Q8 quantization yet"
+        )));
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
-        return Err(gen_core::Error::Unsupported(
-            "candle flux2_klein_9b does not support control / IP-adapter / edit yet (txt2img only)"
-                .into(),
-        ));
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {id} does not support control / IP-adapter / edit yet (txt2img only)"
+        )));
     }
     let device = candle_gen::default_device()?;
     Ok(Box::new(Flux2Generator {
-        descriptor: descriptor(),
+        variant,
+        descriptor: descriptor(variant),
         root,
         device,
         components: Mutex::new(None),
     }))
 }
 
-// Link-time self-registration into gen-core's model registry.
+/// Registry load hook for `flux2_klein_9b`.
+pub fn load_klein(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_variant(Flux2Variant::Klein9b, spec)
+}
+
+/// Registry load hook for `flux2_dev`.
+pub fn load_dev(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_variant(Flux2Variant::Dev, spec)
+}
+
+// Link-time self-registration into gen-core's model registry — one per txt2img variant.
 inventory::submit! {
-    ModelRegistration { descriptor, load }
+    ModelRegistration { descriptor: descriptor_klein, load: load_klein }
+}
+inventory::submit! {
+    ModelRegistration { descriptor: descriptor_dev, load: load_dev }
 }
 
 /// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped when the
@@ -402,6 +468,7 @@ pub fn force_link() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{FLUX2_DEV_ID, FLUX2_KLEIN_9B_ID};
     use candle_gen::gen_core::registry;
     use candle_gen::gen_core::ConditioningKind;
 
@@ -416,9 +483,12 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_advertises_only_wired_txt2img_surface() {
-        let d = descriptor();
+    fn klein_descriptor_advertises_only_wired_txt2img_surface() {
+        let d = descriptor_klein();
+        assert_eq!(d.id, FLUX2_KLEIN_9B_ID);
         assert!(d.capabilities.supports_guidance);
+        // klein runs a classifier-free negative pass when guidance > 1.
+        assert!(d.capabilities.supports_negative_prompt);
         assert!(d.capabilities.requires_sigma_shift);
         assert!(!d.capabilities.mac_only);
         assert!(d.capabilities.conditioning.is_empty());
@@ -426,6 +496,24 @@ mod tests {
         assert!(!d.capabilities.supports_kv_cache);
         assert!(d.capabilities.supported_quants.is_empty());
         assert!(!d.capabilities.accepts(ConditioningKind::Reference));
+    }
+
+    #[test]
+    fn dev_registers_and_advertises_embedded_guidance_surface() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load(FLUX2_DEV_ID, &spec).expect("flux2_dev is registered");
+        assert_eq!(g.descriptor().id, FLUX2_DEV_ID);
+        assert_eq!(g.descriptor().family, "flux2");
+        assert_eq!(g.descriptor().backend, "candle");
+        assert_eq!(g.descriptor().modality, Modality::Image);
+        let d = descriptor_dev();
+        assert!(d.capabilities.supports_guidance);
+        // dev is guidance-distilled (embedded scalar) — no negative pass, no true-CFG, not mac-only.
+        assert!(!d.capabilities.supports_negative_prompt);
+        assert!(!d.capabilities.supports_true_cfg);
+        assert!(!d.capabilities.mac_only);
+        assert!(d.capabilities.conditioning.is_empty());
+        assert!(d.capabilities.requires_sigma_shift);
     }
 
     #[test]
@@ -461,12 +549,19 @@ mod tests {
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
         assert!(matches!(
-            load(&lora).err().expect("err"),
+            load_klein(&lora).err().expect("err"),
             gen_core::Error::Unsupported(_)
         ));
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
         assert!(matches!(
-            load(&quant).err().expect("err"),
+            load_klein(&quant).err().expect("err"),
+            gen_core::Error::Unsupported(_)
+        ));
+        // dev rejects the same unwired surfaces (on-the-fly quant in particular — its quant path is
+        // the pre-quantized snapshot manifest, not `spec.quantize`).
+        let dev_quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q4);
+        assert!(matches!(
+            load_dev(&dev_quant).err().expect("err"),
             gen_core::Error::Unsupported(_)
         ));
     }
@@ -474,7 +569,10 @@ mod tests {
     #[test]
     fn load_rejects_single_file_source() {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/flux2.safetensors".into()));
-        let err = load(&spec).err().expect("expected an error").to_string();
+        let err = load_klein(&spec)
+            .err()
+            .expect("expected an error")
+            .to_string();
         assert!(err.contains("snapshot directory"), "got: {err}");
     }
 }

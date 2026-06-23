@@ -1,12 +1,17 @@
-//! FLUX.2's **Qwen3** text encoder — a 36-layer decoder-only LM whose intermediate hidden states
-//! (the outputs of layers 9, 18, 27) are concatenated into the transformer's `prompt_embeds`
-//! `[B, S, 3·hidden = 12288]`. Port of `mlx-gen-flux2`'s `text_encoder/` module.
+//! FLUX.2's decoder-LM text encoder. Two checkpoints share this graph: klein's **Qwen3** (36 layers,
+//! hidden 4096, θ=1e6, eps 1e-6, per-head q/k-norm, `model.*` keys) and dev's **Mistral** (the
+//! language tower of a `Mistral3ForConditionalGeneration`: hidden 5120, θ=1e9, eps 1e-5, **no**
+//! q/k-norm, `language_model.model.*` keys). Their intermediate hidden states — Qwen3 layers
+//! (9, 18, 27) → `[B, S, 12288]`, Mistral layers (10, 20, 30) → `[B, S, 15360]` — are concatenated
+//! into the transformer's `prompt_embeds`. Port of `mlx-gen-flux2`'s `text_encoder/` module (which
+//! likewise unifies both behind a single `qk_norm` flag).
 //!
-//! Standard Qwen3: GQA (32 query / 8 kv heads), **bias-less** q/k/v/o projections, **per-head q/k
-//! RMSNorm** on the head dim, HF half-split RoPE (θ = 1e6), SwiGLU MLP, pre-norm residual blocks.
-//! The prompt path runs only the first 27 layers (higher layers cannot influence the kept states),
-//! applies **no** final norm, and concatenates the three saved states on the feature axis. Runs in
-//! **f32** (the transformer's x/context embedders require f32 input).
+//! Both: GQA (32 query / 8 kv heads), **bias-less** q/k/v/o projections, HF half-split RoPE, SwiGLU
+//! MLP, pre-norm residual blocks. The prompt path runs only up to `max(out_layers)` layers (higher
+//! layers cannot influence the kept states), applies **no** final norm, and concatenates the three
+//! saved states on the feature axis. Runs in **f32** (the transformer's x/context embedders require
+//! f32 input). The per-head q/k RMSNorm is the Qwen3 addition — gated by `te_qk_norm` (klein on,
+//! dev off).
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::{
@@ -55,8 +60,9 @@ struct Attention {
     k_proj: Linear,
     v_proj: Linear,
     o_proj: Linear,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
+    /// Per-head q/k RMSNorm over the head dim — `Some` for Qwen3 (klein), `None` for Mistral (dev).
+    q_norm: Option<RmsNorm>,
+    k_norm: Option<RmsNorm>,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -66,13 +72,23 @@ impl Attention {
     fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
         let h = cfg.te_hidden_size;
         let (nh, nkv, hd) = (cfg.te_n_heads, cfg.te_n_kv_heads, cfg.te_head_dim);
+        // Mistral (dev) has no `q_norm`/`k_norm` weights — only build them when the variant carries
+        // per-head q/k-norm, so loading the dev tower doesn't look for absent keys.
+        let (q_norm, k_norm) = if cfg.te_qk_norm {
+            (
+                Some(rms_norm(hd, cfg.te_rms_norm_eps, vb.pp("q_norm"))?),
+                Some(rms_norm(hd, cfg.te_rms_norm_eps, vb.pp("k_norm"))?),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Self {
             q_proj: linear_no_bias(h, nh * hd, vb.pp("q_proj"))?,
             k_proj: linear_no_bias(h, nkv * hd, vb.pp("k_proj"))?,
             v_proj: linear_no_bias(h, nkv * hd, vb.pp("v_proj"))?,
             o_proj: linear_no_bias(nh * hd, h, vb.pp("o_proj"))?,
-            q_norm: rms_norm(hd, cfg.te_rms_norm_eps, vb.pp("q_norm"))?,
-            k_norm: rms_norm(hd, cfg.te_rms_norm_eps, vb.pp("k_norm"))?,
+            q_norm,
+            k_norm,
             n_heads: nh,
             n_kv_heads: nkv,
             head_dim: hd,
@@ -83,12 +99,21 @@ impl Attention {
         let (b, s, _) = x.dims3()?;
         let (nh, nkv, hd) = (self.n_heads, self.n_kv_heads, self.head_dim);
 
-        // Project, reshape to [B, H, S, D], apply per-head q/k RMSNorm (over the head_dim axis).
+        // Project, reshape to [B, H, S, D]. Per-head q/k RMSNorm (over the head_dim axis, before
+        // RoPE) is Qwen3-only; for Mistral (dev) q/k pass straight through.
         let q = self.q_proj.forward(x)?.reshape((b, s, nh, hd))?;
         let k = self.k_proj.forward(x)?.reshape((b, s, nkv, hd))?;
         let v = self.v_proj.forward(x)?.reshape((b, s, nkv, hd))?;
-        let q = self.q_norm.forward(&q)?.transpose(1, 2)?; // [B, nh, S, D]
-        let k = self.k_norm.forward(&k)?.transpose(1, 2)?; // [B, nkv, S, D]
+        let q = match &self.q_norm {
+            Some(n) => n.forward(&q)?,
+            None => q,
+        }
+        .transpose(1, 2)?; // [B, nh, S, D]
+        let k = match &self.k_norm {
+            Some(n) => n.forward(&k)?,
+            None => k,
+        }
+        .transpose(1, 2)?; // [B, nkv, S, D]
         let v = v.transpose(1, 2)?.contiguous()?;
 
         let (q, k) = rotary.apply(&q, &k)?;
@@ -183,12 +208,17 @@ pub struct Qwen3TextEncoder {
 }
 
 impl Qwen3TextEncoder {
-    /// Build under the `model.*` prefix. The final `model.norm` and `lm_head` are intentionally not
-    /// loaded — `prompt_embeds` uses the pre-final-norm intermediate states only. Only the first
-    /// `max(out_layers)` layers are constructed (higher layers cannot affect the kept states).
+    /// Build under `cfg.te_prefix` (klein Qwen3: `model`; dev Mistral: `language_model.model`). The
+    /// final `…norm` and `lm_head` are intentionally not loaded — `prompt_embeds` uses the
+    /// pre-final-norm intermediate states only. Only the first `max(out_layers)` layers are
+    /// constructed (higher layers cannot affect the kept states).
     pub fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
-        let model = vb.pp("model");
-        let embed_tokens = embedding(151936, cfg.te_hidden_size, model.pp("embed_tokens"))?;
+        let model = vb.pp(cfg.te_prefix);
+        let embed_tokens = embedding(
+            cfg.te_vocab_size,
+            cfg.te_hidden_size,
+            model.pp("embed_tokens"),
+        )?;
         let max_run = *cfg.te_out_layers.iter().max().unwrap();
         let mut layers = Vec::with_capacity(max_run);
         let vb_layers = model.pp("layers");

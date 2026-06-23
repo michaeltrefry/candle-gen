@@ -34,5 +34,5 @@ fn flux2_klein_9b_conformance() {
         steps: 4,
         ..Profile::cheap()
     };
-    conformance(|| candle_gen_flux2::load(&spec).unwrap(), &profile);
+    conformance(|| candle_gen_flux2::load_klein(&spec).unwrap(), &profile);
 }

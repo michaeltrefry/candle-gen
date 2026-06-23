@@ -30,7 +30,7 @@ use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
 
-use crate::config::{DEFAULT_GUIDANCE, DEFAULT_STEPS, SIZE_MULTIPLE};
+use crate::config::{Flux2Variant, DEFAULT_GUIDANCE, DEFAULT_STEPS, SIZE_MULTIPLE};
 use crate::text_encoder::Qwen3TextEncoder;
 use crate::transformer::Flux2Transformer;
 use crate::vae::Flux2Vae;
@@ -90,7 +90,8 @@ impl Flux2Edit {
     /// the txt2img load (f32 compute, parity-sensitive).
     pub fn load(paths: &Flux2EditPaths) -> Result<Self> {
         let device = candle_gen::default_device()?;
-        let pipe = Pipeline::load(&paths.root, &device);
+        // The klein edit path loads the klein snapshot (dev edit is epic 6564 story 4).
+        let pipe = Pipeline::load(Flux2Variant::Klein9b, &paths.root, &device);
         let te = Qwen3TextEncoder::new(&pipe.cfg, pipe.component_vb("text_encoder")?)?;
         let transformer = Flux2Transformer::new(&pipe.cfg, pipe.component_vb("transformer")?)?;
         let vae = Flux2Vae::new_with_encoder(pipe.component_vb("vae")?)?;
@@ -213,9 +214,10 @@ impl Flux2Edit {
         ts: f32,
         target_seq: usize,
     ) -> Result<Tensor> {
+        // klein edit is distilled (CFG-free / true-CFG via the negative pass) — no embedded guidance.
         let out = self
             .transformer
-            .forward(hidden, embeds, img_ids, txt_ids, ts)?;
+            .forward(hidden, embeds, img_ids, txt_ids, ts, None)?;
         Ok(out.narrow(1, 0, target_seq)?)
     }
 
