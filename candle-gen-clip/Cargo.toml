@@ -21,6 +21,8 @@ candle-gen-sdxl = { path = "../candle-gen-sdxl" }
 # Same workspace pin candle-gen uses → one candle build (no skew).
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+tokenizers = { workspace = true }
 # Link-time self-registration into gen-core's image-embedder registry (the `inventory::submit!` below).
 inventory = { workspace = true }
 
@@ -29,6 +31,6 @@ inventory = { workspace = true }
 # on this crate selects the matching candle backend everywhere (the embedder runs f32, but the device
 # follows the build so the worker's dataset-analysis job keeps one device).
 default = []
-metal = ["candle-gen/metal", "candle-gen-sdxl/metal"]
-cuda = ["candle-gen/cuda", "candle-gen-sdxl/cuda"]
-flash-attn = ["candle-gen/flash-attn", "candle-gen-sdxl/flash-attn"]
+metal = ["candle-gen/metal", "candle-gen-sdxl/metal", "candle-transformers/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-sdxl/cuda", "candle-transformers/cuda"]
+flash-attn = ["candle-gen/flash-attn", "candle-gen-sdxl/flash-attn", "candle-transformers/flash-attn"]

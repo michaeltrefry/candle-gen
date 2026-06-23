@@ -172,7 +172,11 @@ resolver = "2"
 # `CandleLatentOps` needs no new method. `43aa2bf` is the mlx-gen #541 MERGE commit on main (also carries
 # #540's additive image-embedder contract). The SceneWorks worker re-pins mlx-gen + candle-gen to this
 # rev in lockstep so the `--features backend-candle` skew gate resolves ONE gen-core rev (sc-7491 S4).
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "43aa2bf8556b2beab50b7008e168496bc77df365" }
+# Bumped `43aa2bf` -> `418f900` (sc-6537): a REAL gen-core change adding the backend-neutral
+# `TextEmbedder` contract/registry plus the MLX CLIP-L text embedder provider. candle-gen-clip mirrors
+# that provider for CUDA/Windows and the 17 per-crate `sceneworks-gen-core-testkit` dev-deps move in
+# lockstep so SceneWorks resolves one gen-core rev when it pins mlx-gen + candle-gen for alignment.
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "418f900d696703a82bbd8e19f56eb2ac9c71dc01" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels

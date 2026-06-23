@@ -241,7 +241,9 @@ dependencies = [
  "candle-gen",
  "candle-gen-sdxl",
  "candle-nn",
+ "candle-transformers",
  "inventory",
+ "tokenizers 0.22.2",
 ]
 
 [[package]]
@@ -2613,7 +2615,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-gen-core"
 version = "0.1.0"
-source = "git+https://github.com/michaeltrefry/mlx-gen?rev=43aa2bf8556b2beab50b7008e168496bc77df365#43aa2bf8556b2beab50b7008e168496bc77df365"
+source = "git+https://github.com/michaeltrefry/mlx-gen?rev=418f900d696703a82bbd8e19f56eb2ac9c71dc01#418f900d696703a82bbd8e19f56eb2ac9c71dc01"
 dependencies = [
  "inventory",
  "safetensors 0.4.5",
@@ -2625,7 +2627,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-gen-core-testkit"
 version = "0.1.0"
-source = "git+https://github.com/michaeltrefry/mlx-gen?rev=43aa2bf8556b2beab50b7008e168496bc77df365#43aa2bf8556b2beab50b7008e168496bc77df365"
+source = "git+https://github.com/michaeltrefry/mlx-gen?rev=418f900d696703a82bbd8e19f56eb2ac9c71dc01#418f900d696703a82bbd8e19f56eb2ac9c71dc01"
 dependencies = [
  "sceneworks-gen-core",
 ]
