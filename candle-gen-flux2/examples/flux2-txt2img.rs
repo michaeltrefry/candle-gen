@@ -1,17 +1,27 @@
-//! FLUX.2-klein txt2img smoke driver — resolves THIS crate's inventory-registered generator through
-//! `gen_core::registry::load("flux2_klein_9b", …)`, runs a real `generate` against a local FLUX.2
-//! snapshot, and writes the `gen_core::Image` to PNG. The human-eyeball check behind sc-3695.
+//! FLUX.2 txt2img smoke driver — resolves THIS crate's inventory-registered generator through
+//! `gen_core::registry::load(<id>, …)`, runs a real `generate` against a local FLUX.2 snapshot, and
+//! writes the `gen_core::Image` to PNG. The human-eyeball check behind sc-3695 (klein) / sc-7457 (dev).
+//!
+//! `--variant klein` (default) loads the distilled 9B (4-step, CFG-free); `--variant dev` loads the
+//! guidance-distilled 32B flagship (~28-step, embedded guidance ~4). `--quant q4|q8` is honored for
+//! dev only — the 32B is staged dense in CPU RAM and quantized onto the GPU at load.
 //!
 //! ```text
+//! # klein (dense, 4 steps)
 //! cargo run --release --example flux2-txt2img --features cuda -- \
-//!   --snapshot "C:\Users\…\models--black-forest-labs--FLUX.2-klein-9B\snapshots\<hash>" \
+//!   --snapshot "…\models--black-forest-labs--FLUX.2-klein-9B\snapshots\<hash>" \
 //!   --prompt "a photo of a rusty robot holding a lit candle" --steps 4 --seed 42 --out out.png
+//!
+//! # dev (Q4, default 28 steps @ embedded guidance 4)
+//! cargo run --release --example flux2-txt2img --features cuda -- \
+//!   --variant dev --quant q4 --snapshot "D:\models\FLUX.2-dev" \
+//!   --prompt "a photo of a rusty robot holding a lit candle" --seed 42 --out dev.png
 //! ```
 
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    self, GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -48,13 +58,31 @@ fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("flux2_smoke.png"));
 
+    // klein (default) vs the 32B dev flagship; map to the registered engine id.
+    let variant = arg(&args, "--variant").unwrap_or_else(|| "klein".into());
+    let id = match variant.as_str() {
+        "klein" | "klein_9b" | "flux2_klein_9b" => "flux2_klein_9b",
+        "dev" | "flux2_dev" => "flux2_dev",
+        other => return Err(format!("unknown --variant {other:?} (expected klein|dev)").into()),
+    };
+    // Q4/Q8 → LoadSpec.quantize (honored for dev: CPU-stage → quantize-onto-GPU); klein rejects it.
+    let quant = match arg(&args, "--quant").as_deref() {
+        None => None,
+        Some("q4") | Some("Q4") => Some(Quant::Q4),
+        Some("q8") | Some("Q8") => Some(Quant::Q8),
+        Some(other) => return Err(format!("unknown --quant {other:?} (expected q4|q8)").into()),
+    };
+
     println!(
-        "[smoke] snapshot={snapshot}\n[smoke] {width}x{height} steps={steps:?} guidance={guidance:?} seed={seed}\n[smoke] prompt={prompt:?}"
+        "[smoke] id={id} quant={quant:?} snapshot={snapshot}\n[smoke] {width}x{height} steps={steps:?} guidance={guidance:?} seed={seed}\n[smoke] prompt={prompt:?}"
     );
 
     candle_gen_flux2::force_link();
-    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
-    let gen = gen_core::registry::load("flux2_klein_9b", &spec)?;
+    let mut spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
+    if let Some(q) = quant {
+        spec = spec.with_quant(q);
+    }
+    let gen = gen_core::registry::load(id, &spec)?;
     println!(
         "[smoke] resolved engine id={} backend={}",
         gen.descriptor().id,

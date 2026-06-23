@@ -221,6 +221,7 @@ impl Pipeline {
 
         // Prompt embeds are seed-independent: encode once.
         let prompt_embeds = self.encode(&comps.te, &req.prompt)?;
+        dbg_stats("prompt_embeds", &prompt_embeds);
         // Two guidance regimes. dev is guidance-distilled: a single forward feeds the guidance scalar
         // to the DiT's embedded-guidance embedder (no negative pass). klein is distilled / true-CFG:
         // a classifier-free negative pass only when guidance > 1 (it runs CFG-free at 1.0).
@@ -254,6 +255,7 @@ impl Pipeline {
             // The driver does cancel + progress + the euler/curated integrator step. The forward (and the
             // guidance>1 CFG blend) lives inside `predict` so a multi-eval solver re-runs it. FLUX.2 uses
             // the Sigma convention but the model embeds σ×1000, so feed `sigma * 1000.0` to the transformer.
+            let mut dbg_first = true;
             let latents = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::Sigma,
@@ -264,44 +266,82 @@ impl Pipeline {
                 on_progress,
                 |latents, sigma| -> CResult<Tensor> {
                     let ts = sigma * 1000.0;
-                    if embedded_guidance {
+                    let out = if embedded_guidance {
                         // dev: single forward feeding the embedded guidance scalar to the DiT.
-                        return Ok(comps.transformer.forward(
+                        comps.transformer.forward(
                             latents,
                             &prompt_embeds,
                             &img_ids,
                             &txt_ids,
                             ts,
                             Some(guidance),
-                        )?);
-                    }
-                    let v = comps.transformer.forward(
-                        latents,
-                        &prompt_embeds,
-                        &img_ids,
-                        &txt_ids,
-                        ts,
-                        None,
-                    )?;
-                    match &negative {
-                        Some(neg) => {
-                            let vn = comps
-                                .transformer
-                                .forward(latents, neg, &img_ids, &txt_ids, ts, None)?;
-                            // vn + guidance·(v − vn)
-                            Ok((&vn + ((&v - &vn)? * guidance as f64)?)?)
+                        )?
+                    } else {
+                        let v = comps.transformer.forward(
+                            latents,
+                            &prompt_embeds,
+                            &img_ids,
+                            &txt_ids,
+                            ts,
+                            None,
+                        )?;
+                        match &negative {
+                            Some(neg) => {
+                                let vn = comps
+                                    .transformer
+                                    .forward(latents, neg, &img_ids, &txt_ids, ts, None)?;
+                                // vn + guidance·(v − vn)
+                                (&vn + ((&v - &vn)? * guidance as f64)?)?
+                            }
+                            None => v,
                         }
-                        None => Ok(v),
+                    };
+                    if dbg_first {
+                        dbg_stats("latents_in@step0", latents);
+                        dbg_stats("velocity@step0", &out);
+                        dbg_first = false;
                     }
+                    Ok(out)
                 },
             )?;
+            dbg_stats("final_latents", &latents);
 
             on_progress(Progress::Decoding);
             let packed = pipeline::unpack_latents(&latents, req.width, req.height)?;
             let decoded = comps.vae.decode_packed(&packed)?; // [1,3,H,W] in [-1,1]
+            dbg_stats("decoded", &decoded);
             images.push(to_image(&decoded)?);
         }
         Ok(images)
+    }
+}
+
+/// Debug probe (sc-7457 dev-quant black-image hunt): print tensor stats to stderr when `FLUX2_DEBUG`
+/// is set. Localizes the first non-finite / degenerate stage without changing normal-run behavior.
+pub(crate) fn dbg_stats(name: &str, t: &Tensor) {
+    if std::env::var_os("FLUX2_DEBUG").is_none() {
+        return;
+    }
+    let dims = t.dims().to_vec();
+    let r = (|| -> CResult<(f32, f32, f64, bool)> {
+        let v = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let (mut mn, mut mx, mut s, mut bad) = (f32::INFINITY, f32::NEG_INFINITY, 0f64, false);
+        for &x in &v {
+            if x.is_finite() {
+                mn = mn.min(x);
+                mx = mx.max(x);
+            } else {
+                bad = true;
+            }
+            s += x as f64;
+        }
+        Ok((mn, mx, s / v.len().max(1) as f64, bad))
+    })();
+    match r {
+        Ok((mn, mx, me, bad)) => eprintln!(
+            "[dbg] {name} shape={dims:?} min={mn:.4} max={mx:.4} mean={me:.4} nonfinite={bad}"
+        ),
+        Err(e) => eprintln!("[dbg] {name}: stats err {e}"),
     }
 }
 
