@@ -250,7 +250,10 @@ mod tests {
         assert_eq!(r.text().unwrap().0.dim(1).unwrap(), cap);
         assert_eq!(r.ref_image().unwrap().0.dim(1).unwrap(), ref_len);
         assert_eq!(r.image().unwrap().0.dim(1).unwrap(), noise_len);
-        assert_eq!(r.combined_image().unwrap().0.dim(1).unwrap(), ref_len + noise_len);
+        assert_eq!(
+            r.combined_image().unwrap().0.dim(1).unwrap(),
+            ref_len + noise_len
+        );
         // Per-image ref slices partition the reference block in order.
         assert_eq!(r.ref_image_slice(0, 4).unwrap().0.dim(1).unwrap(), 4);
         assert_eq!(r.ref_image_slice(4, 3).unwrap().0.dim(1).unwrap(), 3);

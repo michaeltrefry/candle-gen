@@ -474,13 +474,13 @@ mod tests {
         assert_eq!(&pt[2..6], &[2, 2, 2, 2]);
         assert_eq!(&ph[2..6], &[2, 2, 3, 3]); // rows 0,0,1,1 + offset 2
         assert_eq!(&pw[2..6], &[2, 3, 2, 3]); // cols 0,1,0,1 + offset 2
-        // Text after image 0: offset advanced by max(4,4)/2 = 2 → 4.
+                                              // Text after image 0: offset advanced by max(4,4)/2 = 2 → 4.
         assert_eq!(pt[6], 4);
         // Image 1 sits at t-axis = 5 (one past the text), 2 tokens (2×1 grid).
         assert_eq!(&pt[7..9], &[5, 5]);
         assert_eq!(&ph[7..9], &[5, 6]); // rows 0,1 + offset 5
         assert_eq!(&pw[7..9], &[5, 5]); // single column
-        // Trailing text: offset advanced by max(4,2)/2 = 2 → 7.
+                                        // Trailing text: offset advanced by max(4,2)/2 = 2 → 7.
         assert_eq!(pt[9], 7);
     }
 }
