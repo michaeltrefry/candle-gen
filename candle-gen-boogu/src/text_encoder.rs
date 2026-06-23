@@ -9,7 +9,7 @@
 //! Runs in **f32** — the proven parity-grade precision for this exact encoder in the sibling ideogram
 //! port; the DiT casts the features down to bf16.
 
-use candle_gen::candle_core::{DType, Device, Result, Tensor};
+use candle_gen::candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::rotary_emb::rope;
 use candle_gen::candle_nn::{Embedding, Linear, Module};
@@ -64,13 +64,9 @@ impl Rotary {
         })
     }
 
-    fn apply(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
-        let seq = q.dim(2)?;
-        let cos = self.cos.narrow(0, 0, seq)?;
-        let sin = self.sin.narrow(0, 0, seq)?;
-        let q = rope(&q.contiguous()?, &cos, &sin)?;
-        let k = rope(&k.contiguous()?, &cos, &sin)?;
-        Ok((q, k))
+    /// The plain 1-D RoPE `(cos, sin)` `[seq, head_dim/2]` for the text path (sequential positions).
+    fn text(&self, seq: usize) -> Result<(Tensor, Tensor)> {
+        Ok((self.cos.narrow(0, 0, seq)?, self.sin.narrow(0, 0, seq)?))
     }
 }
 
@@ -103,7 +99,9 @@ impl Attention {
         })
     }
 
-    fn forward(&self, x: &Tensor, rotary: &Rotary, mask: &Tensor) -> Result<Tensor> {
+    /// `x`: `[b, s, hidden]`; `cos`/`sin`: `[s, head_dim/2]` (the text 1-D or image 3-D MRoPE table);
+    /// `mask`: additive causal `[b, 1, s, s]`.
+    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let (nh, nkv, hd) = (self.n_heads, self.n_kv_heads, self.head_dim);
 
@@ -111,11 +109,16 @@ impl Attention {
         let k = self.k_proj.forward(x)?.reshape((b, s, nkv, hd))?;
         let v = self.v_proj.forward(x)?.reshape((b, s, nkv, hd))?;
         // Per-head q/k RMSNorm over the head dim, then transpose to [B, H, S, D].
-        let q = rmsnorm(&q, &self.q_norm, self.eps)?.transpose(1, 2)?;
-        let k = rmsnorm(&k, &self.k_norm, self.eps)?.transpose(1, 2)?;
+        let q = rmsnorm(&q, &self.q_norm, self.eps)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = rmsnorm(&k, &self.k_norm, self.eps)?
+            .transpose(1, 2)?
+            .contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
-        let (q, k) = rotary.apply(&q, &k)?;
+        let q = rope(&q, cos, sin)?;
+        let k = rope(&k, cos, sin)?;
         let k = repeat_kv(&k, nh / nkv)?;
         let v = repeat_kv(&v, nh / nkv)?;
 
@@ -181,13 +184,19 @@ impl DecoderLayer {
         })
     }
 
-    fn forward(&self, x: &Tensor, rotary: &Rotary, mask: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let h = (x + self
             .attn
-            .forward(&rmsnorm(x, &self.input_ln, self.eps)?, rotary, mask)?)?;
+            .forward(&rmsnorm(x, &self.input_ln, self.eps)?, cos, sin, mask)?)?;
         &h + self.mlp.forward(&rmsnorm(&h, &self.post_ln, self.eps)?)?
     }
 }
+
+/// Qwen3-VL `text_config.rope_parameters.mrope_section` — the per-axis (T/H/W) frequency counts over
+/// `head_dim/2 = 64`. The image path interleaves these across the rotary freqs (the Qwen3-VL form).
+const MROPE_SECTION: [usize; 3] = [24, 20, 20];
+/// Vision spatial merge — the LM sees one token per `merge²` patches.
+const SPATIAL_MERGE: i64 = 2;
 
 /// The Boogu Qwen3-VL text-path condition encoder.
 pub struct BooguTextEncoder {
@@ -196,6 +205,8 @@ pub struct BooguTextEncoder {
     rotary: Rotary,
     final_norm: Tensor,
     eps: f64,
+    head_dim: usize,
+    rope_theta: f32,
     device: Device,
 }
 
@@ -220,6 +231,8 @@ impl BooguTextEncoder {
             rotary: Rotary::new(cfg.head_dim, cfg.rope_theta, max_seq.max(1), w.device())?,
             final_norm: w.get(&format!("{prefix}.norm.weight"))?,
             eps: cfg.rms_norm_eps,
+            head_dim: cfg.head_dim,
+            rope_theta: cfg.rope_theta,
             device: w.device().clone(),
         })
     }
@@ -228,13 +241,137 @@ impl BooguTextEncoder {
     /// final norm applied. Causal (decoder-only); no padding (the candle tokenizer emits none).
     pub fn last_hidden(&self, input_ids: &Tensor) -> Result<Tensor> {
         let (b, s) = input_ids.dims2()?;
+        let (cos, sin) = self.rotary.text(s)?;
         let mask = causal_mask(b, s, &self.device)?;
         let mut hidden = self.embed_tokens.forward(input_ids)?;
         for layer in &self.layers {
-            hidden = layer.forward(&hidden, &self.rotary, &mask)?;
+            hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
         }
         rmsnorm(&hidden, &self.final_norm, self.eps)
     }
+
+    /// Image-conditioned forward (Edit). Splices `image_embeds` (`[n, 4096]`, the vision tower's
+    /// merged output) into the token embeddings at the `image_token_id` positions, runs the 36
+    /// decoder layers under the 3-D **interleaved MRoPE**, and injects the 3 `deepstack` features
+    /// (`[n, 4096]` each) at the image positions after layers 0/1/2 — mirroring `Qwen3VLTextModel`.
+    /// `grid_thw` is the image's patch grid `[t, h, w]`. `b = 1`.
+    pub fn last_hidden_with_image(
+        &self,
+        input_ids: &Tensor,
+        image_embeds: &Tensor,
+        deepstack: &[Tensor],
+        grid_thw: [i32; 3],
+        image_token_id: u32,
+    ) -> Result<Tensor> {
+        let (b, s) = input_ids.dims2()?;
+        let ids: Vec<u32> = input_ids.i(0)?.to_vec1::<u32>()?;
+
+        // Image-token block (contiguous, single reference).
+        let img_idx: Vec<usize> = (0..s).filter(|&i| ids[i] == image_token_id).collect();
+        let img_start = *img_idx.first().ok_or_else(|| {
+            candle_gen::candle_core::Error::Msg(format!(
+                "boogu edit: no image tokens (id {image_token_id}) in input_ids"
+            ))
+        })?;
+        let img_end = img_start + img_idx.len();
+
+        // Token embeddings, then splice the vision embeds at the image positions.
+        let mut hidden = self.embed_tokens.forward(input_ids)?; // [1, s, 4096], f32
+        let img = image_embeds.unsqueeze(0)?.to_dtype(hidden.dtype())?; // [1, n, 4096]
+        hidden = replace_seq(&hidden, &img, img_start, img_end, s)?;
+
+        // 3-D interleaved MRoPE + causal mask.
+        let (pt, ph, pw) = mrope_positions(&ids, image_token_id, grid_thw[1], grid_thw[2]);
+        let (cos, sin) = self.mrope_cos_sin(&pt, &ph, &pw)?;
+        let mask = causal_mask(b, s, &self.device)?;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
+            // Deepstack: add the layer-i feature at the image positions (LM layers 0/1/2).
+            if i < deepstack.len() {
+                let ds = deepstack[i].unsqueeze(0)?.to_dtype(hidden.dtype())?; // [1, n, 4096]
+                let mid = (slice_seq(&hidden, img_start, img_end)? + ds)?;
+                hidden = replace_seq(&hidden, &mid, img_start, img_end, s)?;
+            }
+        }
+        rmsnorm(&hidden, &self.final_norm, self.eps)
+    }
+
+    /// Build the interleaved-MRoPE `cos`/`sin` `[s, head_dim/2]` (f32). Each of the `head_dim/2`
+    /// frequencies takes its position from the T/H/W axis per the Qwen3-VL interleave: within the
+    /// first `mrope_section[1]·3` indices, `j%3==1 → H`, `j%3==2 → W`, else `T` (the tail stays `T`).
+    fn mrope_cos_sin(&self, pt: &[i64], ph: &[i64], pw: &[i64]) -> Result<(Tensor, Tensor)> {
+        let s = pt.len();
+        let hd = self.head_dim;
+        let half = hd / 2;
+        let sec_h = MROPE_SECTION[1] * 3;
+        let sec_w = MROPE_SECTION[2] * 3;
+        let inv: Vec<f32> = (0..half)
+            .map(|j| (self.rope_theta as f64).powf(-(2.0 * j as f64) / hd as f64) as f32)
+            .collect();
+
+        let mut freqs = vec![0f32; s * half];
+        for (i, ((&t, &h), &w)) in pt.iter().zip(ph).zip(pw).enumerate() {
+            for j in 0..half {
+                let pos = if j < sec_h && j % 3 == 1 {
+                    h
+                } else if j < sec_w && j % 3 == 2 {
+                    w
+                } else {
+                    t
+                };
+                freqs[i * half + j] = pos as f32 * inv[j];
+            }
+        }
+        let freqs = Tensor::from_vec(freqs, (s, half), &self.device)?;
+        Ok((freqs.cos()?, freqs.sin()?))
+    }
+}
+
+/// Slice `[1, s, d]` along the sequence axis (axis 1) to `[start, end)`.
+fn slice_seq(x: &Tensor, start: usize, end: usize) -> Result<Tensor> {
+    x.narrow(1, start, end - start)
+}
+
+/// Replace `x[:, start:end, :]` with `repl` (`[1, end-start, d]`) via concat of the surrounding slices.
+fn replace_seq(x: &Tensor, repl: &Tensor, start: usize, end: usize, s: usize) -> Result<Tensor> {
+    let before = x.narrow(1, 0, start)?;
+    let after = x.narrow(1, end, s - end)?;
+    Tensor::cat(&[&before, repl, &after], 1)
+}
+
+/// 3-D MRoPE positions per token (mirrors `get_rope_index` + `get_vision_position_ids`): text tokens
+/// advance `(i, i, i)`; an image block (at offset `cur`) gets `t = cur`, `h = cur + row`,
+/// `w = cur + col` over its `(h/merge)×(w/merge)` merged grid, then `cur += max(h, w) / merge`.
+fn mrope_positions(
+    ids: &[u32],
+    image_token_id: u32,
+    grid_h: i32,
+    grid_w: i32,
+) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
+    let (llm_h, llm_w) = (grid_h as i64 / SPATIAL_MERGE, grid_w as i64 / SPATIAL_MERGE);
+    let step = (grid_h.max(grid_w) as i64) / SPATIAL_MERGE;
+    let (mut pt, mut ph, mut pw) = (Vec::new(), Vec::new(), Vec::new());
+    let mut cur = 0i64;
+    let mut i = 0usize;
+    while i < ids.len() {
+        if ids[i] == image_token_id {
+            for idx in 0..(llm_h * llm_w) {
+                pt.push(cur);
+                ph.push(cur + idx / llm_w);
+                pw.push(cur + idx % llm_w);
+            }
+            cur += step;
+            i += (llm_h * llm_w) as usize;
+        } else {
+            pt.push(cur);
+            ph.push(cur);
+            pw.push(cur);
+            cur += 1;
+            i += 1;
+        }
+    }
+    (pt, ph, pw)
 }
 
 /// Additive causal mask `[B, 1, S, S]` (f32): `0` where query `i` may attend key `j` (`j ≤ i`),

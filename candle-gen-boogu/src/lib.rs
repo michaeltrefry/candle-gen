@@ -1,7 +1,7 @@
 //! # candle-gen-boogu
 //!
 //! The **Boogu-Image-0.1** provider crate for [`candle-gen`](candle_gen) — the candle (Windows/CUDA)
-//! sibling of `mlx-gen-boogu`. Registers two text-to-image engine ids:
+//! sibling of `mlx-gen-boogu`. Registers three engine ids:
 //!
 //! * **`boogu_image`** — the Base variant: a 10.3B Lumina-Image-2.0 / OmniGen2-lineage hybrid MMDiT
 //!   (8 double + 32 single + 2 refiner layers, GQA, 3-axis interleaved RoPE) with true-CFG, driven by
@@ -9,11 +9,15 @@
 //!   static-shift (`mu = 1.15`) schedule, routed through the unified curated-sampler framework.
 //! * **`boogu_image_turbo`** — the same Base weights-arch + a DMD-distilled few-step (4) sampler loop,
 //!   CFG-free (guidance inert). The default fast surface.
+//! * **`boogu_image_edit`** — single-reference text+image-to-image (sc-7523): the source
+//!   [`ConditioningKind::Reference`] image is VAE-encoded into the DiT's spatial reference latent
+//!   (`forward_edit`) **and** read by the Qwen3-VL **vision tower** so the MLLM "sees" it
+//!   (image-conditioned instruction features). Same true-CFG / static-shift schedule as Base.
 //!
 //! **Reuse:** the FLUX.1 VAE is `candle-transformers`' `z_image::vae::AutoEncoderKL` (the exact 16-ch
 //! AutoencoderKL Z-Image ships, scaling 0.3611 / shift 0.1159) — reused verbatim, as `mlx-gen-boogu`
-//! reuses `mlx-gen-z-image`'s `Vae`. The Qwen3-VL-8B condition encoder + the hybrid DiT are ported
-//! here. The Edit (single-reference TI2I) variant lands in sc-7523.
+//! reuses `mlx-gen-z-image`'s `Vae`. The Qwen3-VL-8B condition encoder, its vision tower, and the
+//! hybrid DiT are ported here.
 //!
 //! `backend = "candle"`, `mac_only = false`. Apache-2.0, ungated.
 
@@ -23,6 +27,7 @@ pub mod pipeline;
 pub mod text_encoder;
 pub mod tokenizer;
 pub mod transformer;
+pub mod vision;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -30,16 +35,18 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, WeightsSource,
+    self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
 
-use pipeline::Components;
+use pipeline::{Components, EditComponents};
 
 /// Registry id for the Base text-to-image variant (true-CFG).
 pub const BOOGU_IMAGE_ID: &str = "boogu_image";
 /// Registry id for the Turbo variant (DMD few-step, CFG-free).
 pub const BOOGU_IMAGE_TURBO_ID: &str = "boogu_image_turbo";
+/// Registry id for the instruction image-edit variant (single-reference TI2I).
+pub const BOOGU_IMAGE_EDIT_ID: &str = "boogu_image_edit";
 
 /// Patch(2)·ae_scale(8) = 16 — `patchify` requires latent dims divisible by this.
 const SIZE_MULTIPLE: u32 = 16;
@@ -49,14 +56,27 @@ const SIZE_MULTIPLE: u32 = 16;
 /// out-of-regime latents, so they stay off the menu. Mirrors `mlx-gen-boogu`'s `TURBO_SAMPLERS`.
 const TURBO_SAMPLERS: &[&str] = &["lcm", "euler_ancestral", "dpmpp_sde"];
 
-/// A lazily-loaded Boogu generator. `turbo` selects the CFG-free DMD few-step path; otherwise the
-/// true-CFG Base path. Components are loaded on the first `generate` and cached.
+/// Which Boogu sampler path a generator drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Variant {
+    /// Base — true-CFG text-to-image.
+    Base,
+    /// Turbo — CFG-free DMD few-step text-to-image.
+    Turbo,
+    /// Edit — single-reference TI2I (true-CFG, with a reference image VAE-encoded + vision-conditioned).
+    Edit,
+}
+
+/// A lazily-loaded Boogu generator. [`Variant`] selects the sampler path. The shared T2I components
+/// load on the first `generate`; the Edit-only components (vision tower + VAE encoder) load lazily on
+/// the first edit, so the T2I paths keep their footprint.
 pub struct BooguGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
-    turbo: bool,
+    variant: Variant,
     device: Device,
     components: Mutex<Option<Arc<Components>>>,
+    edit_components: Mutex<Option<Arc<EditComponents>>>,
 }
 
 impl BooguGenerator {
@@ -69,6 +89,19 @@ impl BooguGenerator {
             return Ok(c.clone());
         }
         let c = Arc::new(pipeline::load_components(&self.root, &self.device)?);
+        *guard = Some(c.clone());
+        Ok(c)
+    }
+
+    fn edit_components(&self) -> gen_core::Result<Arc<EditComponents>> {
+        let mut guard = self
+            .edit_components
+            .lock()
+            .expect("boogu edit-components cache mutex poisoned");
+        if let Some(c) = guard.as_ref() {
+            return Ok(c.clone());
+        }
+        let c = Arc::new(pipeline::load_edit_components(&self.root, &self.device)?);
         *guard = Some(c.clone());
         Ok(c)
     }
@@ -96,6 +129,11 @@ impl Generator for BooguGenerator {
                 req.width, req.height
             )));
         }
+        // The Edit variant needs exactly one source reference; the capability floor already rejects a
+        // Reference on Base/Turbo (their `conditioning` surface is empty).
+        if self.variant == Variant::Edit {
+            resolve_edit_reference(req)?;
+        }
         Ok(())
     }
 
@@ -106,13 +144,39 @@ impl Generator for BooguGenerator {
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
         let comps = self.components()?;
-        let images = if self.turbo {
-            pipeline::render_turbo(&comps, req, &self.device, on_progress)?
-        } else {
-            pipeline::render_base(&comps, req, &self.device, on_progress)?
+        let images = match self.variant {
+            Variant::Turbo => pipeline::render_turbo(&comps, req, &self.device, on_progress)?,
+            Variant::Base => pipeline::render_base(&comps, req, &self.device, on_progress)?,
+            Variant::Edit => {
+                let reference = resolve_edit_reference(req)?;
+                let edit = self.edit_components()?;
+                pipeline::render_edit(&comps, &edit, req, reference, &self.device, on_progress)?
+            }
         };
         Ok(GenerationOutput::Images(images))
     }
+}
+
+/// The single img2img/instruction-edit source [`Conditioning::Reference`] image. More than one
+/// reference, or none, is an error (the Edit path needs exactly one source).
+fn resolve_edit_reference(req: &GenerationRequest) -> gen_core::Result<&Image> {
+    let mut source: Option<&Image> = None;
+    for c in &req.conditioning {
+        if let Conditioning::Reference { image, .. } = c {
+            if source.is_some() {
+                return Err(gen_core::Error::Msg(
+                    "boogu_image_edit: only one reference (source) image is supported for edit"
+                        .into(),
+                ));
+            }
+            source = Some(image);
+        }
+    }
+    source.ok_or_else(|| {
+        gen_core::Error::Msg(
+            "boogu_image_edit: an instruction edit requires a source reference image".into(),
+        )
+    })
 }
 
 /// Boogu Base descriptor — true-CFG text-to-image; no user negative prompt (the CFG-negative is the
@@ -156,10 +220,20 @@ pub fn descriptor_turbo() -> ModelDescriptor {
     d
 }
 
+/// Boogu Edit descriptor — same true-CFG surface as the Base path plus a single img2img/instruction
+/// -edit source [`ConditioningKind::Reference`]: the source image is read by the Qwen3-VL vision
+/// tower (semantic edit) and VAE-encoded into the DiT's spatial reference latent.
+pub fn descriptor_edit() -> ModelDescriptor {
+    let mut d = descriptor();
+    d.id = BOOGU_IMAGE_EDIT_ID;
+    d.capabilities.conditioning = vec![ConditioningKind::Reference];
+    d
+}
+
 fn build(
     spec: &LoadSpec,
     descriptor: ModelDescriptor,
-    turbo: bool,
+    variant: Variant,
 ) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -193,21 +267,27 @@ fn build(
     Ok(Box::new(BooguGenerator {
         descriptor,
         root,
-        turbo,
+        variant,
         device,
         components: Mutex::new(None),
+        edit_components: Mutex::new(None),
     }))
 }
 
 /// Construct a lazy candle Boogu **Base** generator. `spec.weights` must be a [`WeightsSource::Dir`]
 /// pointing at a candle-readable (bf16) Boogu snapshot (`mllm/ transformer/ vae/`).
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    build(spec, descriptor(), false)
+    build(spec, descriptor(), Variant::Base)
 }
 
 /// Construct a lazy candle Boogu **Turbo** generator (DMD few-step, CFG-free).
 pub fn load_turbo(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    build(spec, descriptor_turbo(), true)
+    build(spec, descriptor_turbo(), Variant::Turbo)
+}
+
+/// Construct a lazy candle Boogu **Edit** generator (single-reference TI2I, true-CFG).
+pub fn load_edit(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    build(spec, descriptor_edit(), Variant::Edit)
 }
 
 inventory::submit! {
@@ -217,6 +297,12 @@ inventory::submit! {
     ModelRegistration {
         descriptor: descriptor_turbo,
         load: load_turbo,
+    }
+}
+inventory::submit! {
+    ModelRegistration {
+        descriptor: descriptor_edit,
+        load: load_edit,
     }
 }
 
@@ -229,8 +315,8 @@ mod tests {
     use candle_gen::gen_core::registry;
 
     #[test]
-    fn registers_both_ids_as_candle() {
-        for id in [BOOGU_IMAGE_ID, BOOGU_IMAGE_TURBO_ID] {
+    fn registers_all_three_ids_as_candle() {
+        for id in [BOOGU_IMAGE_ID, BOOGU_IMAGE_TURBO_ID, BOOGU_IMAGE_EDIT_ID] {
             let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
             let g = registry::load(id, &spec).unwrap_or_else(|_| panic!("{id} is registered"));
             assert_eq!(g.descriptor().id, id);
@@ -250,6 +336,85 @@ mod tests {
         assert_eq!(t.id, BOOGU_IMAGE_TURBO_ID);
         assert!(!t.capabilities.supports_guidance);
         assert_eq!(t.capabilities.samplers, TURBO_SAMPLERS.to_vec());
+    }
+
+    #[test]
+    fn descriptor_edit_adds_reference() {
+        let d = descriptor_edit();
+        assert_eq!(d.id, BOOGU_IMAGE_EDIT_ID);
+        assert!(d.capabilities.supports_guidance);
+        assert!(d
+            .capabilities
+            .conditioning
+            .contains(&ConditioningKind::Reference));
+        // Base/Turbo keep an empty conditioning surface (only Edit advertises a reference).
+        assert!(descriptor().capabilities.conditioning.is_empty());
+        assert!(descriptor_turbo().capabilities.conditioning.is_empty());
+    }
+
+    #[test]
+    fn edit_validate_requires_exactly_one_reference() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load(BOOGU_IMAGE_EDIT_ID, &spec).unwrap();
+        let img = |w: u32, h: u32| Image {
+            width: w,
+            height: h,
+            pixels: vec![0u8; (w * h * 3) as usize],
+        };
+        let base = GenerationRequest {
+            prompt: "make it autumn".into(),
+            width: 512,
+            height: 512,
+            ..Default::default()
+        };
+        // No reference → error.
+        assert!(g.validate(&base).is_err());
+        // Exactly one reference → ok.
+        let one = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: img(512, 512),
+                strength: None,
+            }],
+            ..base.clone()
+        };
+        assert!(g.validate(&one).is_ok());
+        // Two references → error.
+        let two = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: img(512, 512),
+                    strength: None,
+                },
+                Conditioning::Reference {
+                    image: img(512, 512),
+                    strength: None,
+                },
+            ],
+            ..base
+        };
+        assert!(g.validate(&two).is_err());
+    }
+
+    #[test]
+    fn base_rejects_reference_conditioning() {
+        // Base has no conditioning surface, so the capability floor rejects a Reference.
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load(BOOGU_IMAGE_ID, &spec).unwrap();
+        let r = GenerationRequest {
+            prompt: "x".into(),
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 512,
+                    height: 512,
+                    pixels: vec![0u8; 512 * 512 * 3],
+                },
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert!(g.validate(&r).is_err());
     }
 
     #[test]

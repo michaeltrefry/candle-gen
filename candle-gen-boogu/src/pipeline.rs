@@ -17,12 +17,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
-use candle_gen::candle_nn::VarBuilder;
+use candle_gen::candle_nn::{Module, VarBuilder};
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::z_image::sampling::postprocess_image;
-use candle_transformers::models::z_image::vae::{AutoEncoderKL, VaeConfig};
+use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder, VaeConfig};
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 
@@ -31,6 +31,12 @@ use crate::loader::Weights;
 use crate::text_encoder::{BooguTextEncoder, BooguTextEncoderConfig};
 use crate::tokenizer::BooguTokenizer;
 use crate::transformer::BooguTransformer;
+use crate::vision::preprocess::preprocess_image;
+use crate::vision::{VisionConfig, VisionTower};
+
+/// Qwen3-VL image placeholder token (`mllm/config.json::image_token_id`) — the position the vision
+/// tower's merged embeds are spliced into for image-conditioned editing.
+const IMAGE_TOKEN_ID: u32 = 151655;
 
 /// Base/Edit default steps + guidance (reference `__call__`: 50-step true-CFG, guidance 4.0).
 pub(crate) const DEFAULT_STEPS: usize = 50;
@@ -208,6 +214,180 @@ pub(crate) fn render_turbo(
         images.push(decode(&comps.vae, &lat)?);
     }
     Ok(images)
+}
+
+// ── Edit (single-reference TI2I) path (sc-7523) ──────────────────────────────────────────────────
+
+/// Edit-only components, lazily loaded on the first edit so the T2I paths keep their footprint: the
+/// Qwen3-VL **vision tower** (image-conditioned instruction features) and a standalone VAE
+/// **encoder** (the reference → clean spatial latent). Both run f32.
+pub(crate) struct EditComponents {
+    vision: VisionTower,
+    vae_encoder: Encoder,
+}
+
+/// Load the Edit-only components from a Boogu snapshot: the Qwen3-VL vision tower (`mllm/model.visual.*`)
+/// and the FLUX.1 VAE encoder (`vae/encoder.*`), both f32.
+pub(crate) fn load_edit_components(root: &Path, device: &Device) -> Result<EditComponents> {
+    let mllm_w = Weights::from_dir(&root.join("mllm"), device, VAE_DTYPE)?;
+    let vision = VisionTower::load(&mllm_w, VisionConfig::qwen3_vl(), "model.visual")?;
+    let vae_vb = vae_varbuilder(&root.join("vae"), device)?;
+    let vae_encoder = Encoder::new(&VaeConfig::z_image(), vae_vb.pp("encoder"))?;
+    Ok(EditComponents {
+        vision,
+        vae_encoder,
+    })
+}
+
+/// Render the **Edit** (single-reference TI2I, true-CFG) path for `req` with source `reference`.
+///
+/// Mirrors `mlx-gen-boogu`'s `generate_edit`: VAE-encode the reference into a clean spatial latent,
+/// build image-conditioned instruction features (Qwen3-VL vision tower → MLLM splice + deepstack), and
+/// flow-match denoise with the reference threaded through the DiT's `forward_edit` (the reference
+/// shapes the DiT image sequence; the instruction drives the edit). Same static-v1 scheduler /
+/// true-CFG as the Base path. The CFG-negative is the text-only empty/drop instruction
+/// (`use_input_images_4_neg_instruct = false`, the reference default).
+pub(crate) fn render_edit(
+    comps: &Components,
+    edit: &EditComponents,
+    req: &GenerationRequest,
+    reference: &Image,
+    device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    // The reference is VAE-encoded at its own dimensions; the latent must be patchify-able (p=2 over
+    // an /8 latent ⇒ multiple of 16), matching the mlx twin's `validate_multiple_of_16(reference)`.
+    if !reference.width.is_multiple_of(16) || !reference.height.is_multiple_of(16) {
+        return Err(CandleError::Msg(format!(
+            "boogu_image_edit: reference dims must be multiples of 16 (got {}x{})",
+            reference.width, reference.height
+        )));
+    }
+    let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
+    let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+
+    // Reference → clean VAE latent [1, 16, rH/8, rW/8] (seed-independent).
+    let ref_latent = vae_encode(&edit.vae_encoder, reference, device)?;
+
+    // Condition encoding (seed-independent): image-conditioned edit instruction + text-only
+    // CFG-negative (empty/drop instruction). Both DiT passes carry the same reference latent.
+    let cond = encode_image_instruction(comps, edit, reference, &req.prompt, device)?;
+    let do_cfg = guidance > 1.0;
+    let uncond = if do_cfg {
+        Some(comps.te.last_hidden(&comps.tok.encode_negative()?)?)
+    } else {
+        None
+    };
+
+    let native = base_native_sigmas(steps);
+    let sigmas = candle_gen::resolve_flow_schedule(
+        req.scheduler.as_deref(),
+        base_shift_mu(),
+        steps,
+        &native,
+    );
+
+    let mut images = Vec::with_capacity(req.count as usize);
+    for index in 0..req.count {
+        let seed = base_seed.wrapping_add(index as u64);
+        let noise = init_noise(req.height, req.width, seed, 0, device)?;
+        let lat = candle_gen::run_flow_sampler(
+            req.sampler.as_deref(),
+            TimestepConvention::OneMinusSigma,
+            &sigmas,
+            noise,
+            seed,
+            &req.cancel,
+            on_progress,
+            |x, timestep| -> Result<Tensor> {
+                let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+                let cond_v = comps.dit.forward_edit(x, &ref_latent, &t, &cond)?;
+                let pred = match &uncond {
+                    Some(u_hidden) => {
+                        let uncond_v = comps.dit.forward_edit(x, &ref_latent, &t, u_hidden)?;
+                        // pred = cond + (scale − 1)·(cond − uncond)
+                        (&cond_v + ((&cond_v - &uncond_v)? * (guidance - 1.0) as f64)?)?
+                    }
+                    None => cond_v,
+                };
+                Ok(pred.to_dtype(DType::F32)?.neg()?)
+            },
+        )?;
+        on_progress(Progress::Decoding);
+        images.push(decode(&comps.vae, &lat)?);
+    }
+    Ok(images)
+}
+
+/// Image-conditioned instruction features for the edit path: preprocess the reference, run the
+/// Qwen3-VL vision tower, render the chat template with the reference image block, and run the
+/// image-conditioned MLLM forward. Returns `[1, L, 4096]` (f32) — the `<|image_pad|>` positions now
+/// carry the vision tower's merged embeds + deepstack injections.
+fn encode_image_instruction(
+    comps: &Components,
+    edit: &EditComponents,
+    reference: &Image,
+    instruction: &str,
+    device: &Device,
+) -> Result<Tensor> {
+    let (pixel_values, grid) = preprocess_image(
+        &reference.pixels,
+        reference.height as usize,
+        reference.width as usize,
+        device,
+    )?;
+    let (image_embeds, deepstack) = edit.vision.forward(&pixel_values, &[grid])?;
+
+    // Chat template with N = merged vision tokens worth of `<|image_pad|>` placeholders, then the
+    // image-conditioned MLLM forward (vision splice + 3-D MRoPE + deepstack injection).
+    let n = image_embeds.dim(0)?;
+    let ids = comps.tok.encode_edit_with_image(instruction, n)?;
+    Ok(comps
+        .te
+        .last_hidden_with_image(&ids, &image_embeds, &deepstack, grid, IMAGE_TOKEN_ID)?)
+}
+
+/// VAE-encode an RGB8 reference [`Image`] → clean latent `[1, 16, H/8, W/8]` (f32). Takes the latent
+/// distribution **mean** (first half of the encoder channels), then maps to latent space as
+/// `(mean − shift) · scale` — exactly the mlx `Vae::encode`, NOT the candle `AutoEncoderKL::encode`
+/// (which *samples* the diagonal Gaussian; the Edit path needs the deterministic mode).
+fn vae_encode(encoder: &Encoder, reference: &Image, device: &Device) -> Result<Tensor> {
+    let pixels = image_to_pixels(reference, device)?; // [1, 3, H, W] in [-1, 1], f32
+    let moments = encoder.forward(&pixels)?; // [1, 2C, H/8, W/8]
+    let two_c = moments.dim(1)?;
+    if two_c % 2 != 0 {
+        return Err(CandleError::Msg(format!(
+            "boogu edit: VAE encoder produced an odd channel count ({two_c}), expected 2·C"
+        )));
+    }
+    let c = two_c / 2;
+    let mean = moments.narrow(1, 0, c)?; // first C channels (the distribution mean)
+    let cfg = VaeConfig::z_image();
+    Ok(((mean - cfg.shift_factor)? * cfg.scaling_factor)?)
+}
+
+/// RGB8 [`Image`] (HWC, `[0, 255]`) → the VAE encoder's `[1, 3, H, W]` f32 tensor in `[-1, 1]` — the
+/// inverse of `postprocess_image`'s `x·0.5 + 0.5` denormalize.
+fn image_to_pixels(img: &Image, device: &Device) -> Result<Tensor> {
+    let (h, w) = (img.height as usize, img.width as usize);
+    let expected = h * w * 3;
+    if img.pixels.len() != expected {
+        return Err(CandleError::Msg(format!(
+            "boogu: reference pixel buffer {} bytes != {}x{}x3 ({expected})",
+            img.pixels.len(),
+            img.width,
+            img.height
+        )));
+    }
+    let f: Vec<f32> = img
+        .pixels
+        .iter()
+        .map(|&p| (p as f32 / 255.0) * 2.0 - 1.0)
+        .collect();
+    // HWC → CHW (batched): build [1, H, W, 3] then permute to [1, 3, H, W].
+    let nhwc = Tensor::from_vec(f, (1, h, w, 3), device)?;
+    Ok(nhwc.permute((0, 3, 1, 2))?.contiguous()?)
 }
 
 /// Seeded initial/renoise latent noise `[1, 16, H/8, W/8]` (f32). `step` derives a distinct RNG key
