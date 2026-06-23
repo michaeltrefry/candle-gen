@@ -219,6 +219,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-boogu"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-transformers",
+ "image",
+ "inventory",
+ "rand",
+ "rand_distr",
+ "serde_json",
+]
+
+[[package]]
 name = "candle-gen-chroma"
 version = "0.0.0"
 dependencies = [
