@@ -30,6 +30,12 @@ pub mod tokenizer;
 pub mod transformer;
 pub mod vae;
 
+// The candle Krea LoRA/LoKr trainer (sc-7577) + its vendored composable-op trainable DiT. Private
+// (reached through gen-core's trainer registry by id, like the SDXL/Z-Image trainers); the
+// `inventory::submit!` in `training` is kept linked by [`force_link`].
+mod train_dit;
+mod training;
+
 pub use config::Krea2Config;
 pub use pipeline::Components;
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
@@ -167,8 +173,10 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         }
     };
     if !spec.adapters.is_empty() {
+        // The `krea_2_raw` LoRA/LoKr **trainer** ships (sc-7577); applying a trained adapter at Turbo
+        // inference (the merge seam) is the separate inference-apply story (sc-7578).
         return Err(gen_core::Error::Unsupported(format!(
-            "candle {} does not yet accept user LoRA/LoKr adapters (tracked: sc-7577/sc-7578)",
+            "candle {} does not yet accept user LoRA/LoKr adapters at inference (tracked: sc-7578)",
             descriptor.id
         )));
     }
@@ -204,7 +212,8 @@ inventory::submit! {
     ModelRegistration { descriptor, load }
 }
 
-/// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped).
+/// Force-link hook (keeps the `inventory::submit!` registrations — the `krea_2_turbo` generator and the
+/// `krea_2_raw` trainer — from being dead-stripped).
 pub fn force_link() {}
 
 #[cfg(test)]

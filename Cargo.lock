@@ -366,6 +366,7 @@ dependencies = [
  "inventory",
  "rand",
  "rand_distr",
+ "safetensors 0.7.0",
  "serde_json",
 ]
 

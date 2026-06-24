@@ -35,3 +35,6 @@ flash-attn = ["candle-gen/flash-attn", "candle-transformers/flash-attn", "candle
 [dev-dependencies]
 # Encode the e2e real-weight smoke output to PNG for eyeballing (sc-7582); mirrors the other families.
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Read the trained adapter `.safetensors` header metadata (`networkType`/`rank`/`alpha`/`baseModel`) in
+# the trainer e2e smoke (sc-7577). Candle's own version (0.7), matching candle-gen.
+safetensors = "0.7"

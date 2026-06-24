@@ -177,7 +177,9 @@ impl Krea2Transformer {
 /// Reference `temb`: `freqs = exp(−ln(1e4)·arange(half)/half)`, `args = (timestep·1e3)·freqs`,
 /// `concat([cos, sin], −1)` (cos-first). `timestep`: `[b]` → `[b, 1, dim]` (a per-sample vector that
 /// broadcasts over the sequence). Built in f32 (the reference upcasts).
-fn temb(timestep: &Tensor, dim: usize, device: &Device) -> Result<Tensor> {
+///
+/// `pub(crate)` so the trainable DiT ([`crate::train_dit`]) shares the exact embedding (parity).
+pub(crate) fn temb(timestep: &Tensor, dim: usize, device: &Device) -> Result<Tensor> {
     let half = dim / 2;
     let neg_ln = -(10000f64.ln()) as f32;
     let freqs: Vec<f32> = (0..half)
@@ -192,7 +194,9 @@ fn temb(timestep: &Tensor, dim: usize, device: &Device) -> Result<Tensor> {
 
 /// Reference `rearrange("b c (h ph) (w pw) -> b (h w) (c ph pw)")`: `[b, C, H, W] →
 /// [b, (H/p)(W/p), C·p·p]` with **channel-major** patch flattening (NOT boogu's `(ph pw c)`).
-fn patchify(latent: &Tensor, p: usize) -> Result<Tensor> {
+///
+/// `pub(crate)` so the trainable DiT ([`crate::train_dit`]) patchifies identically.
+pub(crate) fn patchify(latent: &Tensor, p: usize) -> Result<Tensor> {
     let (b, c, h, w) = latent.dims4()?;
     let (ht, wt) = (h / p, w / p);
     let x = latent.reshape((b, c, ht, p, wt, p))?; // b, c, ht, ph, wt, pw
@@ -202,7 +206,15 @@ fn patchify(latent: &Tensor, p: usize) -> Result<Tensor> {
 
 /// Inverse of [`patchify`] (`"b (h w) (c ph pw) -> b c (h ph) (w pw)"`): `[b, (h)(w), C·p·p] →
 /// [b, C, h·p, w·p]`.
-fn unpatchify(tokens: &Tensor, ht: usize, wt: usize, p: usize, c: usize) -> Result<Tensor> {
+///
+/// `pub(crate)` so the trainable DiT ([`crate::train_dit`]) unpatchifies identically.
+pub(crate) fn unpatchify(
+    tokens: &Tensor,
+    ht: usize,
+    wt: usize,
+    p: usize,
+    c: usize,
+) -> Result<Tensor> {
     let b = tokens.dim(0)?;
     let x = tokens.contiguous()?.reshape((b, ht, wt, c, p, p))?; // b, ht, wt, c, ph, pw
     let x = x.permute((0, 3, 1, 4, 2, 5))?; // b, c, ht, ph, wt, pw
