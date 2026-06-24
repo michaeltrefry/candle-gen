@@ -11,19 +11,21 @@ categories = ["science"]
 [dependencies]
 candle-gen = { path = "../candle-gen" }
 inventory = { workspace = true }
-# JoyCaption is a LLaVA assembly (SigLIP-so400m vision tower + gelu-MLP projector + Llama-3.1-8B
-# decoder). It is a from-scratch candle port (no candle-transformers): the contract needs the
-# SigLIP **-2** hidden state and a Llama that consumes pre-spliced `inputs_embeds`, neither of which
-# candle-transformers exposes — so the tower, projector, splice, and autoregressive decoder are all
-# built in-crate on `candle_nn` primitives (mirroring the other no-reference family ports).
-tokenizers = { workspace = true }
-# Deterministic CPU-seeded sampling RNG (parity with the generators' sc-3673 approach).
-rand = { workspace = true }
+# The unified LLM engine: serves the JoyCaption VLM as the `candle-llava` core-llm vision provider
+# that this shim now consumes through the contract (sc-7692). Pinned to the SAME rev the SceneWorks
+# worker pins so cargo unifies ONE candle-llm — one `candle_core::Tensor`, one `core-llm` — across the
+# worker dependency graph. Both candle-gen and candle-llm pin the identical `candle-core` rev, so there
+# is a single candle build and one `Tensor` type; `core-llm` is `branch = "main"` everywhere, so cargo
+# locks one rev. The in-core SigLIP tower + projector + splice + Llama decoder that used to live here
+# moved into candle-llm's `candle-llava` provider (story 7634).
+candle-llm = { git = "https://github.com/SceneWorks/candle-llm", rev = "8ab61c8dd2b5617cfc6dba1cda978c73bf9d34bf" }
 
 [features]
 default = []
-metal = ["candle-gen/metal"]
-cuda = ["candle-gen/cuda"]
+# Forward the backend feature to candle-llm as well so the `candle-llava` provider's tower + decoder
+# run on the selected device (the CUDA worker build needs candle-llm built with `cuda`).
+metal = ["candle-gen/metal", "candle-llm/metal"]
+cuda = ["candle-gen/cuda", "candle-llm/cuda"]
 flash-attn = ["candle-gen/flash-attn"]
 
 [dev-dependencies]

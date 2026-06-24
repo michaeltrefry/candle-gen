@@ -1,242 +1,44 @@
 //! # candle-gen-joycaption
 //!
-//! The **JoyCaption** image-captioning provider for [`candle-gen`](candle_gen) — the candle
-//! (Windows/CUDA) sibling of `mlx-gen-joycaption`. JoyCaption is a `LlavaForConditionalGeneration`:
-//! a SigLIP-so400m vision tower ([`vision`]) → a gelu-MLP multimodal projector → a Llama-3.1-8B
-//! decoder ([`language`]). It implements the backend-neutral gen-core
-//! [`Captioner`](candle_gen::gen_core::Captioner) contract (image → caption text), not `Generator`.
+//! JoyCaption captioner registration for [`candle-gen`](candle_gen), served by candle-llm's LLaVA
+//! VLM provider. The candle (Windows/CUDA) sibling of `mlx-gen-joycaption`.
 //!
-//! There is **no** candle-transformers reference: the contract needs the SigLIP **`-2`** hidden
-//! state (`vision_feature_layer = -2`, `"full"` 729 tokens) and a Llama that consumes pre-spliced
-//! `inputs_embeds`, neither of which candle-transformers exposes — so the tower, the projector, the
-//! image-feature splice, and the autoregressive decoder are all ported from scratch on `candle_nn`.
+//! The model — SigLIP-so400m vision tower + LLaVA projector + image splice + Llama-3.1 decode + the
+//! LLaVA chat-input format — lives in [`candle-llm`](https://github.com/SceneWorks/candle-llm) as the
+//! `candle-llava` [`core_llm::TextLlm`] vision provider (story 7634). This crate is the thin consumer
+//! seam (story 7692, the candle twin of mlx's sc-7265): it keeps the SceneWorks caption **product
+//! policy** (caption types / length templates / capability bounds / the default system prompt, in
+//! [`prompt`]) and adapts the backend-neutral [`gen_core::Captioner`] contract the worker calls onto
+//! the unified engine — building the prompt text + image request and streaming the provider's tokens
+//! back.
 //!
-//! **Caption (sc-3699):** [`JoyCaptioner::caption`] preprocesses the image → SigLIP `-2` features →
-//! projector → splices the 729 projected rows over the expanded image-token placeholders → runs the
-//! Llama-3.1 decoder autoregressively (greedy or temperature/top-p with a small repetition penalty)
-//! → detokenizes. Registered under `"fancyfeast/llama-joycaption-beta-one-hf-llava"`.
+//! Unlike mlx-llm's dedicated `mlx-joycaption` provider (which injects JoyCaption's default system
+//! prompt itself), candle-llm's `candle-llava` is a *generic* LLaVA provider that renders whatever
+//! messages it is given through the model's own chat template. So this shim supplies the JoyCaption
+//! system prompt as an explicit `System` message — it is SceneWorks product content, not model code —
+//! and the engine owns the chat-input format, image-token splice, and decode.
 //!
-//! **Dtype:** the whole assembly runs **bf16** (the checkpoint's native dtype); logits upcast to f32
-//! for sampling. `backend = "candle"`, `mac_only = false`.
+//! `backend = "candle"`, `mac_only = false`. Registered under
+//! `"fancyfeast/llama-joycaption-beta-one-hf-llava"`.
 
-pub mod language;
 pub mod prompt;
-pub mod vision;
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-
-use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::core_llm::{
+    self, Content, ImageRef, LoadSpec as CoreLoadSpec, Message, ModelRequirements, Role, Sampling,
+    StreamEvent, TextLlm, TextLlmRequest,
+};
 use candle_gen::gen_core::registry::CaptionerRegistration;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
-    self, CaptionOutput, CaptionRequest, Captioner, CaptionerDescriptor, LoadSpec, Progress,
-    WeightsSource,
+    CaptionFinishReason, CaptionOutput, CaptionRequest, Captioner, CaptionerDescriptor, Error,
+    LoadSpec, Progress, Result, WeightsSource,
 };
-use candle_gen::{CandleError, Result as CResult};
 
-use language::{LlamaConfig, LlamaDecoder, LlavaProjector};
-use prompt::{
-    build_chat_text, build_prompt, capabilities, expand_image_tokens, BEGIN_OF_TEXT_TOKEN_ID,
-    DEFAULT_MAX_CONTEXT_TOKENS, JOY_CAPTION_FAMILY, JOY_CAPTION_MODEL_ID, PAD_TOKEN_ID,
-};
-use vision::{SiglipImageProcessor, SiglipVisionConfig, SiglipVisionTower};
+use prompt::{build_prompt, capabilities, JOY_CAPTION_FAMILY, JOY_CAPTION_MODEL_ID, SYSTEM_PROMPT};
 
-/// The JoyCaption checkpoint is bf16 (SigLIP2 + Llama-3.1); the whole assembly runs at this dtype.
-const MODEL_DTYPE: DType = DType::BF16;
-
-/// The loaded, weight-bearing model components + tokenizer (cached after the first caption).
-struct Engine {
-    vision: SiglipVisionTower,
-    projector: LlavaProjector,
-    llama: LlamaDecoder,
-    processor: SiglipImageProcessor,
-    tokenizer: TextTokenizer,
-}
-
-impl Engine {
-    fn load(root: &std::path::Path, device: &Device) -> CResult<Self> {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(root)
-            .map_err(|e| {
-                CandleError::Msg(format!("joycaption: read snapshot {}: {e}", root.display()))
-            })?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            return Err(CandleError::Msg(format!(
-                "joycaption: no .safetensors in snapshot dir {}",
-                root.display()
-            )));
-        }
-        // SAFETY: mmap of read-only weight files; the standard candle loading path.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, MODEL_DTYPE, device)? };
-
-        let vision = SiglipVisionTower::new(
-            SiglipVisionConfig::default(),
-            vb.pp("vision_tower").pp("vision_model"),
-        )?;
-        let projector = LlavaProjector::new(vb.pp("multi_modal_projector"))?;
-        let llama = LlamaDecoder::new(LlamaConfig::default(), vb.pp("language_model"))?;
-
-        let tokenizer = TextTokenizer::from_file(
-            root.join("tokenizer.json"),
-            TokenizerConfig {
-                max_length: DEFAULT_MAX_CONTEXT_TOKENS,
-                pad_token_id: PAD_TOKEN_ID as i32,
-                chat_template: ChatTemplate::None,
-                pad_to_max_length: false,
-            },
-        )
-        .map_err(|e| CandleError::Msg(format!("joycaption: load tokenizer: {e}")))?;
-
-        Ok(Self {
-            vision,
-            projector,
-            llama,
-            processor: SiglipImageProcessor::default(),
-            tokenizer,
-        })
-    }
-}
-
-pub struct JoyCaptioner {
-    descriptor: CaptionerDescriptor,
-    root: PathBuf,
-    device: Device,
-    engine: Mutex<Option<Arc<Engine>>>,
-}
-
-impl JoyCaptioner {
-    fn engine(&self) -> CResult<Arc<Engine>> {
-        let mut guard = self
-            .engine
-            .lock()
-            .expect("joycaption engine cache mutex poisoned");
-        if let Some(e) = guard.as_ref() {
-            return Ok(e.clone());
-        }
-        let engine = Arc::new(Engine::load(&self.root, &self.device)?);
-        *guard = Some(engine.clone());
-        Ok(engine)
-    }
-
-    fn run(
-        &self,
-        req: &CaptionRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> CResult<CaptionOutput> {
-        let engine = self.engine()?;
-
-        // Vision: preprocess → SigLIP -2 features → project into the Llama hidden size.
-        let pixels = engine
-            .processor
-            .preprocess(&req.image, &self.device, MODEL_DTYPE)?;
-        let vision_features = engine.vision.forward(&pixels)?; // [1, 729, 1152]
-        let projected = engine.projector.forward(&vision_features)?; // [1, 729, 4096]
-
-        // Prompt: wrap the (already-constructed) request prompt in the Llama-3 chat template, map to
-        // ids (no auto special tokens — the template carries them as literal strings), prepend the
-        // <|begin_of_text|> BOS the HF chat template starts with, then expand the single image marker
-        // into 729 placeholders.
-        let chat = build_chat_text(&req.prompt);
-        let mut ids: Vec<i64> = engine
-            .tokenizer
-            .encode_ids(&chat, false)
-            .map_err(|e| CandleError::Msg(format!("joycaption: tokenize: {e}")))?
-            .into_iter()
-            .map(|i| i as i64)
-            .collect();
-        ids.insert(0, BEGIN_OF_TEXT_TOKEN_ID);
-        let ids = expand_image_tokens(&ids);
-
-        // Embed ids, splice the projected image rows over the image-token positions.
-        let input_ids = Tensor::from_vec(
-            ids.iter().map(|&i| i as u32).collect::<Vec<_>>(),
-            (1, ids.len()),
-            &self.device,
-        )?;
-        let embeds = engine.llama.embed(&input_ids)?;
-        let spliced = language::splice_image_features(&embeds, &ids, &projected)?;
-
-        // Autoregressive generation, reporting one progress step per emitted token.
-        let total = req.sampling.max_new_tokens;
-        let mut produced = 0u32;
-        let mut on_token = || {
-            produced += 1;
-            on_progress(Progress::Step {
-                current: produced,
-                total,
-            });
-        };
-        let gen = engine.llama.generate_from_embeds(
-            &ids,
-            &spliced,
-            req.sampling,
-            &req.cancel,
-            &mut on_token,
-        )?;
-
-        let toks: Vec<u32> = gen.token_ids.iter().map(|&i| i as u32).collect();
-        let text = engine
-            .tokenizer
-            .decode(&toks, true)
-            .map(|t| t.trim().to_owned())
-            .map_err(|e| CandleError::Msg(format!("joycaption: detokenize: {e}")))?;
-
-        Ok(CaptionOutput {
-            text,
-            generated_tokens: Some(gen.token_ids.len() as u32),
-            finish_reason: Some(gen.finish_reason),
-        })
-    }
-}
-
-impl Captioner for JoyCaptioner {
-    fn descriptor(&self) -> &CaptionerDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &CaptionRequest) -> gen_core::Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(JOY_CAPTION_MODEL_ID, req)?;
-        Ok(())
-    }
-
-    fn caption(
-        &self,
-        req: &CaptionRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<CaptionOutput> {
-        // Construct the effective prompt from the caption type/length options when the caller didn't
-        // supply one (sc-5189), mirroring mlx-gen-joycaption's `normalized_request`
-        // (`out.prompt = build_prompt(out.options)`). SceneWorks' worker sends `prompt = custom_prompt`,
-        // which is empty for the normal type/length flow — without this the request fails validation
-        // ("prompt is required"). `validate`/`run` then see a non-empty, options-derived prompt.
-        let req = normalized_request(req);
-        self.validate(&req)?;
-        // An already-cancelled request returns the typed `Canceled` before any inference (or even a
-        // weight load) runs — the captioner cancellation contract (sc-4895).
-        if req.cancel.is_cancelled() {
-            return Err(gen_core::Error::Canceled);
-        }
-        Ok(self.run(&req, on_progress)?)
-    }
-}
-
-/// Fill the request prompt from the caption options when the caller left it empty — the JoyCaption
-/// type/length template (or the custom-prompt override, which `build_prompt` returns as-is). Mirrors
-/// `mlx-gen-joycaption`'s `normalized_request` so both backends accept an options-only request.
-fn normalized_request(req: &CaptionRequest) -> CaptionRequest {
-    let mut out = req.clone();
-    if out.prompt.trim().is_empty() {
-        out.prompt = build_prompt(&out.options);
-    }
-    out
-}
+// Force-link the candle-llm engine so the `candle-llava` provider's `inventory::submit!` into
+// core-llm's registry survives the linker — this crate resolves the provider through
+// `core_llm::load_for_model_with` and never names another candle-llm symbol.
+use candle_llm as _;
 
 /// The JoyCaption captioner descriptor (candle backend; not mac-only).
 pub fn descriptor() -> CaptionerDescriptor {
@@ -248,14 +50,21 @@ pub fn descriptor() -> CaptionerDescriptor {
     }
 }
 
-/// Construct a lazy candle JoyCaption captioner. `spec.weights` must be a [`WeightsSource::Dir`]
-/// pointing at a `fancyfeast/llama-joycaption-beta-one-hf-llava` snapshot (`config.json`,
-/// `tokenizer.json`, `model-*.safetensors`). Adapters / quantization are rejected (not wired).
-pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Captioner>> {
+/// Construct a candle JoyCaption captioner. `spec.weights` must be a [`WeightsSource::Dir`] pointing
+/// at a `fancyfeast/llama-joycaption-beta-one-hf-llava` snapshot (`config.json`, `tokenizer.json`,
+/// `model-*.safetensors`). Adapters / quantization are rejected (not wired). The provider — and its
+/// weights — are resolved eagerly, exactly as the worker's `load_captioner` call site expects (it
+/// loads at job time with the real snapshot present, mirroring the mlx lane).
+pub fn load(spec: &LoadSpec) -> Result<Box<dyn Captioner>> {
+    Ok(Box::new(load_joycaption(spec)?))
+}
+
+/// The concrete-typed loader behind [`load`].
+pub fn load_joycaption(spec: &LoadSpec) -> Result<JoyCaptioner> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
         WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(
+            return Err(Error::Msg(
                 "joycaption expects a snapshot directory (config.json, tokenizer.json, \
                  model-*.safetensors), not a single .safetensors file"
                     .into(),
@@ -263,22 +72,168 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Captioner>> {
         }
     };
     if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(
+        return Err(Error::Unsupported(
             "candle joycaption does not support LoRA/LoKr".into(),
         ));
     }
     if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(
+        return Err(Error::Unsupported(
             "candle joycaption does not support on-the-fly quantization".into(),
         ));
     }
-    let device = candle_gen::default_device()?;
-    Ok(Box::new(JoyCaptioner {
+
+    // Model-first resolution: the `candle-llava` vision provider's weightless `can_load` claims the
+    // LLaVA snapshot; `with_vision()` disambiguates it from any text-only provider.
+    let provider = core_llm::load_for_model_with(
+        &CoreLoadSpec {
+            source: root.to_string_lossy().into_owned(),
+            quantize: None,
+        },
+        &ModelRequirements::default().with_vision(),
+    )
+    .map_err(map_core_err)?;
+
+    Ok(JoyCaptioner {
         descriptor: descriptor(),
-        root,
-        device,
-        engine: Mutex::new(None),
-    }))
+        provider,
+    })
+}
+
+/// The JoyCaption captioner: a thin adapter from the [`gen_core::Captioner`] contract onto the
+/// candle-llm `candle-llava` vision provider.
+pub struct JoyCaptioner {
+    descriptor: CaptionerDescriptor,
+    provider: Box<dyn TextLlm>,
+}
+
+/// Fill the request prompt from the caption options when the caller left it empty — the JoyCaption
+/// type/length template (or the custom-prompt override, which `build_prompt` returns as-is). Mirrors
+/// `mlx-gen-joycaption`'s `normalized_request` so both backends accept an options-only request
+/// (SceneWorks' worker sends `prompt = custom_prompt`, empty for the normal type/length flow).
+fn normalized_request(req: &CaptionRequest) -> CaptionRequest {
+    let mut out = req.clone();
+    if out.prompt.trim().is_empty() {
+        out.prompt = build_prompt(&out.options);
+    }
+    out
+}
+
+impl Captioner for JoyCaptioner {
+    fn descriptor(&self) -> &CaptionerDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &CaptionRequest) -> Result<()> {
+        let req = normalized_request(req);
+        self.descriptor
+            .capabilities
+            .validate_request(self.descriptor.id, &req)
+    }
+
+    fn caption(
+        &self,
+        req: &CaptionRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<CaptionOutput> {
+        let req = normalized_request(req);
+        self.descriptor
+            .capabilities
+            .validate_request(self.descriptor.id, &req)?;
+        // An already-cancelled request returns the typed `Canceled` before any inference runs — the
+        // captioner cancellation contract (sc-4895 / the testkit pre-cancel check).
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+
+        // The JoyCaption default system prompt (product policy) + one user turn carrying the image and
+        // the (product-policy) prompt text. The LLaVA chat-input format and image-token splice are
+        // applied inside the provider, so the consumer passes plain text + an image and nothing
+        // model-specific. (mlx-llm's dedicated provider injects this system prompt itself; the generic
+        // candle-llava provider does not, so the shim supplies it here.)
+        let image = ImageRef::new(req.image.width, req.image.height, req.image.pixels.clone())
+            .map_err(Error::Msg)?;
+        let messages = vec![
+            Message {
+                role: Role::System,
+                content: vec![Content::Text(SYSTEM_PROMPT.to_owned())],
+                thinking: None,
+            },
+            Message {
+                role: Role::User,
+                content: vec![Content::Image(image), Content::Text(req.prompt.clone())],
+                thinking: None,
+            },
+        ];
+
+        // The provider polls its own `core_llm::CancelFlag`; bridge the gen-core flag onto it by
+        // mirroring on each streamed token so the provider's next-step cancel check trips promptly.
+        let core_cancel = core_llm::CancelFlag::new();
+        let request = TextLlmRequest {
+            messages,
+            sampling: Sampling {
+                temperature: req.sampling.temperature,
+                top_p: req.sampling.top_p,
+                // CaptionSampling exposes no top-k; disabled (0) matches the prior engine sampler.
+                top_k: 0,
+                repetition_penalty: req.sampling.repetition_penalty,
+                repetition_context: req.sampling.repetition_context,
+            },
+            max_new_tokens: req.sampling.max_new_tokens,
+            seed: req.sampling.seed,
+            cancel: core_cancel.clone(),
+            ..Default::default()
+        };
+
+        // Report one progress step per emitted token (the testkit's Progress-monotonicity check) and
+        // bridge cancellation on every token.
+        let total = req.sampling.max_new_tokens;
+        let gen_cancel = req.cancel.clone();
+        let bridge_cancel = core_cancel;
+        let mut produced = 0u32;
+        let mut on_event = |ev: StreamEvent| {
+            if let StreamEvent::Token { .. } = ev {
+                produced += 1;
+                on_progress(Progress::Step {
+                    current: produced,
+                    total,
+                });
+                if gen_cancel.is_cancelled() {
+                    bridge_cancel.cancel();
+                }
+            }
+        };
+        let out = self
+            .provider
+            .generate(&request, &mut on_event)
+            .map_err(map_core_err)?;
+
+        Ok(CaptionOutput {
+            text: out.text.trim().to_owned(),
+            generated_tokens: Some(out.usage.generated_tokens),
+            finish_reason: out.finish_reason.map(map_finish),
+        })
+    }
+}
+
+/// Map a core-llm engine error onto the gen-core captioner error, preserving the **typed**
+/// cancellation the contract (and the conformance suite) require.
+fn map_core_err(e: core_llm::Error) -> Error {
+    match e {
+        core_llm::Error::Canceled => Error::Canceled,
+        other => Error::Msg(other.to_string()),
+    }
+}
+
+fn map_finish(f: core_llm::FinishReason) -> CaptionFinishReason {
+    match f {
+        // JoyCaption stops on an EOS/stop token or exhausts its token budget; it ships no content
+        // filter, so that arm is unreachable but kept total (treated as a model-initiated stop).
+        core_llm::FinishReason::Stop | core_llm::FinishReason::ContentFilter => {
+            CaptionFinishReason::StopToken
+        }
+        core_llm::FinishReason::Length => CaptionFinishReason::MaxTokens,
+        core_llm::FinishReason::Cancelled => CaptionFinishReason::Cancelled,
+    }
 }
 
 inventory::submit! {
@@ -291,8 +246,7 @@ pub fn force_link() {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
-    use candle_gen::gen_core::{CaptionOptions, CaptionRequest};
+    use candle_gen::gen_core::{AdapterKind, AdapterSpec, CaptionOptions};
 
     #[test]
     fn normalize_builds_prompt_from_options_when_empty() {
@@ -340,15 +294,6 @@ mod tests {
     }
 
     #[test]
-    fn registers_and_resolves_as_candle_captioner() {
-        // Lazy load: a nonexistent dir still resolves (weights are only touched at caption time).
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let c = registry::load_captioner(JOY_CAPTION_MODEL_ID, &spec).expect("registered");
-        assert_eq!(c.descriptor().id, JOY_CAPTION_MODEL_ID);
-        assert_eq!(c.descriptor().backend, "candle");
-    }
-
-    #[test]
     fn load_rejects_single_file_source() {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/w.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
@@ -357,13 +302,12 @@ mod tests {
 
     #[test]
     fn load_rejects_adapters() {
-        use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         let spec = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
         assert!(matches!(
             load(&spec).err().expect("err"),
-            gen_core::Error::Unsupported(_)
+            Error::Unsupported(_)
         ));
     }
 }
