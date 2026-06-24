@@ -20,6 +20,7 @@
 //! satisfies it). The Q4/Q8 turnkey + worker quant gating is sc-7581; the Story-1 slice loads dense
 //! bf16.
 
+pub mod adapters;
 pub mod config;
 pub mod convert;
 pub mod loader;
@@ -36,6 +37,7 @@ pub mod vae;
 mod train_dit;
 mod training;
 
+pub use adapters::{merge_adapters, merge_into_weights, MergeReport};
 pub use config::Krea2Config;
 pub use pipeline::Components;
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
@@ -50,8 +52,8 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, WeightsSource,
+    self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
+    Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
 
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
@@ -72,6 +74,9 @@ pub struct KreaGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
     device: Device,
+    /// LoRA/LoKr adapters merged into the DiT weights at component-load (sc-7836). Fixed for this
+    /// generator instance; empty ⇒ the stock unadapted build.
+    adapters: Vec<AdapterSpec>,
     components: Mutex<Option<Arc<Components>>>,
 }
 
@@ -84,7 +89,11 @@ impl KreaGenerator {
         if let Some(c) = guard.as_ref() {
             return Ok(c.clone());
         }
-        let c = Arc::new(pipeline::load_components(&self.root, &self.device)?);
+        let c = Arc::new(pipeline::load_components(
+            &self.root,
+            &self.device,
+            &self.adapters,
+        )?);
         *guard = Some(c.clone());
         Ok(c)
     }
@@ -143,8 +152,11 @@ pub fn descriptor() -> ModelDescriptor {
             supports_guidance: false,
             supports_true_cfg: false,
             conditioning: Vec::new(),
-            supports_lora: false,
-            supports_lokr: false,
+            // LoRA/LoKr wired (sc-7836): a trained `krea_2_raw` adapter merges into the dense DiT
+            // attention projections at load ([`adapters::merge_into_weights`]), closing the candle
+            // train→infer loop. On-the-fly Q4/Q8 quantization is still deferred (rejected at load).
+            supports_lora: true,
+            supports_lokr: true,
             // Rectified-flow v-param over the unified curated-sampler framework (epic 7114). The
             // native distilled loop stays the byte-exact default (`req.sampler == None`).
             samplers: candle_gen::curated_sampler_names(),
@@ -172,14 +184,8 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
             )));
         }
     };
-    if !spec.adapters.is_empty() {
-        // The `krea_2_raw` LoRA/LoKr **trainer** ships (sc-7577); applying a trained adapter at Turbo
-        // inference (the merge seam) is the separate inference-apply story (sc-7578).
-        return Err(gen_core::Error::Unsupported(format!(
-            "candle {} does not yet accept user LoRA/LoKr adapters at inference (tracked: sc-7578)",
-            descriptor.id
-        )));
-    }
+    // LoRA/LoKr adapters are accepted and merged into the DiT at first `generate` (sc-7836); the merge
+    // (`adapters::merge_into_weights`) is lazy, so a nonexistent adapter path still loads here.
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {} does not yet support on-the-fly Q4/Q8 quantization (load bf16 weights); the \
@@ -198,6 +204,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         descriptor,
         root,
         device,
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
     }))
 }
@@ -239,6 +246,10 @@ mod tests {
         assert!(!d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_negative_prompt);
         assert!(d.capabilities.conditioning.is_empty());
+        // LoRA/LoKr merge wired (sc-7836); on-the-fly quant still deferred.
+        assert!(d.capabilities.supports_lora);
+        assert!(d.capabilities.supports_lokr);
+        assert!(d.capabilities.supported_quants.is_empty());
         assert_eq!(d.capabilities.max_size, 2048);
         assert_eq!(TURBO_STEPS, 8);
     }
@@ -299,17 +310,17 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_single_file_and_unwired_surfaces() {
+    fn load_accepts_lora_rejects_single_file_and_unwired_surfaces() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         let file = LoadSpec::new(WeightsSource::File("/tmp/q.safetensors".into()));
         assert!(load(&file).is_err());
+        // LoRA/LoKr now wired (sc-7836): a LoRA `LoadSpec` is accepted (lazily — the merge happens at
+        // first `generate`), so `load` resolves rather than rejecting.
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
-        assert!(matches!(
-            load(&lora).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        assert!(load(&lora).is_ok(), "LoRA load is wired + lazy (sc-7836)");
+        // On-the-fly quantization is still deferred — a typed `Unsupported` so the worker can fall back.
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
         assert!(matches!(
             load(&quant).err().expect("err"),

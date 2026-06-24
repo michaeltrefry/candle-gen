@@ -4,6 +4,7 @@
 //! loads the identity-keyed diffusers checkpoint directly). [`linear`] builds a [`Linear`] from the
 //! actual `{base}.weight` (+ optional `{base}.bias`) tensor shapes.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
@@ -11,10 +12,18 @@ use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::Linear;
 
 /// An mmaped component-directory of `.safetensors`, loading tensors at a fixed compute dtype.
+///
+/// An optional in-memory `overlay` (installed by [`set_overlay`](Weights::set_overlay)) takes priority
+/// over the mmap for the keys it holds — the inference-side LoRA/LoKr adapter merge (sc-7836) folds its
+/// deltas into the targeted dense weights on the CPU in f32, then installs them here so
+/// [`crate::transformer::Krea2Transformer::load`] reads the **merged** weight without re-mmapping or
+/// touching the untargeted bulk of the model. Overlay tensors are stored CPU-side (where the merge runs)
+/// and moved to `device` / cast to the requested dtype on read, exactly like the mmap path.
 pub struct Weights {
     st: MmapedSafetensors,
     device: Device,
     dtype: DType,
+    overlay: HashMap<String, Tensor>,
 }
 
 impl Weights {
@@ -40,6 +49,7 @@ impl Weights {
             st,
             device: device.clone(),
             dtype,
+            overlay: HashMap::new(),
         })
     }
 
@@ -51,26 +61,49 @@ impl Weights {
             st,
             device: device.clone(),
             dtype,
+            overlay: HashMap::new(),
         })
     }
 
-    /// Load `name` at the component dtype.
+    /// Load `name` at the component dtype — from the [`overlay`](Weights::set_overlay) if present
+    /// (adapter-merged weight), else the mmap.
     pub fn get(&self, name: &str) -> Result<Tensor> {
+        if let Some(t) = self.overlay.get(name) {
+            return t.to_device(&self.device)?.to_dtype(self.dtype);
+        }
         self.st.load(name, &self.device)?.to_dtype(self.dtype)
     }
 
-    /// Load `name` preserving its on-disk dtype (e.g. int `input_ids` in a parity fixture).
+    /// Load `name` preserving its on-disk dtype (e.g. int `input_ids` in a parity fixture). The overlay
+    /// only ever holds merged DiT weights (never raw-dtype tensors), so this stays the mmap path.
     pub fn get_raw(&self, name: &str) -> Result<Tensor> {
         self.st.load(name, &self.device)
     }
 
-    /// Load `name` forcing f32 (the `+1` norm weights and other precision-sensitive scalars).
+    /// Load `name` forcing f32 (the `+1` norm weights and other precision-sensitive scalars) — from the
+    /// overlay if present, else the mmap.
     pub fn get_f32(&self, name: &str) -> Result<Tensor> {
+        if let Some(t) = self.overlay.get(name) {
+            return t.to_device(&self.device)?.to_dtype(DType::F32);
+        }
         self.st.load(name, &self.device)?.to_dtype(DType::F32)
     }
 
+    /// Load `name` onto the **CPU** at its on-disk dtype. Used by the inference-side adapter merge
+    /// ([`crate::adapters`]), which reconstructs LoRA/LoKr deltas on the CPU (matching the CPU-loaded
+    /// adapter factors) and folds them into the base weight before installing the [`overlay`](Weights::set_overlay).
+    pub(crate) fn get_cpu(&self, name: &str) -> Result<Tensor> {
+        self.st.load(name, &Device::Cpu)
+    }
+
+    /// Install an in-memory `overlay` of (CPU-resident) tensors that take priority over the mmap for the
+    /// keys they cover — the adapter-merged dense weights (sc-7836). Replaces any prior overlay.
+    pub(crate) fn set_overlay(&mut self, overlay: HashMap<String, Tensor>) {
+        self.overlay = overlay;
+    }
+
     pub fn contains(&self, name: &str) -> bool {
-        self.st.get(name).is_ok()
+        self.overlay.contains_key(name) || self.st.get(name).is_ok()
     }
 
     /// All tensor keys in the component (for architecture validation).
@@ -78,7 +111,8 @@ impl Weights {
         self.st.tensors().into_iter().map(|(k, _)| k).collect()
     }
 
-    /// On-disk shape of `name` (for architecture validation), or `None` if absent.
+    /// On-disk shape of `name` (for architecture validation), or `None` if absent. The overlay never
+    /// changes a weight's shape, so the mmap is authoritative.
     pub fn shape(&self, name: &str) -> Option<Vec<usize>> {
         self.st.get(name).ok().map(|v| v.shape().to_vec())
     }

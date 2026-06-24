@@ -25,6 +25,10 @@ rand = { workspace = true }
 rand_distr = { workspace = true }
 # Parse the diffusers `transformer/config.json` + `text_encoder/config.json` + `model_index.json`.
 serde_json = "1"
+# Read a trained adapter `.safetensors` header `__metadata__` (`networkType`/`rank`/`alpha`) for the
+# inference-side LoRA/LoKr merge (sc-7836) — candle's tensor loader drops the header blob. Candle's own
+# version (0.7), matching candle-gen / the other provider crates' `adapters.rs`.
+safetensors = "0.7"
 
 [features]
 default = []
@@ -35,6 +39,3 @@ flash-attn = ["candle-gen/flash-attn", "candle-transformers/flash-attn", "candle
 [dev-dependencies]
 # Encode the e2e real-weight smoke output to PNG for eyeballing (sc-7582); mirrors the other families.
 image = { version = "0.25", default-features = false, features = ["png"] }
-# Read the trained adapter `.safetensors` header metadata (`networkType`/`rank`/`alpha`/`baseModel`) in
-# the trainer e2e smoke (sc-7577). Candle's own version (0.7), matching candle-gen.
-safetensors = "0.7"

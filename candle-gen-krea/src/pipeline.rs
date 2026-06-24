@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
+use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_gen_qwen_image::vae::QwenVae;
 use rand::{rngs::StdRng, SeedableRng};
@@ -54,7 +54,15 @@ pub struct Components {
 }
 
 /// Load all Turbo components from a Krea 2 snapshot (`tokenizer/ text_encoder/ transformer/ vae/`).
-pub fn load_components(root: &Path, device: &Device) -> Result<Components> {
+///
+/// `adapters` (when non-empty) are trained `krea_2_raw` LoRA/LoKr `.safetensors` merged into the dense
+/// DiT attention projections at load (sc-7836, [`crate::adapters::merge_into_weights`]) — **merge, not
+/// residual** (the flow-match sampler is chaos-sensitive). Empty ⇒ the stock unadapted build.
+pub fn load_components(
+    root: &Path,
+    device: &Device,
+    adapters: &[AdapterSpec],
+) -> Result<Components> {
     let tok = crate::tokenizer::KreaTokenizer::from_snapshot(root, device)?;
 
     let te_cfg = KreaTeConfig::from_snapshot(root)?;
@@ -62,8 +70,12 @@ pub fn load_components(root: &Path, device: &Device) -> Result<Components> {
     let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
 
     let cfg = Krea2Config::from_snapshot(root)?;
-    let dit_w = Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
+    let mut dit_w = Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
     crate::convert::validate_transformer(&dit_w, &cfg)?;
+    // Fold any LoRA/LoKr adapters into the targeted dense weights before the DiT reads them. A
+    // non-empty spec that matches no target is a hard error inside `merge_into_weights` (the worker
+    // then falls back rather than silently rendering unadapted).
+    crate::adapters::merge_into_weights(&mut dit_w, &cfg, adapters)?;
     let dit = Krea2Transformer::load(&dit_w, &cfg)?;
 
     let vae = load_vae(root, device)?;
