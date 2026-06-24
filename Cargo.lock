@@ -334,11 +334,10 @@ name = "candle-gen-joycaption"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-llm",
  "image",
  "inventory",
- "rand",
  "sceneworks-gen-core-testkit",
- "tokenizers 0.22.2",
 ]
 
 [[package]]
@@ -559,6 +558,19 @@ name = "candle-kernels"
 version = "0.10.2"
 dependencies = [
  "cudaforge",
+]
+
+[[package]]
+name = "candle-llm"
+version = "0.0.0"
+source = "git+https://github.com/SceneWorks/candle-llm?rev=8ab61c8dd2b5617cfc6dba1cda978c73bf9d34bf#8ab61c8dd2b5617cfc6dba1cda978c73bf9d34bf"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "core-llm",
+ "inventory",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

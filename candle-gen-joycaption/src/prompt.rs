@@ -1,31 +1,19 @@
-//! JoyCaption prompt + chat-template + token-id surface — a near-verbatim port of mlx-gen's
-//! `src/caption/joycaption.rs` (backend-agnostic: pure string/token logic). The SceneWorks caption
-//! prompt map, the LLaVA/Llama-3 chat wrapper, the special token ids, and the capability surface.
+//! JoyCaption caption **product policy** — the SceneWorks caption prompt map, the default system
+//! prompt, the capability surface, and trigger-word post-processing. Pure string logic, backend
+//! agnostic.
+//!
+//! The model's chat-input format (the LLaVA/Llama-3 chat wrapper) and the special token ids used to
+//! live here too; they moved into candle-llm's `candle-llava` provider when this crate was repointed
+//! onto the unified engine (sc-7692). What remains is product content only.
 
 use candle_gen::gen_core::{CaptionCapabilities, CaptionOptions};
 
 pub const JOY_CAPTION_MODEL_ID: &str = "fancyfeast/llama-joycaption-beta-one-hf-llava";
 pub const JOY_CAPTION_FAMILY: &str = "joycaption";
 
+/// JoyCaption's default system prompt. Passed by the shim as an explicit `System` message (the
+/// generic `candle-llava` provider does not inject a model-specific system prompt of its own).
 pub const SYSTEM_PROMPT: &str = "You are a helpful image captioner.";
-pub const DEFAULT_DATE_STRING: &str = "26 July 2024";
-pub const CUTTING_KNOWLEDGE_DATE: &str = "December 2023";
-
-pub const BEGIN_OF_TEXT_TOKEN_ID: i64 = 128000;
-pub const END_OF_TEXT_TOKEN_ID: i64 = 128001;
-pub const START_HEADER_TOKEN_ID: i64 = 128006;
-pub const END_HEADER_TOKEN_ID: i64 = 128007;
-pub const EOM_TOKEN_ID: i64 = 128008;
-pub const EOT_TOKEN_ID: i64 = 128009;
-pub const PAD_TOKEN_ID: i64 = 128004;
-pub const IMAGE_TOKEN_ID: i64 = 128077;
-/// SigLIP-so400m/14@384 → 27² = 729 patch tokens; the single `IMAGE_TOKEN` expands to this many.
-pub const IMAGE_SEQ_LENGTH: usize = 729;
-pub const DEFAULT_MAX_CONTEXT_TOKENS: usize = 4096;
-
-pub const IMAGE_TOKEN: &str = "<|reserved_special_token_69|>";
-pub const IMAGE_START_TOKEN: &str = "<|reserved_special_token_70|>";
-pub const IMAGE_END_TOKEN: &str = "<|reserved_special_token_71|>";
 
 pub const JOY_NAME_OPTION: &str =
     "If there is a person/character in the image you must refer to them as {name}.";
@@ -206,47 +194,6 @@ pub fn apply_trigger_words(caption: &str, trigger_words: &[String]) -> String {
     parts.join(", ")
 }
 
-pub fn build_chat_text(prompt: &str) -> String {
-    build_chat_text_with_system(prompt, SYSTEM_PROMPT, DEFAULT_DATE_STRING, true)
-}
-
-pub fn build_chat_text_with_system(
-    prompt: &str,
-    system_prompt: &str,
-    date_string: &str,
-    add_generation_prompt: bool,
-) -> String {
-    let user_prompt = prompt.replace(IMAGE_TOKEN, "");
-    let user_prompt = user_prompt.trim_start();
-    let mut text = format!(
-        "<|start_header_id|>system<|end_header_id|>\n\n\
-         Cutting Knowledge Date: {CUTTING_KNOWLEDGE_DATE}\n\
-         Today Date: {date_string}\n\n\
-         {system_prompt}<|eot_id|>\
-         <|start_header_id|>user<|end_header_id|>\n\n\
-         {IMAGE_START_TOKEN}{IMAGE_TOKEN}{IMAGE_END_TOKEN}{user_prompt}<|eot_id|>"
-    );
-    if add_generation_prompt {
-        text.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
-    }
-    text
-}
-
-/// Expand the single `IMAGE_TOKEN_ID` (from the chat text's one `<|image|>`) into
-/// [`IMAGE_SEQ_LENGTH`] copies, so the spliced vision features line up 1:1 with the 729 image-token
-/// embeddings. Port of `expand_joycaption_image_tokens`.
-pub fn expand_image_tokens(ids: &[i64]) -> Vec<i64> {
-    let mut out = Vec::with_capacity(ids.len() + IMAGE_SEQ_LENGTH);
-    for &id in ids {
-        if id == IMAGE_TOKEN_ID {
-            out.extend(std::iter::repeat_n(IMAGE_TOKEN_ID, IMAGE_SEQ_LENGTH));
-        } else {
-            out.push(id);
-        }
-    }
-    out
-}
-
 fn templates_for(caption_type: &str) -> &'static [&'static str; 3] {
     PROMPT_TEMPLATES
         .iter()
@@ -298,33 +245,6 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(prompt, "Describe only the outfit.");
-    }
-
-    #[test]
-    fn chat_template_matches_single_turn_hf_shape() {
-        let text = build_chat_text("Write a caption.");
-        assert_eq!(
-            text,
-            "<|start_header_id|>system<|end_header_id|>\n\n\
-             Cutting Knowledge Date: December 2023\n\
-             Today Date: 26 July 2024\n\n\
-             You are a helpful image captioner.<|eot_id|>\
-             <|start_header_id|>user<|end_header_id|>\n\n\
-             <|reserved_special_token_70|><|reserved_special_token_69|><|reserved_special_token_71|>Write a caption.<|eot_id|>\
-             <|start_header_id|>assistant<|end_header_id|>\n\n"
-        );
-    }
-
-    #[test]
-    fn expand_image_tokens_expands_to_seq_length() {
-        let ids = vec![1, IMAGE_TOKEN_ID, 2];
-        let out = expand_image_tokens(&ids);
-        assert_eq!(out.len(), 2 + IMAGE_SEQ_LENGTH);
-        assert_eq!(out[0], 1);
-        assert!(out[1..1 + IMAGE_SEQ_LENGTH]
-            .iter()
-            .all(|&id| id == IMAGE_TOKEN_ID));
-        assert_eq!(out[1 + IMAGE_SEQ_LENGTH], 2);
     }
 
     #[test]
