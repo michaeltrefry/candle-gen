@@ -16,6 +16,7 @@
 //! `[B, img_len, 128]` plus the 4 captured text-feature layers and predicts the patch-space velocity
 //! `[B, img_len, 128]` (= `patch²·out_channels`). Run bf16 in production / f32 for the parity gate.
 
+use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::{
     linear, ops::softmax_last_dim, rms_norm, Linear, Module, RmsNorm, VarBuilder,
@@ -30,6 +31,73 @@ use crate::rope::{apply_rope, LensRope};
 pub const EPS: f64 = 1e-6;
 /// The multi-layer text front-end RMSNorm epsilon (the `txt_norm` per-layer norms use eps 1e-5).
 pub const TXT_NORM_EPS: f64 = 1e-5;
+
+/// Which DiT projection a quant decision applies to ([`DitQuantPlan`]).
+#[derive(Clone, Copy)]
+enum DitRole {
+    ImgIn,
+    TxtIn,
+    ProjOut,
+    Attn,
+    Mlp,
+}
+
+/// Per-role GGUF block type for [`LensTransformer::quantize`]. `None` for a role keeps those linears
+/// dense (bf16).
+///
+/// **sc-7702 — the SwiGLU MLP stays at Q8 in the Q4 tier.** Uniform `Q4_0` (or `Q4_K`/`Q5_K`) across
+/// the DiT makes the denoise **diverge to NaN** (a black render): the [`GateMlp`]'s *unbounded*
+/// `silu(w1·x)·(w3·x)` product amplifies the 4/5-bit quant error and the latent blows up over the
+/// denoise steps until a SwiGLU activation overflows bf16 (~step 3). Empirically (GPU sweep, sc-7545
+/// box) **only Q8 on the MLP** holds — Q4_0/Q4_K/Q5_K MLP all diverge — while attention tolerates Q4
+/// (its softmax-weighted output is bounded). So `Quant::Q4` ⇒ Q8 MLP + Q4_0 attention/`img_in`/
+/// `txt_in`/`proj_out`; `Quant::Q8` ⇒ uniform Q8. Every DiT linear's `in_features` is ÷32, so both
+/// `Q4_0` and `Q8_0` are always valid (no k-quant / fallback needed).
+#[derive(Clone, Copy)]
+struct DitQuantPlan {
+    img_in: Option<GgmlDType>,
+    txt_in: Option<GgmlDType>,
+    proj_out: Option<GgmlDType>,
+    attn: Option<GgmlDType>,
+    mlp: Option<GgmlDType>,
+}
+
+impl DitQuantPlan {
+    fn from_quant(quant: Quant) -> Self {
+        match quant {
+            // Q8 is uniformly stable.
+            Quant::Q8 => {
+                let q8 = Some(GgmlDType::Q8_0);
+                Self {
+                    img_in: q8,
+                    txt_in: q8,
+                    proj_out: q8,
+                    attn: q8,
+                    mlp: q8,
+                }
+            }
+            // Q4: Q8 the divergence-prone SwiGLU MLP, Q4_0 everything else (sc-7702).
+            Quant::Q4 => Self {
+                img_in: Some(GgmlDType::Q4_0),
+                txt_in: Some(GgmlDType::Q4_0),
+                proj_out: Some(GgmlDType::Q4_0),
+                attn: Some(GgmlDType::Q4_0),
+                mlp: Some(GgmlDType::Q8_0),
+            },
+        }
+    }
+
+    /// The GGUF block type for `role` (`None` = keep dense).
+    fn dtype(&self, role: DitRole) -> Option<GgmlDType> {
+        match role {
+            DitRole::ImgIn => self.img_in,
+            DitRole::TxtIn => self.txt_in,
+            DitRole::ProjOut => self.proj_out,
+            DitRole::Attn => self.attn,
+            DitRole::Mlp => self.mlp,
+        }
+    }
+}
 
 /// The Lens / Lens-Turbo `transformer/config.json` values.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -180,10 +248,11 @@ impl GateMlp {
         self.w2.forward(&gate.mul(&up)?)
     }
 
-    fn quantize(&mut self, quant: Quant) -> Result<()> {
-        self.w1.quantize(quant)?;
-        self.w2.quantize(quant)?;
-        self.w3.quantize(quant)?;
+    fn quantize(&mut self, plan: &DitQuantPlan) -> Result<()> {
+        let dt = plan.dtype(DitRole::Mlp);
+        for w in [&mut self.w1, &mut self.w2, &mut self.w3] {
+            w.quantize_to(dt)?;
+        }
         Ok(())
     }
 }
@@ -226,11 +295,16 @@ impl JointAttention {
     /// Quantize the four fused/output projections to Q4/Q8 (sc-5117). Called **after** any adapter
     /// merge (the merge folds `W += δ` into the dense weight before the DiT is built, so the quantized
     /// base already carries the adapter delta). The QK-norm weights stay full precision.
-    fn quantize(&mut self, quant: Quant) -> Result<()> {
-        self.img_qkv.quantize(quant)?;
-        self.txt_qkv.quantize(quant)?;
-        self.to_out.quantize(quant)?;
-        self.to_add_out.quantize(quant)?;
+    fn quantize(&mut self, plan: &DitQuantPlan) -> Result<()> {
+        let dt = plan.dtype(DitRole::Attn);
+        for l in [
+            &mut self.img_qkv,
+            &mut self.txt_qkv,
+            &mut self.to_out,
+            &mut self.to_add_out,
+        ] {
+            l.quantize_to(dt)?;
+        }
         Ok(())
     }
 
@@ -338,10 +412,10 @@ impl LensTransformerBlock {
     /// Quantize the block's compute-heavy linears to Q4/Q8 (sc-5117): the joint-attention projections
     /// and both SwiGLU MLPs. The AdaLN modulations (`img_mod`/`txt_mod`) and the RMSNorm weights stay
     /// full precision (small, and precision-sensitive — the modulation drives every gated residual).
-    pub fn quantize(&mut self, quant: Quant) -> Result<()> {
-        self.attn.quantize(quant)?;
-        self.img_mlp.quantize(quant)?;
-        self.txt_mlp.quantize(quant)?;
+    fn quantize(&mut self, plan: &DitQuantPlan) -> Result<()> {
+        self.attn.quantize(plan)?;
+        self.img_mlp.quantize(plan)?;
+        self.txt_mlp.quantize(plan)?;
         Ok(())
     }
 
@@ -476,12 +550,17 @@ impl LensTransformer {
     /// precision-sensitive). Call **after** any adapter merge — the merge folds `W += δ` into the dense
     /// weight before the DiT is built, so quantizing here transcodes the already-adapted base. Mirrors
     /// `mlx-gen-lens::dit::LensTransformer::quantize` (sc-3175).
+    ///
+    /// The per-linear precision is the [`DitQuantPlan`] for `quant`: `Quant::Q8` is uniform Q8, while
+    /// `Quant::Q4` keeps the **SwiGLU MLP at Q8** (4/5-bit MLP makes the denoise diverge to NaN —
+    /// sc-7702) and Q4_0s the rest.
     pub fn quantize(&mut self, quant: Quant) -> Result<()> {
-        self.img_in.quantize(quant)?;
-        self.txt_in.quantize(quant)?;
-        self.proj_out.quantize(quant)?;
+        let plan = DitQuantPlan::from_quant(quant);
+        self.img_in.quantize_to(plan.dtype(DitRole::ImgIn))?;
+        self.txt_in.quantize_to(plan.dtype(DitRole::TxtIn))?;
+        self.proj_out.quantize_to(plan.dtype(DitRole::ProjOut))?;
         for block in &mut self.blocks {
-            block.quantize(quant)?;
+            block.quantize(&plan)?;
         }
         Ok(())
     }
@@ -593,5 +672,45 @@ mod tests {
         assert_eq!(c.mlp_hidden(), 4096); // inner/3·8
         assert_eq!(c.txt_in_dim(), 11520); // 2880·4
         assert_eq!(c.axes_dims_rope.iter().sum::<usize>(), c.head_dim); // 8+28+28 = 64
+    }
+
+    /// sc-7702 regression: the Q4 plan must keep the SwiGLU MLP at **Q8_0** (4/5-bit MLP diverges to
+    /// NaN over the denoise → black render) while Q4_0-ing the rest; Q8 stays uniform. Guards the fix
+    /// against a future "quantize everything uniformly" regression (the e2e check is the GPU
+    /// `lens-render` example's degeneracy guard).
+    #[test]
+    fn q4_plan_protects_swiglu_mlp() {
+        let q4 = DitQuantPlan::from_quant(Quant::Q4);
+        assert_eq!(
+            q4.dtype(DitRole::Mlp),
+            Some(GgmlDType::Q8_0),
+            "Q4 MLP must be Q8"
+        );
+        for role in [
+            DitRole::ImgIn,
+            DitRole::TxtIn,
+            DitRole::ProjOut,
+            DitRole::Attn,
+        ] {
+            assert_eq!(
+                q4.dtype(role),
+                Some(GgmlDType::Q4_0),
+                "Q4 non-MLP must be Q4_0"
+            );
+        }
+        let q8 = DitQuantPlan::from_quant(Quant::Q8);
+        for role in [
+            DitRole::ImgIn,
+            DitRole::TxtIn,
+            DitRole::ProjOut,
+            DitRole::Attn,
+            DitRole::Mlp,
+        ] {
+            assert_eq!(
+                q8.dtype(role),
+                Some(GgmlDType::Q8_0),
+                "Q8 must be uniform Q8"
+            );
+        }
     }
 }

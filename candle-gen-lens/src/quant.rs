@@ -83,15 +83,24 @@ impl QLinear {
     }
 
     /// Fold a dense projection to `Q4_0`/`Q8_0` in place (idempotent — a no-op if already quantized).
-    /// The weight is quantized on the CPU and placed back on its original device via
-    /// `QTensor::quantize_onto`; the bias is promoted to f32 for the post-matmul add.
     pub fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.quantize_to(Some(ggml_dtype(quant)))
+    }
+
+    /// Fold a dense projection to a **specific** GGUF block type, or keep it dense when `dtype` is
+    /// `None` (sc-7702 mixed-precision: the divergence-prone SwiGLU MLP stays at Q8 while the rest of
+    /// the DiT is Q4_0). Idempotent. The weight is quantized on the CPU and placed back on its original
+    /// device via `QTensor::quantize_onto`; the bias is promoted to f32 for the post-matmul add.
+    pub fn quantize_to(&mut self, dtype: Option<GgmlDType>) -> Result<()> {
+        let Some(dtype) = dtype else {
+            return Ok(());
+        };
         let Self::Dense(l) = self else {
             return Ok(());
         };
         let device = l.weight().device().clone();
         let w_cpu = l.weight().to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        let qtensor = QTensor::quantize_onto(&w_cpu, ggml_dtype(quant), &device)?;
+        let qtensor = QTensor::quantize_onto(&w_cpu, dtype, &device)?;
         let matmul = QMatMul::from_qtensor(qtensor)?;
         let bias = match l.bias() {
             Some(b) => Some(b.to_dtype(DType::F32)?),
