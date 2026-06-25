@@ -4,21 +4,23 @@
 //! class** of the whole LoRA-trainer hierarchy (epic 5164) — and reuses the shared
 //! [`candle_gen::train`] harness the SDXL story established.
 //!
-//! ## What it does, and the Z-Image realities that shape it
+//! Since sc-7787 the cache → loop → save scaffolding lives in the shared single-model flow-match
+//! driver ([`candle_gen::train::flow_match`]); this module supplies the Z-Image-specific hooks via
+//! [`FlowMatchTrainer`] — caching, DiT construction, and the one parity-critical piece that genuinely
+//! differs per family: [`compute_loss_grads`].
 //!
-//! Cache → loop → save, mirroring the SDXL trainer's lifecycle bands but on the **flow-match**
-//! objective (Z-Image is a rectified-flow model, not DDPM ε-prediction):
+//! ## The Z-Image realities that shape the hooks (flow-match, not DDPM ε-prediction)
 //!
 //!  1. **Cache** — for each captioned image: decode/crop/resize to a VAE-input tensor
 //!     ([`load_image_tensor`]), encode the **deterministic latent mean** (the stock z_image
-//!     [`Encoder`] → `(mean − shift)·scale`; the `reg` sampling is skipped so caching is
+//!     [`Encoder`](VaeEncoder) → `(mean − shift)·scale`; the `reg` sampling is skipped so caching is
 //!     reproducible), and encode the caption through the Qwen3 text encoder with the *exact* gen-core
 //!     [`TokenizerConfig`] inference uses → `(L, 2560)`. The VAE + text encoder are dropped after
-//!     caching (idle for the rest of the run).
-//!  2. **Loop** — sample a flow-match `σ ∈ [1e-3, 1−1e-3]` ([`sample_sigma`], the timestep
-//!     distribution/bias knobs), form `x_t = (1−σ)·x0 + σ·noise`, predict the velocity through the
-//!     vendored trainable DiT, regress it toward `noise − x0`, and step the adapter factors.
-//!     Gradient accumulation, LR schedule, and grad-norm clipping all reuse the harness.
+//!     caching.
+//!  2. **Loop** (driver-owned) — sample a flow-match `σ ∈ [1e-3, 1−1e-3]`
+//!     ([`sample_unit_timestep`](candle_gen::train::flow_match::sample_unit_timestep)), form
+//!     `x_t = (1−σ)·x0 + σ·noise`, predict the velocity through the vendored trainable DiT, regress it
+//!     toward `noise − x0`, and step the adapter factors.
 //!  3. **Save** — a PEFT `.safetensors` (`save_lora_peft` with the DiT's **bare** key prefix /
 //!     `save_lokr`), the exact on-disk format [`crate::adapters::merge_adapters`] reads back.
 //!
@@ -27,6 +29,8 @@
 //! [`ZImageTransformer2DModel`] returns the **raw** velocity, so the trainer negates it and regresses
 //! the negated velocity toward `noise − x0` — exactly optimizing the adapter against the function
 //! inference will run (the MLX twin folds the negation into its `forward`; same target either way).
+//! The timestep fed to the DiT is `1 − σ` (the `current_timestep_normalized` convention) — distinct
+//! from Lens (`t`), Krea (`σ`), and Wan (`t·1000`), which is why [`compute_loss_grads`] stays local.
 //!
 //! **The eager-`Var` simplification** (inherited from the SDXL harness): the adapter factors are
 //! storage-sharing `Var`s installed once ([`build_lora_targets`]/[`build_lokr_targets`]); each forward
@@ -44,30 +48,21 @@
 //! Mac-unified-memory SIGKILL that forced the MLX work), so this is the lever for higher training
 //! resolutions / smaller cards rather than a correctness requirement.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Tensor, Var};
-use candle_nn::VarBuilder;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::train::{
-    NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress,
-    TrainingRequest,
+    Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use candle_gen::gen_core::{self, LoadSpec, Modality, WeightsSource};
-use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
-use candle_gen::train::gradient_checkpoint::checkpointed_backward_with_input_grad;
-use candle_gen::train::lora::{
-    build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraSet,
+use candle_gen::train::flow_match::{
+    self, run_flow_match_training, validate_flow_match_request, velocity_loss, FlowMatchTrainer,
 };
-use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
-use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
+use candle_gen::train::gradient_checkpoint::checkpointed_backward_with_input_grad;
 use candle_gen::{CandleError, Result};
 
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
@@ -79,100 +74,17 @@ use crate::dit::{ZImageTransformer2DModel, Z_IMAGE_ATTN_TARGETS};
 use crate::pipeline::{QWEN_PAD_TOKEN_ID, TOKENIZER_MAX_LEN};
 use crate::MODEL_ID;
 
-/// Recognized `timestep_type` values — the noise-schedule samplers [`sample_sigma`] branches on
-/// (`linear`/`uniform`/`weighted`) plus the `sigmoid` default it falls back to. Validation rejects
-/// anything else rather than silently sampling sigmoid (matching the MLX trainer's F-041 guard).
-const TIMESTEP_TYPES: [&str; 4] = ["sigmoid", "linear", "uniform", "weighted"];
-/// Recognized `timestep_bias` values — the high/low-noise tilts plus the neutral default.
-const TIMESTEP_BIASES: [&str; 9] = [
-    "balanced",
-    "none",
-    "neutral",
-    "high",
-    "high_noise",
-    "favor_high_noise",
-    "low",
-    "low_noise",
-    "favor_low_noise",
-];
-/// Recognized `loss_type` values — `mae`/`l1` select MAE, `mse`/`l2` the MSE default.
-const LOSS_TYPES: [&str; 4] = ["mse", "l2", "mae", "l1"];
+/// Error-message prefix shared by [`validate_flow_match_request`] and the driver's `no usable dataset
+/// items` guard.
+const LABEL: &str = "z_image trainer";
 
-/// `"bf16"`/`"bfloat16"` → [`DType::BF16`]; anything else → [`DType::F32`] (the gen-core contract:
-/// unrecognized = f32). Z-Image is a bf16 model (the default), but the adapter factors / loss / grads
-/// stay f32 regardless (master weights).
-fn parse_compute_dtype(s: &str) -> DType {
-    let t = s.trim();
-    if t.eq_ignore_ascii_case("bf16") || t.eq_ignore_ascii_case("bfloat16") {
-        DType::BF16
-    } else {
-        DType::F32
-    }
-}
-
-/// Normalize a free-form config string (trim, lowercase, `-`/space → `_`) so validation accepts
-/// exactly the spellings [`sample_sigma`] would.
-fn normalize_cfg(s: &str) -> String {
-    s.trim().to_ascii_lowercase().replace([' ', '-'], "_")
-}
-
-/// Sample a normalized flow-match timestep (interpolation coefficient) `σ ∈ [1e-3, 1−1e-3]` — a
-/// faithful port of the MLX `sample_sigma` / SceneWorks `sample_training_timestep`: `sigmoid(randn)`
-/// by default, `uniform` for linear, `(uniform + sigmoid(randn))/2` for weighted; bias `high` → `√σ`,
-/// `low` → `σ²`. Deterministic in `seed` via the sc-3673 CPU `StdRng` discipline (NOT candle's device
-/// RNG). Cross-framework numeric parity with MLX is a non-goal (different RNG algorithms); per-seed
-/// determinism is what the worker relies on.
-fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> f32 {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
-    let t = match normalize_cfg(timestep_type).as_str() {
-        "linear" | "uniform" => rng.random::<f32>(),
-        "weighted" => {
-            let base = rng.random::<f32>();
-            let z: f32 = StandardNormal.sample(&mut rng);
-            (base + sigmoid(z)) / 2.0
-        }
-        // "sigmoid" + any unrecognized value (validation rejects the latter up front).
-        _ => {
-            let z: f32 = StandardNormal.sample(&mut rng);
-            sigmoid(z)
-        }
-    };
-    let t = match normalize_cfg(timestep_bias).as_str() {
-        "high" | "high_noise" | "favor_high_noise" => t.sqrt(),
-        "low" | "low_noise" | "favor_low_noise" => t * t,
-        _ => t,
-    };
-    t.clamp(1e-3, 1.0 - 1e-3)
-}
-
-/// `(x_t, target, timestep)` for one sample at flow-match `σ`: `x_t = (1−σ)·x0 + σ·noise`,
-/// `target = noise − x0` (the velocity the *negated* DiT output trains toward), `timestep = 1−σ` (the
-/// `current_timestep_normalized` convention the DiT's `t_embedder` consumes). All in f32.
+/// `(x_t, target, timestep)` for one sample at flow-match `σ`: delegates the latent mix
+/// (`x_t = (1−σ)·x0 + σ·noise`, `target = noise − x0`) to the shared
+/// [`flow_match::build_batch`](candle_gen::train::flow_match::build_batch) and appends Z-Image's
+/// timestep convention `1 − σ` (the `current_timestep_normalized` the DiT's `t_embedder` consumes).
 fn build_batch(x0: &Tensor, noise: &Tensor, sigma: f32) -> Result<(Tensor, Tensor, f32)> {
-    let x_t = ((x0 * (1.0 - sigma) as f64)? + (noise * sigma as f64)?)?;
-    let target = (noise - x0)?;
+    let (x_t, target) = flow_match::build_batch(x0, noise, sigma as f64)?;
     Ok((x_t, target, 1.0 - sigma))
-}
-
-/// Flow-match velocity loss in f32: `mean((v − target)²)` (MSE) or `mean|v − target|` (MAE). `v` (the
-/// negated DiT output, in the compute dtype) is promoted to f32 so the loss/grads stay f32.
-fn velocity_loss(v: &Tensor, target_f32: &Tensor, mae: bool) -> candle_core::Result<Tensor> {
-    let diff = (v.to_dtype(DType::F32)? - target_f32)?;
-    if mae {
-        diff.abs()?.mean_all()
-    } else {
-        diff.sqr()?.mean_all()
-    }
-}
-
-/// Deterministic `N(0, 1)` noise of the given shape, drawn from a seeded CPU `StdRng` then moved to
-/// `device` (sc-3673 launch-portable discipline). The flow-match prior + the regression target.
-fn sample_noise(shape: &[usize], seed: u64, device: &Device) -> Result<Tensor> {
-    let n: usize = shape.iter().product();
-    let mut rng = StdRng::seed_from_u64(seed);
-    let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
-    Ok(Tensor::from_vec(data, shape, &Device::Cpu)?.to_device(device)?)
 }
 
 /// One micro-step's forward+backward over the installed adapter `Var`s: build the noised latent at
@@ -269,42 +181,6 @@ fn compute_loss_grads(
     }
 }
 
-/// Resolve the sorted `.safetensors` files in the snapshot component subdir `sub`.
-fn component_files(root: &Path, sub: &str) -> Result<Vec<PathBuf>> {
-    let dir = root.join(sub);
-    if !dir.is_dir() {
-        return Err(CandleError::Msg(format!(
-            "z_image trainer: snapshot missing the {sub}/ component directory (at {})",
-            root.display()
-        )));
-    }
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|e| CandleError::Msg(format!("z_image trainer: read {sub}/: {e}")))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "z_image trainer: no .safetensors in {sub}/ (at {})",
-            dir.display()
-        )));
-    }
-    Ok(files)
-}
-
-/// Build a [`VarBuilder`] over the snapshot component subdir `sub` at `dtype`.
-fn component_vb(
-    root: &Path,
-    sub: &str,
-    device: &Device,
-    dtype: DType,
-) -> Result<VarBuilder<'static>> {
-    let files = component_files(root, sub)?;
-    // SAFETY: mmap of read-only weight files; standard candle loading path.
-    Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? })
-}
-
 /// Encode the **deterministic latent mean** of a VAE-input image `[1, 3, edge, edge]` (range
 /// `[-1, 1]`) to a clean latent `[1, 16, edge/8, edge/8]`: run the encoder, take the distribution
 /// **mean** (the first channel half, skipping `DiagonalGaussian`'s sampling), then `(mean − shift)·
@@ -354,39 +230,18 @@ fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
 }
 
 /// Build the vendored, trainable DiT from the snapshot `transformer/` safetensors at `dtype`.
-fn build_dit(root: &Path, device: &Device, dtype: DType) -> Result<ZImageTransformer2DModel> {
-    let vb = component_vb(root, "transformer", device, dtype)?;
+fn build_trainable_dit(
+    root: &Path,
+    device: &Device,
+    dtype: DType,
+) -> Result<ZImageTransformer2DModel> {
+    let vb = flow_match::component_vb(root, "transformer", device, dtype, LABEL)?;
     // The vendored DiT always runs the materialized math attention (the flash/SDPA paths have no
     // backward); the stock `use_accelerated_attn` knob is irrelevant to it. `z_image_turbo` config.
     Ok(ZImageTransformer2DModel::new(
         &DitConfig::z_image_turbo(),
         vb,
     )?)
-}
-
-/// The config's target-module suffixes (default [`Z_IMAGE_ATTN_TARGETS`]).
-fn resolve_target_suffixes(cfg: &TrainingConfig) -> Vec<String> {
-    if cfg.lora_target_modules.is_empty() {
-        Z_IMAGE_ATTN_TARGETS.iter().map(|s| s.to_string()).collect()
-    } else {
-        cfg.lora_target_modules.clone()
-    }
-}
-
-/// Write the adapter as a `.safetensors`: LoRA with the DiT's **bare** dotted keys (empty prefix —
-/// the SDXL `base_model.model.unet.` prefix is SDXL-specific), LoKr with bare keys + metadata.
-fn save_adapter(set: &LoraSet, path: &Path) -> Result<()> {
-    let meta = HashMap::new();
-    match set.kind {
-        AdapterKind::Lora => save_lora_peft(set, "", &meta, path),
-        AdapterKind::Lokr => save_lokr(set, &meta, path),
-    }
-}
-
-/// Create the output directory, mapping the `io::Error` into the crate error.
-fn create_output_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| CandleError::Msg(format!("create output dir {}: {e}", dir.display())))
 }
 
 /// Identity + capabilities of the candle Z-Image trainer: LoRA + LoKr, `backend = "candle"`.
@@ -441,7 +296,7 @@ impl Trainer for ZImageTrainer {
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        self.validate_impl(req).map_err(Into::into)
+        validate_flow_match_request(req, LABEL).map_err(Into::into)
     }
 
     fn train(
@@ -449,82 +304,42 @@ impl Trainer for ZImageTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
-        self.train_impl(req, on_progress).map_err(Into::into)
+        validate_flow_match_request(req, LABEL)?;
+        run_flow_match_training(self, req, on_progress).map_err(Into::into)
     }
 }
 
-impl ZImageTrainer {
-    /// Reject a request before any expensive load: empty dataset, zero rank/steps, unsupported
-    /// optimizer, and — rather than silently falling back to a default sampler/loss — an unrecognized
-    /// `timestep_type`/`timestep_bias`/`loss_type` (the MLX F-041 guard). The target-module
-    /// resolution is checked in [`train_impl`](Self::train_impl), where the loaded DiT is available.
-    fn validate_impl(&self, req: &TrainingRequest) -> Result<()> {
-        let cfg = &req.config;
-        if req.items.is_empty() {
-            return Err(CandleError::Msg("z_image trainer: dataset is empty".into()));
-        }
-        if cfg.rank == 0 {
-            return Err(CandleError::Msg("z_image trainer: rank must be > 0".into()));
-        }
-        if cfg.steps == 0 {
-            return Err(CandleError::Msg(
-                "z_image trainer: steps must be > 0".into(),
-            ));
-        }
-        if !TrainOptimizer::is_supported(&cfg.optimizer) {
-            return Err(CandleError::Msg(format!(
-                "z_image trainer: optimizer '{}' is not available (supported: adamw, adam, rose, prodigy)",
-                cfg.optimizer
-            )));
-        }
-        if !TIMESTEP_TYPES.contains(&normalize_cfg(&cfg.timestep_type).as_str()) {
-            return Err(CandleError::Msg(format!(
-                "z_image trainer: timestep_type '{}' is not recognized (supported: {})",
-                cfg.timestep_type,
-                TIMESTEP_TYPES.join(", ")
-            )));
-        }
-        if !TIMESTEP_BIASES.contains(&normalize_cfg(&cfg.timestep_bias).as_str()) {
-            return Err(CandleError::Msg(format!(
-                "z_image trainer: timestep_bias '{}' is not recognized (supported: {})",
-                cfg.timestep_bias,
-                TIMESTEP_BIASES.join(", ")
-            )));
-        }
-        if !LOSS_TYPES.contains(&normalize_cfg(&cfg.loss_type).as_str()) {
-            return Err(CandleError::Msg(format!(
-                "z_image trainer: loss_type '{}' is not recognized (supported: {})",
-                cfg.loss_type,
-                LOSS_TYPES.join(", ")
-            )));
-        }
-        Ok(())
+impl FlowMatchTrainer for ZImageTrainer {
+    type Dit = ZImageTransformer2DModel;
+    /// `(x0 latent [1,16,h,w], caption embed (L, 2560))`, both f32.
+    type Cached = (Tensor, Tensor);
+    type Aux = ();
+    const LABEL: &'static str = LABEL;
+
+    fn device(&self) -> &Device {
+        &self.device
     }
 
-    /// The rich-`Result` body behind [`Trainer::train`].
-    fn train_impl(
-        &mut self,
-        req: &TrainingRequest,
-        on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> Result<TrainingOutput> {
-        self.validate_impl(req)?;
-        let cfg = &req.config;
-        let device = &self.device;
-        on_progress(TrainingProgress::Preparing);
-        let edge = bucket_resolution(cfg.resolution);
-        let compute_dtype = parse_compute_dtype(&cfg.train_dtype);
+    fn default_targets(&self) -> &'static [&'static str] {
+        &Z_IMAGE_ATTN_TARGETS
+    }
 
-        // --- load + cache: VAE latent means + Qwen caption embeddings (both f32) ---
-        on_progress(TrainingProgress::LoadingModel);
+    fn cache(
+        &self,
+        req: &TrainingRequest,
+        device: &Device,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> Result<(Vec<(Tensor, Tensor)>, ())> {
+        let edge = bucket_resolution(req.config.resolution);
         let vae_cfg = VaeConfig::z_image();
         let vae_encoder = VaeEncoder::new(
             &vae_cfg,
-            component_vb(&self.root, "vae", device, DType::F32)?.pp("encoder"),
+            flow_match::component_vb(&self.root, "vae", device, DType::F32, LABEL)?.pp("encoder"),
         )?;
         let tokenizer = load_tokenizer(&self.root)?;
         let text_encoder = ZImageTextEncoder::new(
             &TextEncoderConfig::z_image(),
-            component_vb(&self.root, "text_encoder", device, DType::F32)?,
+            flow_match::component_vb(&self.root, "text_encoder", device, DType::F32, LABEL)?,
         )?;
 
         let total = req.items.len() as u32;
@@ -550,131 +365,50 @@ impl ZImageTrainer {
         // Encoders are dead weight once cached — drop them before the DiT (working set) loads.
         drop(text_encoder);
         drop(vae_encoder);
-        if cache.is_empty() {
-            if req.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            return Err(CandleError::Msg(
-                "z_image trainer: no usable dataset items".into(),
-            ));
-        }
+        Ok((cache, ()))
+    }
 
-        // --- build DiT + install adapters ---
-        let mut dit = build_dit(&self.root, device, compute_dtype)?;
-        let suffixes = resolve_target_suffixes(cfg);
-        let lora_set = match cfg.network_type {
-            NetworkType::Lora => {
-                build_lora_targets(&mut dit, &suffixes, cfg.rank, cfg.alpha, cfg.seed, device)?
-            }
-            NetworkType::Lokr => build_lokr_targets(
-                &mut dit,
-                &suffixes,
-                cfg.rank,
-                cfg.alpha,
-                cfg.decompose_factor,
-                cfg.seed,
-                device,
-            )?,
-        };
-        let use_checkpoint = cfg.gradient_checkpointing;
+    fn build_dit(
+        &self,
+        req: &TrainingRequest,
+        device: &Device,
+    ) -> Result<ZImageTransformer2DModel> {
+        build_trainable_dit(
+            &self.root,
+            device,
+            flow_match::parse_compute_dtype(&req.config.train_dtype),
+        )
+    }
 
-        // --- optimizer + schedule ---
-        let mae = matches!(cfg.loss_type.to_ascii_lowercase().as_str(), "mae" | "l1");
-        // AdamW with wd=0 ≡ Adam, so the one optimizer covers both choices.
-        let weight_decay = if cfg.optimizer.eq_ignore_ascii_case("adam") {
-            0.0
-        } else {
-            cfg.weight_decay
-        };
-        let mut opt = TrainOptimizer::from_config(
-            &cfg.optimizer,
-            lora_set.vars.clone(),
-            cfg.learning_rate,
-            weight_decay,
-        )?;
-        let accum = cfg.gradient_accumulation.max(1);
-        let (total_updates, warmup_updates) =
-            schedule_updates(cfg.steps, accum, cfg.lr_warmup_steps);
-        let stem = file_stem(&req.file_name).to_string();
-
-        // --- train loop ---
-        let mut accumulated: Option<GradStore> = None;
-        let mut update_idx = 0u32;
-        let mut last_loss = 0.0f32;
-        let mut steps_run = 0u32;
-        for step in 1..=cfg.steps {
-            if req.cancel.is_cancelled() {
-                break;
-            }
-            let (x0, cap) = &cache[((step - 1) as usize) % cache.len()];
-            let sigma = sample_sigma(
-                &cfg.timestep_type,
-                &cfg.timestep_bias,
-                cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
-            );
-            let noise = sample_noise(
-                x0.dims(),
-                cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
-                device,
-            )?;
-            let (loss, grads) = compute_loss_grads(
-                &dit,
-                &lora_set.vars,
-                x0,
-                cap,
-                sigma,
-                &noise,
-                mae,
-                compute_dtype,
-                use_checkpoint,
-            )?;
-            last_loss = loss;
-            steps_run = step;
-            accumulate_grads(&mut accumulated, grads, &lora_set.vars)?;
-
-            if step % accum == 0 || step == cfg.steps {
-                let mult =
-                    lr_multiplier(cfg.lr_scheduler, update_idx, total_updates, warmup_updates);
-                opt.set_lr_scaled(mult);
-                let mut avg = accumulated
-                    .take()
-                    .expect("an update fires only after accumulation");
-                scale_grads(&mut avg, &lora_set.vars, 1.0 / accum as f64)?;
-                clip_grad_norm(&mut avg, &lora_set.vars, 1.0)?;
-                opt.step(&avg)?;
-                update_idx += 1;
-            }
-
-            on_progress(TrainingProgress::Training {
-                step,
-                total: cfg.steps,
-                loss: last_loss,
-            });
-
-            if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
-                create_output_dir(&req.output_dir)?;
-                let ckpt = req.output_dir.join(checkpoint_filename(&stem, step));
-                save_adapter(&lora_set, &ckpt)?;
-                on_progress(TrainingProgress::Checkpoint { step });
-            }
-        }
-
-        // Cancelled before a single step completed: the factors are still the no-op init (`B = 0`),
-        // so surface the typed cancellation rather than shipping an identity adapter (F-040).
-        if steps_run == 0 {
-            return Err(CandleError::Canceled);
-        }
-
-        // --- save final adapter ---
-        on_progress(TrainingProgress::Saving);
-        create_output_dir(&req.output_dir)?;
-        let adapter_path = req.output_dir.join(&req.file_name);
-        save_adapter(&lora_set, &adapter_path)?;
-        Ok(TrainingOutput {
-            adapter_path,
-            steps: steps_run,
-            final_loss: last_loss,
-        })
+    fn micro_step(
+        &self,
+        dit: &ZImageTransformer2DModel,
+        vars: &[Var],
+        cached: &(Tensor, Tensor),
+        _aux: &(),
+        cfg: &TrainingConfig,
+        step: u32,
+        device: &Device,
+    ) -> Result<(f32, GradStore)> {
+        let (x0, cap) = cached;
+        let sigma = flow_match::sample_unit_timestep(
+            &cfg.timestep_type,
+            &cfg.timestep_bias,
+            flow_match::timestep_seed(cfg.seed, step),
+        );
+        let noise =
+            flow_match::sample_noise(x0.dims(), flow_match::noise_seed(cfg.seed, step), device)?;
+        compute_loss_grads(
+            dit,
+            vars,
+            x0,
+            cap,
+            sigma,
+            &noise,
+            flow_match::is_mae(cfg),
+            flow_match::parse_compute_dtype(&cfg.train_dtype),
+            cfg.gradient_checkpointing,
+        )
     }
 }
 
@@ -683,6 +417,7 @@ mod tests {
     use super::*;
     use candle_gen::gen_core::registry;
     use candle_gen::train::lora::build_lora_targets;
+    use candle_gen::train::optim::{clip_grad_norm, TrainOptimizer};
     use candle_nn::{VarBuilder, VarMap};
     use candle_transformers::models::z_image::transformer::Config;
 
@@ -700,37 +435,8 @@ mod tests {
         (model, cfg)
     }
 
-    /// `sample_sigma` is deterministic in its seed, lands in `[1e-3, 1−1e-3]`, and the bias tilts
-    /// shift the mass the documented way (`low` ⇒ smaller σ than neutral than `high`, on average).
-    #[test]
-    fn sigma_is_deterministic_and_in_range() {
-        for seed in [0u64, 1, 42, 9999] {
-            let a = sample_sigma("sigmoid", "balanced", seed);
-            let b = sample_sigma("sigmoid", "balanced", seed);
-            assert_eq!(a, b, "same seed must reproduce");
-            assert!((1e-3..=1.0 - 1e-3).contains(&a), "σ out of range: {a}");
-        }
-        // uniform/weighted/linear all stay in range too.
-        for ttype in ["uniform", "linear", "weighted"] {
-            let s = sample_sigma(ttype, "neutral", 7);
-            assert!(
-                (1e-3..=1.0 - 1e-3).contains(&s),
-                "{ttype} σ out of range: {s}"
-            );
-        }
-        // Averaged bias ordering: low (σ²) ≤ neutral ≤ high (√σ).
-        let mean = |bias: &str| {
-            let s: f32 = (0..256).map(|i| sample_sigma("sigmoid", bias, i)).sum();
-            s / 256.0
-        };
-        let (lo, mid, hi) = (mean("low"), mean("balanced"), mean("high"));
-        assert!(
-            lo < mid && mid < hi,
-            "bias order low {lo} < mid {mid} < high {hi}"
-        );
-    }
-
-    /// `build_batch`: `x_t = (1−σ)x0 + σ·noise`, `target = noise − x0`, `timestep = 1−σ`.
+    /// `build_batch`: `x_t = (1−σ)x0 + σ·noise`, `target = noise − x0`, `timestep = 1−σ` (the Z-Image
+    /// convention layered over the shared `flow_match::build_batch`).
     #[test]
     fn build_batch_math() {
         let dev = Device::Cpu;
@@ -974,7 +680,8 @@ mod tests {
     }
 
     /// `validate` rejects an empty dataset, zero rank/steps, an unsupported optimizer, and an
-    /// unrecognized timestep/loss knob — before any load.
+    /// unrecognized timestep/loss knob — before any load (now via the shared
+    /// `flow_match::validate_flow_match_request`).
     #[test]
     fn validate_rejects_bad_requests() {
         use candle_gen::gen_core::runtime::CancelFlag;

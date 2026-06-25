@@ -7,14 +7,25 @@
 //! Registered under `"wan2_2_t2v_14b"` — the **T2V** A14B. (The I2V channel-concat conditioning and the
 //! dense 5B path — the latter blocked on a z48 VAE *encoder* port — are sc-5167 follow-ups.)
 //!
+//! ## Why Wan keeps a bespoke loop (sc-7787)
+//!
+//! The single-model flow-match driver ([`candle_gen::train::flow_match::run_flow_match_training`]) the
+//! Z-Image/Lens/Krea trainers adopted assumes **one** DiT, optimizer, adapter set, and timestep range.
+//! The Wan A14B is a **dual-expert MoE**: it alternates a high-noise expert (`transformer/`) and a
+//! low-noise expert (`transformer_2/`), each with its own LoRA/LoKr, optimizer, LR schedule, timestep
+//! band, and gradient-accumulation buffer, and emits an expert-suffixed save pair. That does not fit the
+//! single-model driver cleanly, so Wan keeps the alternating loop below and consumes only the **Tier-1
+//! shared helpers** from [`flow_match`] (sampling, batch math, validation, snapshot IO, adapter install
+//! + optimizer step). Exactly the split sc-7787 sanctions.
+//!
 //! ## The Wan realities that shape it
 //!
 //! Cache → loop → save, on the **flow-match** objective. The two Wan-specific twists vs the Z-Image
 //! trainer:
 //!  1. **No velocity negation.** Wan feeds the transformer output to the flow-match step *without*
 //!     negation (opposite of Z-Image's `noise_pred.neg()`), so the trainer regresses the **raw** DiT
-//!     velocity toward `noise − x0` (`target = noise − x0`, [`build_batch`]). The timestep fed to the
-//!     DiT is `t · 1000` (the `[0, NUM_TRAIN_TIMESTEPS]` integer convention), not `1 − σ`.
+//!     velocity toward `noise − x0` (`target = noise − x0`). The timestep fed to the DiT is `t · 1000`
+//!     (the `[0, NUM_TRAIN_TIMESTEPS]` integer convention), not `1 − σ` — see [`compute_loss_grads`].
 //!  2. **MoE dual-expert.** The A14B denoises with a **high-noise** expert (`transformer/`, timestep
 //!     ≥ `boundary·1000`) and a **low-noise** expert (`transformer_2/`, below it). Each gets its **own**
 //!     LoRA/LoKr (separate factor map + optimizer + LR schedule + timestep band). Training **alternates**
@@ -32,25 +43,19 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::backprop::GradStore;
 use candle_gen::candle_core::{DType, Device, Tensor, Var};
-use candle_gen::candle_nn::VarBuilder;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::train::{
-    NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress,
-    TrainingRequest,
+    Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use candle_gen::gen_core::{self, LoadSpec, Modality, WeightsSource};
 use candle_gen::train::checkpoint::file_stem;
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
+use candle_gen::train::flow_match::{self, validate_flow_match_request, velocity_loss};
 use candle_gen::train::gradient_checkpoint::checkpointed_backward;
-use candle_gen::train::lora::{
-    build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraSet,
-};
-use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
-use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
+use candle_gen::train::lora::LoraSet;
+use candle_gen::train::optim::{accumulate_grads, TrainOptimizer};
+use candle_gen::train::schedule::schedule_updates;
 use candle_gen::{CandleError, Result};
 
 use crate::config::{
@@ -62,109 +67,23 @@ use crate::rope::WanRope;
 use crate::text_encoder::Umt5Encoder;
 use crate::vae16::WanVae16;
 
-/// Recognized `timestep_type` values (`linear`/`uniform`/`weighted` + the `sigmoid` default), matching
-/// the Z-Image trainer's [F-041 guard]; anything else is rejected rather than silently defaulted.
-const TIMESTEP_TYPES: [&str; 4] = ["sigmoid", "linear", "uniform", "weighted"];
-/// Recognized `timestep_bias` values — the high/low tilts plus the neutral default.
-const TIMESTEP_BIASES: [&str; 9] = [
-    "balanced",
-    "none",
-    "neutral",
-    "high",
-    "high_noise",
-    "favor_high_noise",
-    "low",
-    "low_noise",
-    "favor_low_noise",
-];
-/// Recognized `loss_type` values — `mae`/`l1` select MAE, `mse`/`l2` the MSE default.
-const LOSS_TYPES: [&str; 4] = ["mse", "l2", "mae", "l1"];
-
-/// `"bf16"`/`"bfloat16"` → [`DType::BF16`]; anything else → [`DType::F32`]. The A14B experts are bf16
-/// (the default); adapter factors / loss / grads stay f32 (master weights).
-fn parse_compute_dtype(s: &str) -> DType {
-    let t = s.trim();
-    if t.eq_ignore_ascii_case("bf16") || t.eq_ignore_ascii_case("bfloat16") {
-        DType::BF16
-    } else {
-        DType::F32
-    }
-}
-
-fn normalize_cfg(s: &str) -> String {
-    s.trim().to_ascii_lowercase().replace([' ', '-'], "_")
-}
-
-/// Sample a **unit** flow-match timestep `t_unit ∈ (0, 1)` — `sigmoid(randn)` by default, `uniform` for
-/// linear, `(uniform + sigmoid(randn))/2` for weighted; bias `high` → `√t`, `low` → `t²`. Deterministic
-/// in `seed` via the sc-3673 CPU `StdRng` discipline. (Same sampler as the Z-Image trainer; Wan then
-/// maps `t_unit` into the active expert's band — see [`sample_band_timestep`].)
-fn sample_unit_t(timestep_type: &str, timestep_bias: &str, seed: u64) -> f32 {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
-    let t = match normalize_cfg(timestep_type).as_str() {
-        "linear" | "uniform" => rng.random::<f32>(),
-        "weighted" => {
-            let base = rng.random::<f32>();
-            let z: f32 = StandardNormal.sample(&mut rng);
-            (base + sigmoid(z)) / 2.0
-        }
-        _ => {
-            let z: f32 = StandardNormal.sample(&mut rng);
-            sigmoid(z)
-        }
-    };
-    let t = match normalize_cfg(timestep_bias).as_str() {
-        "high" | "high_noise" | "favor_high_noise" => t.sqrt(),
-        "low" | "low_noise" | "favor_low_noise" => t * t,
-        _ => t,
-    };
-    t.clamp(1e-3, 1.0 - 1e-3)
-}
+/// Error-message prefix shared by [`validate_flow_match_request`] and the component-IO helpers.
+const LABEL: &str = "wan trainer";
 
 /// Sample a timestep `t ∈ [lo, hi)` inside an expert's noise band: draw a unit `t_unit`
-/// ([`sample_unit_t`]) then affine-map it into `(lo, hi)`. The high-noise expert samples `(boundary, 1)`,
-/// the low-noise `(0, boundary)` — the per-expert split the A14B trains.
+/// ([`flow_match::sample_unit_timestep`]) then affine-map it into `(lo, hi)`. The high-noise expert
+/// samples `(boundary, 1)`, the low-noise `(0, boundary)` — the per-expert split the A14B trains. This
+/// band map is Wan-specific (the other flow-match trainers train one model over the full `(0, 1)`), so
+/// it stays local; only the unit draw is shared.
 fn sample_band_timestep(
     timestep_type: &str,
     timestep_bias: &str,
     band: (f64, f64),
     seed: u64,
 ) -> f64 {
-    let t_unit = sample_unit_t(timestep_type, timestep_bias, seed) as f64;
+    let t_unit = flow_match::sample_unit_timestep(timestep_type, timestep_bias, seed) as f64;
     let (lo, hi) = band;
     (lo + t_unit * (hi - lo)).clamp(1e-3, 1.0 - 1e-3)
-}
-
-/// `(x_t, target)` for one sample at flow-match `t`: `x_t = (1−t)·x0 + t·noise`, `target = noise − x0`
-/// (the **raw** velocity Wan trains toward — NO sign flip, unlike Z-Image). All in f32.
-fn build_batch(x0: &Tensor, noise: &Tensor, t: f64) -> Result<(Tensor, Tensor)> {
-    let x_t = ((x0 * (1.0 - t))? + (noise * t)?)?;
-    let target = (noise - x0)?;
-    Ok((x_t, target))
-}
-
-/// Flow-match velocity loss in f32: `mean((v − target)²)` (MSE) or `mean|v − target|` (MAE). `v` is the
-/// DiT's raw f32 velocity output.
-fn velocity_loss(
-    v: &Tensor,
-    target: &Tensor,
-    mae: bool,
-) -> candle_gen::candle_core::Result<Tensor> {
-    let diff = (v.to_dtype(DType::F32)? - target)?;
-    if mae {
-        diff.abs()?.mean_all()
-    } else {
-        diff.sqr()?.mean_all()
-    }
-}
-
-/// Deterministic `N(0, 1)` noise of the given shape (seeded CPU `StdRng`, sc-3673), moved to `device`.
-fn sample_noise(shape: &[usize], seed: u64, device: &Device) -> Result<Tensor> {
-    let n: usize = shape.iter().product();
-    let mut rng = StdRng::seed_from_u64(seed);
-    let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
-    Ok(Tensor::from_vec(data, shape, &Device::Cpu)?.to_device(device)?)
 }
 
 /// One micro-step's forward+backward over one expert's installed adapter `Var`s: build the noised
@@ -194,7 +113,7 @@ fn compute_loss_grads(
     compute_dtype: DType,
     use_checkpoint: bool,
 ) -> Result<(f32, GradStore)> {
-    let (x_t, target) = build_batch(x0, noise, t)?;
+    let (x_t, target) = flow_match::build_batch(x0, noise, t)?;
     let x_t = x_t.to_dtype(compute_dtype)?;
     // Text context + timestep are adapter-free constants the blocks consume.
     let ctx = dit.embed_text(umt5)?;
@@ -221,42 +140,6 @@ fn compute_loss_grads(
         let grads = loss.backward()?;
         Ok((loss_val, grads))
     }
-}
-
-/// Resolve the sorted `.safetensors` files in the snapshot component subdir `sub`.
-fn component_files(root: &Path, sub: &str) -> Result<Vec<PathBuf>> {
-    let dir = root.join(sub);
-    if !dir.is_dir() {
-        return Err(CandleError::Msg(format!(
-            "wan trainer: snapshot missing the {sub}/ component directory (at {})",
-            root.display()
-        )));
-    }
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|e| CandleError::Msg(format!("wan trainer: read {sub}/: {e}")))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "wan trainer: no .safetensors in {sub}/ (at {})",
-            dir.display()
-        )));
-    }
-    Ok(files)
-}
-
-/// Build a [`VarBuilder`] over the snapshot component subdir `sub` at `dtype`.
-fn component_vb(
-    root: &Path,
-    sub: &str,
-    device: &Device,
-    dtype: DType,
-) -> Result<VarBuilder<'static>> {
-    let files = component_files(root, sub)?;
-    // SAFETY: mmap of read-only weight files; standard candle loading path.
-    Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? })
 }
 
 /// Tokenize + UMT5-encode `caption` → `[1, 512, 4096]` (f32, zero-padded to 512 — the same context
@@ -304,58 +187,11 @@ fn encode_caption(
     }
 }
 
-/// The config's target-module suffixes (default [`WAN_ATTN_TARGETS`]).
-fn resolve_target_suffixes(cfg: &TrainingConfig) -> Vec<String> {
-    if cfg.lora_target_modules.is_empty() {
-        WAN_ATTN_TARGETS.iter().map(|s| s.to_string()).collect()
-    } else {
-        cfg.lora_target_modules.clone()
-    }
-}
-
 /// Insert `.{suffix}` before the extension of `file_name` (`a.safetensors` → `a.high_noise.safetensors`).
 fn with_expert_suffix(file_name: &str, suffix: &str) -> String {
     match file_name.rsplit_once('.') {
         Some((stem, ext)) => format!("{stem}.{suffix}.{ext}"),
         None => format!("{file_name}.{suffix}"),
-    }
-}
-
-/// Write one expert's adapter `.safetensors`: LoRA with **bare** dotted keys (empty prefix — Wan DiT
-/// keys are bare diffusers paths), LoKr with bare keys + metadata.
-fn save_adapter(set: &LoraSet, path: &Path) -> Result<()> {
-    let meta = HashMap::new();
-    match set.kind {
-        AdapterKind::Lora => save_lora_peft(set, "", &meta, path),
-        AdapterKind::Lokr => save_lokr(set, &meta, path),
-    }
-}
-
-fn create_output_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| CandleError::Msg(format!("create output dir {}: {e}", dir.display())))
-}
-
-/// Install LoRA/LoKr adapters on `dit` for the resolved `suffixes`, with a per-expert `seed` offset so
-/// the two experts get distinct (but per-seed reproducible) factor inits.
-fn install_adapters(
-    dit: &mut WanTransformerTrain,
-    cfg: &TrainingConfig,
-    suffixes: &[String],
-    seed: u64,
-    device: &Device,
-) -> Result<LoraSet> {
-    match cfg.network_type {
-        NetworkType::Lora => build_lora_targets(dit, suffixes, cfg.rank, cfg.alpha, seed, device),
-        NetworkType::Lokr => build_lokr_targets(
-            dit,
-            suffixes,
-            cfg.rank,
-            cfg.alpha,
-            cfg.decompose_factor,
-            seed,
-            device,
-        ),
     }
 }
 
@@ -425,7 +261,7 @@ impl Trainer for WanMoeTrainer {
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        self.validate_impl(req).map_err(Into::into)
+        validate_flow_match_request(req, LABEL).map_err(Into::into)
     }
 
     fn train(
@@ -438,59 +274,17 @@ impl Trainer for WanMoeTrainer {
 }
 
 impl WanMoeTrainer {
-    /// Reject a request before any expensive load (mirrors the Z-Image trainer's guards).
-    fn validate_impl(&self, req: &TrainingRequest) -> Result<()> {
-        let cfg = &req.config;
-        if req.items.is_empty() {
-            return Err(CandleError::Msg("wan trainer: dataset is empty".into()));
-        }
-        if cfg.rank == 0 {
-            return Err(CandleError::Msg("wan trainer: rank must be > 0".into()));
-        }
-        if cfg.steps == 0 {
-            return Err(CandleError::Msg("wan trainer: steps must be > 0".into()));
-        }
-        if !TrainOptimizer::is_supported(&cfg.optimizer) {
-            return Err(CandleError::Msg(format!(
-                "wan trainer: optimizer '{}' is not available (supported: adamw, adam, rose, prodigy)",
-                cfg.optimizer
-            )));
-        }
-        if !TIMESTEP_TYPES.contains(&normalize_cfg(&cfg.timestep_type).as_str()) {
-            return Err(CandleError::Msg(format!(
-                "wan trainer: timestep_type '{}' is not recognized (supported: {})",
-                cfg.timestep_type,
-                TIMESTEP_TYPES.join(", ")
-            )));
-        }
-        if !TIMESTEP_BIASES.contains(&normalize_cfg(&cfg.timestep_bias).as_str()) {
-            return Err(CandleError::Msg(format!(
-                "wan trainer: timestep_bias '{}' is not recognized (supported: {})",
-                cfg.timestep_bias,
-                TIMESTEP_BIASES.join(", ")
-            )));
-        }
-        if !LOSS_TYPES.contains(&normalize_cfg(&cfg.loss_type).as_str()) {
-            return Err(CandleError::Msg(format!(
-                "wan trainer: loss_type '{}' is not recognized (supported: {})",
-                cfg.loss_type,
-                LOSS_TYPES.join(", ")
-            )));
-        }
-        Ok(())
-    }
-
     fn train_impl(
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> Result<TrainingOutput> {
-        self.validate_impl(req)?;
+        validate_flow_match_request(req, LABEL)?;
         let cfg = &req.config;
         let device = &self.device;
         on_progress(TrainingProgress::Preparing);
         let edge = bucket_resolution(cfg.resolution);
-        let compute_dtype = parse_compute_dtype(&cfg.train_dtype);
+        let compute_dtype = flow_match::parse_compute_dtype(&cfg.train_dtype);
         let dit_cfg = TransformerConfig::t2v_14b();
 
         // --- load + cache: z16 VAE latent means + UMT5 caption embeds (both f32) ---
@@ -498,14 +292,14 @@ impl WanMoeTrainer {
         let vae_cfg = Vae16Config::wan21();
         let vae = WanVae16::new_with_encoder(
             &vae_cfg,
-            component_vb(&self.root, "vae", device, DType::F32)?,
+            flow_match::component_vb(&self.root, "vae", device, DType::F32, LABEL)?,
         )?;
         let te_cfg = TextEncoderConfig::umt5_xxl();
         // Load the UMT5 encoder at bf16 for caching (11 GB vs 22 GB at f32) — it only produces the
         // cached caption embeds (kept f32 in the cache), and is dropped before the experts load.
         let text_encoder = Umt5Encoder::new(
             &te_cfg,
-            component_vb(&self.root, "text_encoder", device, DType::BF16)?,
+            flow_match::component_vb(&self.root, "text_encoder", device, DType::BF16, LABEL)?,
         )?;
 
         let total = req.items.len() as u32;
@@ -542,14 +336,10 @@ impl WanMoeTrainer {
         let (cos, sin) = WanRope::new(&dit_cfg).cos_sin(ppf, pph, ppw, device)?;
 
         // --- build the two experts (transformer/ = high-noise, transformer_2/ = low-noise) ---
-        let suffixes = resolve_target_suffixes(cfg);
+        let suffixes = flow_match::resolve_target_suffixes(cfg, &WAN_ATTN_TARGETS);
         let accum = cfg.gradient_accumulation.max(1);
-        let weight_decay = if cfg.optimizer.eq_ignore_ascii_case("adam") {
-            0.0
-        } else {
-            cfg.weight_decay
-        };
-        let mae = matches!(normalize_cfg(&cfg.loss_type).as_str(), "mae" | "l1");
+        let weight_decay = flow_match::effective_weight_decay(cfg);
+        let mae = flow_match::is_mae(cfg);
         let boundary = T2V_14B_BOUNDARY;
 
         // odd steps → high (≈ ceil(steps/2) micro-steps), even → low (≈ floor(steps/2)).
@@ -565,13 +355,13 @@ impl WanMoeTrainer {
         {
             let mut dit = WanTransformerTrain::new(
                 &dit_cfg,
-                component_vb(&self.root, sub, device, compute_dtype)?,
+                flow_match::component_vb(&self.root, sub, device, compute_dtype, LABEL)?,
             )?;
             // Distinct per-expert seed (so the two adapters don't init identically), reproducible.
             let seed = cfg
                 .seed
                 .wrapping_add((idx as u64).wrapping_mul(0x9E37_79B9));
-            let set = install_adapters(&mut dit, cfg, &suffixes, seed, device)?;
+            let set = flow_match::install_adapters(&mut dit, cfg, &suffixes, seed, device)?;
             let opt = TrainOptimizer::from_config(
                 &cfg.optimizer,
                 set.vars.clone(),
@@ -611,11 +401,11 @@ impl WanMoeTrainer {
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
                 band,
-                cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
+                flow_match::timestep_seed(cfg.seed, step),
             );
-            let noise = sample_noise(
+            let noise = flow_match::sample_noise(
                 x0.dims(),
-                cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
+                flow_match::noise_seed(cfg.seed, step),
                 device,
             )?;
             let (loss, grads) = compute_loss_grads(
@@ -648,13 +438,13 @@ impl WanMoeTrainer {
             });
 
             if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
-                create_output_dir(&req.output_dir)?;
+                flow_match::create_output_dir(&req.output_dir)?;
                 for ex in &experts {
                     let name = with_expert_suffix(
                         &format!("{}-step{step:06}.safetensors", file_stem(&req.file_name)),
                         ex.suffix,
                     );
-                    save_adapter(&ex.set, &req.output_dir.join(name))?;
+                    flow_match::save_adapter(&ex.set, &HashMap::new(), &req.output_dir.join(name))?;
                 }
                 on_progress(TrainingProgress::Checkpoint { step });
             }
@@ -672,13 +462,13 @@ impl WanMoeTrainer {
 
         // --- save the high/low adapter pair; report the high-noise file as the primary path ---
         on_progress(TrainingProgress::Saving);
-        create_output_dir(&req.output_dir)?;
+        flow_match::create_output_dir(&req.output_dir)?;
         let mut primary: Option<PathBuf> = None;
         for ex in &experts {
             let path = req
                 .output_dir
                 .join(with_expert_suffix(&req.file_name, ex.suffix));
-            save_adapter(&ex.set, &path)?;
+            flow_match::save_adapter(&ex.set, &HashMap::new(), &path)?;
             if ex.suffix == "high_noise" {
                 primary = Some(path);
             }
@@ -691,22 +481,20 @@ impl WanMoeTrainer {
     }
 }
 
-/// Fire one optimizer update for `ex`: average the accumulated grads, LR-schedule, clip, step.
+/// Fire one optimizer update for `ex`: delegates the average-clip-step to the shared
+/// [`flow_match::apply_update`] (over `ex`'s own optimizer/accumulation/schedule), then advances the
+/// expert's update counter.
 fn apply_update(ex: &mut ExpertState, accum: u32, cfg: &TrainingConfig) -> Result<()> {
-    let mult = lr_multiplier(
-        cfg.lr_scheduler,
+    flow_match::apply_update(
+        &mut ex.opt,
+        &mut ex.accumulated,
+        &ex.set,
+        accum,
+        cfg,
         ex.update_idx,
         ex.total_updates,
         ex.warmup_updates,
-    );
-    ex.opt.set_lr_scaled(mult);
-    let mut avg = ex
-        .accumulated
-        .take()
-        .expect("apply_update called with a pending accumulation");
-    scale_grads(&mut avg, &ex.set.vars, 1.0 / accum as f64)?;
-    clip_grad_norm(&mut avg, &ex.set.vars, 1.0)?;
-    ex.opt.step(&avg)?;
+    )?;
     ex.update_idx += 1;
     Ok(())
 }
@@ -716,6 +504,8 @@ mod tests {
     use super::*;
     use candle_gen::candle_nn::{VarBuilder, VarMap};
     use candle_gen::gen_core::registry;
+    use candle_gen::train::lora::build_lora_targets;
+    use candle_gen::train::optim::clip_grad_norm;
 
     /// A tiny Wan-shaped DiT (z16, head_dim 128, 1 head, 1 layer) — exercises the real flow-match
     /// forward+backward on CPU.
@@ -764,7 +554,7 @@ mod tests {
     #[test]
     fn harness_factor_set_propagates_to_forward() {
         use candle_gen::candle_nn::{Linear, Module};
-        use candle_gen::train::lora::{build_lora_targets, LoraHost, LoraLinear};
+        use candle_gen::train::lora::{LoraHost, LoraLinear};
         struct H(LoraLinear);
         impl LoraHost for H {
             fn visit_lora_mut(
@@ -806,17 +596,6 @@ mod tests {
             y0, y1,
             "setting set.vars must change the installed LoraLinear forward"
         );
-    }
-
-    /// `build_batch`: `x_t = (1−t)x0 + t·noise`, `target = noise − x0` (raw, no negation).
-    #[test]
-    fn build_batch_math() {
-        let dev = Device::Cpu;
-        let x0 = Tensor::from_vec(vec![2.0f32, 4.0], (1, 2), &dev).unwrap();
-        let noise = Tensor::from_vec(vec![1.0f32, 0.0], (1, 2), &dev).unwrap();
-        let (x_t, target) = build_batch(&x0, &noise, 0.25).unwrap();
-        assert_eq!(x_t.to_vec2::<f32>().unwrap(), vec![vec![1.75, 3.0]]);
-        assert_eq!(target.to_vec2::<f32>().unwrap(), vec![vec![-1.0, -4.0]]);
     }
 
     /// Band sampling is deterministic, in-band, and the high band lies above the low band.
@@ -1062,7 +841,7 @@ mod tests {
     }
 
     /// `validate` rejects an empty dataset, zero rank/steps, an unsupported optimizer, and unrecognized
-    /// timestep/loss knobs — before any load.
+    /// timestep/loss knobs — before any load (now via the shared `flow_match::validate_flow_match_request`).
     #[test]
     fn validate_rejects_bad_requests() {
         use candle_gen::gen_core::runtime::CancelFlag;
