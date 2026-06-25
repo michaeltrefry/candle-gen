@@ -5,6 +5,11 @@
 //! and the adapter cross-applies to **Krea-2-Turbo** at inference by the family-match policy
 //! (`baseModel: krea_2_raw`, `family: krea_2`).
 //!
+//! Since sc-7787 the cache → loop → save scaffolding lives in the shared single-model flow-match
+//! driver ([`candle_gen::train::flow_match`]); this module supplies the Krea-specific hooks via
+//! [`FlowMatchTrainer`] — caching, DiT construction, the parity-critical [`compute_loss_grads`], and the
+//! provenance-stamping [`save`](FlowMatchTrainer::save).
+//!
 //! ## Cache → loop → save, on the flow-match objective
 //!
 //!  1. **Cache** — for each captioned image: decode/crop/resize to a VAE-input tensor
@@ -13,19 +18,21 @@
 //!     skips the `DiagonalGaussian` draw), and encode the caption through the Qwen3-VL-4B text encoder
 //!     with the *exact* tokenizer + select-layer stack inference uses → `(L, num_text_layers,
 //!     text_hidden)`. The VAE encoder + text encoder are dropped after caching.
-//!  2. **Loop** — sample a flow-match `σ ∈ [1e-3, 1−1e-3]` ([`sample_sigma`]), form
+//!  2. **Loop** (driver-owned) — sample a flow-match `σ ∈ [1e-3, 1−1e-3]`
+//!     ([`sample_unit_timestep`](candle_gen::train::flow_match::sample_unit_timestep)), form
 //!     `x_t = (1−σ)·x0 + σ·noise`, predict the velocity through the vendored trainable DiT
 //!     ([`KreaTrainDit`]) at timestep `σ` (the raw flow time the DiT's `temb` scales ×1000 — the
 //!     [`TimestepConvention::Sigma`](candle_gen::gen_core::sampling) inference uses), and regress it
-//!     toward `noise − x0`. Gradient accumulation, the LR schedule, and grad-norm clipping reuse the
-//!     harness.
+//!     toward `noise − x0`.
 //!  3. **Save** — a PEFT `.safetensors` (`save_lora_peft` with the DiT's **bare** key prefix /
-//!     `save_lokr`), the on-disk format the eventual Turbo inference-side merge (sc-7578) reads back.
+//!     `save_lokr`) stamped with `baseModel`/`family` provenance, the on-disk format the Turbo
+//!     inference-side merge (sc-7578) reads back.
 //!
 //! **Velocity sign.** Krea's inference pipeline consumes the **raw** DiT velocity (`x + v·Δσ`,
 //! [`crate::pipeline`]) — unlike Z-Image it does not negate — so [`KreaTrainDit::forward`] returns the
 //! raw velocity and the trainer regresses it toward `noise − x0` directly (the Lens convention). The
-//! timestep fed to the DiT is the raw `σ` (NOT `1−σ`), matching the inference `TimestepConvention::Sigma`.
+//! timestep fed to the DiT is the raw `σ` (NOT `1−σ`), matching the inference `TimestepConvention::Sigma`
+//! — which (with the absence of a pre-main adapter stitch) is why [`compute_loss_grads`] stays local.
 //!
 //! **The eager-`Var` simplification** (inherited from the SDXL/Z-Image harness): the adapter factors
 //! are storage-sharing `Var`s installed once; each forward re-reads the current factor storage and
@@ -42,25 +49,18 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::backprop::GradStore;
-use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::candle_nn::VarBuilder;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
+use candle_gen::candle_core::{DType, Device, Tensor, Var};
 
 use candle_gen::gen_core::train::{
-    NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress,
-    TrainingRequest,
+    Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use candle_gen::gen_core::{self, LoadSpec, Modality, WeightsSource};
-use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
-use candle_gen::train::gradient_checkpoint::checkpointed_backward;
-use candle_gen::train::lora::{
-    build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraSet,
+use candle_gen::train::flow_match::{
+    self, run_flow_match_training, validate_flow_match_request, velocity_loss, FlowMatchTrainer,
 };
-use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
-use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
+use candle_gen::train::gradient_checkpoint::checkpointed_backward;
+use candle_gen::train::lora::LoraSet;
 use candle_gen::{CandleError, Result};
 
 use candle_gen_qwen_image::vae::QwenVaeEncoder;
@@ -75,105 +75,20 @@ use crate::train_dit::{KreaTrainDit, KREA_ATTN_TARGETS};
 /// distinct from the `krea_2_turbo` inference id — mirrors the MLX trainer (sc-7577).
 pub const KREA_2_RAW_ID: &str = "krea_2_raw";
 
+/// Error-message prefix shared by [`validate_flow_match_request`] and the driver's `no usable dataset
+/// items` guard.
+const LABEL: &str = "krea trainer";
+
 /// Max prompt tokens the Qwen3-VL RoPE table is sized for during caption caching (matches the pipeline).
 const MAX_TEXT_TOKENS: usize = 1024;
 
-/// Recognized `timestep_type` values — the noise-schedule samplers [`sample_sigma`] branches on, plus
-/// the `sigmoid` default. Validation rejects anything else (the MLX F-041 guard).
-const TIMESTEP_TYPES: [&str; 4] = ["sigmoid", "linear", "uniform", "weighted"];
-/// Recognized `timestep_bias` values — the high/low-noise tilts plus the neutral default.
-const TIMESTEP_BIASES: [&str; 9] = [
-    "balanced",
-    "none",
-    "neutral",
-    "high",
-    "high_noise",
-    "favor_high_noise",
-    "low",
-    "low_noise",
-    "favor_low_noise",
-];
-/// Recognized `loss_type` values — `mae`/`l1` select MAE, `mse`/`l2` the MSE default.
-const LOSS_TYPES: [&str; 4] = ["mse", "l2", "mae", "l1"];
-
-/// `"bf16"`/`"bfloat16"` → [`DType::BF16`] (the Krea DiT's native compute dtype); anything else →
-/// [`DType::F32`] (the gen-core contract: unrecognized = f32). Adapter factors / loss / grads stay f32.
-fn parse_compute_dtype(s: &str) -> DType {
-    let t = s.trim();
-    if t.eq_ignore_ascii_case("bf16") || t.eq_ignore_ascii_case("bfloat16") {
-        DType::BF16
-    } else {
-        DType::F32
-    }
-}
-
-/// Normalize a free-form config string (trim, lowercase, `-`/space → `_`) so validation accepts exactly
-/// the spellings [`sample_sigma`] would.
-fn normalize_cfg(s: &str) -> String {
-    s.trim().to_ascii_lowercase().replace([' ', '-'], "_")
-}
-
-/// Sample a normalized flow-match timestep (interpolation coefficient) `σ ∈ [1e-3, 1−1e-3]` — the same
-/// `sample_training_timestep` port the Z-Image trainer uses: `sigmoid(randn)` by default, `uniform` for
-/// linear, `(uniform + sigmoid(randn))/2` for weighted; bias `high` → `√σ`, `low` → `σ²`. Deterministic
-/// in `seed` via the sc-3673 CPU `StdRng` discipline. Cross-framework numeric parity with MLX is a
-/// non-goal (different RNG); per-seed determinism is what the worker relies on.
-fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> f32 {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
-    let t = match normalize_cfg(timestep_type).as_str() {
-        "linear" | "uniform" => rng.random::<f32>(),
-        "weighted" => {
-            let base = rng.random::<f32>();
-            let z: f32 = StandardNormal.sample(&mut rng);
-            (base + sigmoid(z)) / 2.0
-        }
-        // "sigmoid" + any unrecognized value (validation rejects the latter up front).
-        _ => {
-            let z: f32 = StandardNormal.sample(&mut rng);
-            sigmoid(z)
-        }
-    };
-    let t = match normalize_cfg(timestep_bias).as_str() {
-        "high" | "high_noise" | "favor_high_noise" => t.sqrt(),
-        "low" | "low_noise" | "favor_low_noise" => t * t,
-        _ => t,
-    };
-    t.clamp(1e-3, 1.0 - 1e-3)
-}
-
-/// `(x_t, target, timestep)` for one sample at flow-match `σ`: `x_t = (1−σ)·x0 + σ·noise`,
-/// `target = noise − x0` (the velocity the **raw** DiT output trains toward — no negation, the Krea/Lens
-/// convention), `timestep = σ` (the raw flow time the DiT's `temb` consumes; the inference
-/// `TimestepConvention::Sigma`). All in f32.
+/// `(x_t, target, timestep)` for one sample at flow-match `σ`: delegates the latent mix
+/// (`x_t = (1−σ)·x0 + σ·noise`, `target = noise − x0`) to the shared
+/// [`flow_match::build_batch`](candle_gen::train::flow_match::build_batch) and appends Krea's raw-σ
+/// timestep convention `timestep = σ` (the inference `TimestepConvention::Sigma`, NOT Z-Image's `1 − σ`).
 fn build_batch(x0: &Tensor, noise: &Tensor, sigma: f32) -> Result<(Tensor, Tensor, f32)> {
-    let x_t = ((x0 * (1.0 - sigma) as f64)? + (noise * sigma as f64)?)?;
-    let target = (noise - x0)?;
+    let (x_t, target) = flow_match::build_batch(x0, noise, sigma as f64)?;
     Ok((x_t, target, sigma))
-}
-
-/// Flow-match velocity loss in f32: `mean((v − target)²)` (MSE) or `mean|v − target|` (MAE). `v` (the
-/// raw DiT velocity, in the compute dtype) is promoted to f32 so the loss/grads stay f32.
-fn velocity_loss(
-    v: &Tensor,
-    target_f32: &Tensor,
-    mae: bool,
-) -> candle_gen::candle_core::Result<Tensor> {
-    let diff = (v.to_dtype(DType::F32)? - target_f32)?;
-    if mae {
-        diff.abs()?.mean_all()
-    } else {
-        diff.sqr()?.mean_all()
-    }
-}
-
-/// Deterministic `N(0, 1)` noise of the given shape, drawn from a seeded CPU `StdRng` then moved to
-/// `device` (sc-3673 launch-portable discipline). The flow-match prior + the regression target.
-fn sample_noise(shape: &[usize], seed: u64, device: &Device) -> Result<Tensor> {
-    let n: usize = shape.iter().product();
-    let mut rng = StdRng::seed_from_u64(seed);
-    let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
-    Ok(Tensor::from_vec(data, shape, &Device::Cpu)?.to_device(device)?)
 }
 
 /// One micro-step's forward+backward over the installed adapter `Var`s: build the noised latent at
@@ -190,7 +105,7 @@ fn sample_noise(shape: &[usize], seed: u64, device: &Device) -> Result<Tensor> {
 #[allow(clippy::too_many_arguments)]
 fn compute_loss_grads(
     dit: &KreaTrainDit,
-    lora_vars: &[candle_gen::candle_core::Var],
+    lora_vars: &[Var],
     x0: &Tensor,
     cap: &Tensor,
     sigma: f32,
@@ -230,42 +145,6 @@ fn compute_loss_grads(
     }
 }
 
-/// Resolve the sorted `.safetensors` files in the snapshot component subdir `sub`.
-fn component_files(root: &Path, sub: &str) -> Result<Vec<PathBuf>> {
-    let dir = root.join(sub);
-    if !dir.is_dir() {
-        return Err(CandleError::Msg(format!(
-            "krea trainer: snapshot missing the {sub}/ component directory (at {})",
-            root.display()
-        )));
-    }
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|e| CandleError::Msg(format!("krea trainer: read {sub}/: {e}")))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "krea trainer: no .safetensors in {sub}/ (at {})",
-            dir.display()
-        )));
-    }
-    Ok(files)
-}
-
-/// Build a [`VarBuilder`] over the snapshot component subdir `sub` at `dtype` (the VAE-encoder load).
-fn component_vb(
-    root: &Path,
-    sub: &str,
-    device: &Device,
-    dtype: DType,
-) -> Result<VarBuilder<'static>> {
-    let files = component_files(root, sub)?;
-    // SAFETY: mmap of read-only weight files; standard candle loading path.
-    Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? })
-}
-
 /// Tokenize `caption` + encode it through the Qwen3-VL text encoder to the cached conditioning stack
 /// `(L, num_text_layers, text_hidden)` at f32 — the exact tokenizer + select-layer stack the inference
 /// [`crate::pipeline`] uses (parity), minus the device-dtype cast (caching keeps f32).
@@ -273,34 +152,6 @@ fn encode_caption(tok: &KreaTokenizer, te: &KreaTextEncoder, caption: &str) -> R
     let ids = tok.encode_prompt(caption)?;
     let enc = te.forward(&ids)?; // (1, L, num_text_layers, text_hidden)
     Ok(enc.squeeze(0)?.to_dtype(DType::F32)?)
-}
-
-/// The config's target-module suffixes (default [`KREA_ATTN_TARGETS`]).
-fn resolve_target_suffixes(cfg: &TrainingConfig) -> Vec<String> {
-    if cfg.lora_target_modules.is_empty() {
-        KREA_ATTN_TARGETS.iter().map(|s| s.to_string()).collect()
-    } else {
-        cfg.lora_target_modules.clone()
-    }
-}
-
-/// Write the adapter as a `.safetensors`: LoRA with the DiT's **bare** dotted keys (empty prefix — the
-/// SDXL `base_model.model.unet.` prefix is SDXL-specific), LoKr with bare keys + metadata. Records the
-/// base-model id so the Turbo cross-apply policy (family-match) can validate provenance.
-fn save_adapter(set: &LoraSet, path: &Path) -> Result<()> {
-    let mut meta = HashMap::new();
-    meta.insert("baseModel".to_string(), KREA_2_RAW_ID.to_string());
-    meta.insert("family".to_string(), "krea_2".to_string());
-    match set.kind {
-        AdapterKind::Lora => save_lora_peft(set, "", &meta, path),
-        AdapterKind::Lokr => save_lokr(set, &meta, path),
-    }
-}
-
-/// Create the output directory, mapping the `io::Error` into the crate error.
-fn create_output_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| CandleError::Msg(format!("create output dir {}: {e}", dir.display())))
 }
 
 /// Identity + capabilities of the candle Krea trainer: LoRA + LoKr, `backend = "candle"`.
@@ -354,7 +205,7 @@ impl Trainer for KreaTrainer {
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        self.validate_impl(req).map_err(Into::into)
+        validate_flow_match_request(req, LABEL).map_err(Into::into)
     }
 
     fn train(
@@ -362,71 +213,40 @@ impl Trainer for KreaTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
-        self.train_impl(req, on_progress).map_err(Into::into)
+        validate_flow_match_request(req, LABEL)?;
+        run_flow_match_training(self, req, on_progress).map_err(Into::into)
     }
 }
 
-impl KreaTrainer {
-    /// Reject a request before any expensive load: empty dataset, zero rank/steps, unsupported
-    /// optimizer, and an unrecognized `timestep_type`/`timestep_bias`/`loss_type` (the MLX F-041 guard).
-    fn validate_impl(&self, req: &TrainingRequest) -> Result<()> {
-        let cfg = &req.config;
-        if req.items.is_empty() {
-            return Err(CandleError::Msg("krea trainer: dataset is empty".into()));
-        }
-        if cfg.rank == 0 {
-            return Err(CandleError::Msg("krea trainer: rank must be > 0".into()));
-        }
-        if cfg.steps == 0 {
-            return Err(CandleError::Msg("krea trainer: steps must be > 0".into()));
-        }
-        if !TrainOptimizer::is_supported(&cfg.optimizer) {
-            return Err(CandleError::Msg(format!(
-                "krea trainer: optimizer '{}' is not available (supported: adamw, adam, rose, prodigy)",
-                cfg.optimizer
-            )));
-        }
-        if !TIMESTEP_TYPES.contains(&normalize_cfg(&cfg.timestep_type).as_str()) {
-            return Err(CandleError::Msg(format!(
-                "krea trainer: timestep_type '{}' is not recognized (supported: {})",
-                cfg.timestep_type,
-                TIMESTEP_TYPES.join(", ")
-            )));
-        }
-        if !TIMESTEP_BIASES.contains(&normalize_cfg(&cfg.timestep_bias).as_str()) {
-            return Err(CandleError::Msg(format!(
-                "krea trainer: timestep_bias '{}' is not recognized (supported: {})",
-                cfg.timestep_bias,
-                TIMESTEP_BIASES.join(", ")
-            )));
-        }
-        if !LOSS_TYPES.contains(&normalize_cfg(&cfg.loss_type).as_str()) {
-            return Err(CandleError::Msg(format!(
-                "krea trainer: loss_type '{}' is not recognized (supported: {})",
-                cfg.loss_type,
-                LOSS_TYPES.join(", ")
-            )));
-        }
-        Ok(())
+impl FlowMatchTrainer for KreaTrainer {
+    type Dit = KreaTrainDit;
+    /// `(x0 latent [1,16,h,w], caption stack (L, num_text_layers, text_hidden))`, both f32.
+    type Cached = (Tensor, Tensor);
+    type Aux = ();
+    const LABEL: &'static str = LABEL;
+
+    fn device(&self) -> &Device {
+        &self.device
     }
 
-    /// The rich-`Result` body behind [`Trainer::train`].
-    fn train_impl(
-        &mut self,
-        req: &TrainingRequest,
-        on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> Result<TrainingOutput> {
-        self.validate_impl(req)?;
-        let cfg = &req.config;
-        let device = &self.device;
-        on_progress(TrainingProgress::Preparing);
-        let edge = bucket_resolution(cfg.resolution);
-        let compute_dtype = parse_compute_dtype(&cfg.train_dtype);
+    fn default_targets(&self) -> &'static [&'static str] {
+        &KREA_ATTN_TARGETS
+    }
 
-        // --- load + cache: VAE latent means + Qwen3-VL caption stacks (both f32) ---
-        on_progress(TrainingProgress::LoadingModel);
-        let vae_encoder =
-            QwenVaeEncoder::new(component_vb(&self.root, "vae", device, DType::F32)?)?;
+    fn cache(
+        &self,
+        req: &TrainingRequest,
+        device: &Device,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> Result<(Vec<(Tensor, Tensor)>, ())> {
+        let edge = bucket_resolution(req.config.resolution);
+        let vae_encoder = QwenVaeEncoder::new(flow_match::component_vb(
+            &self.root,
+            "vae",
+            device,
+            DType::F32,
+            LABEL,
+        )?)?;
         let tokenizer = KreaTokenizer::from_snapshot(&self.root, device)?;
         let te_cfg = KreaTeConfig::from_snapshot(&self.root)?;
         let te_w = Weights::from_dir(&self.root.join("text_encoder"), device, DType::F32)?;
@@ -451,142 +271,63 @@ impl KreaTrainer {
         // Encoders are dead weight once cached — drop them before the DiT (working set) loads.
         drop(text_encoder);
         drop(vae_encoder);
-        if cache.is_empty() {
-            if req.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            return Err(CandleError::Msg(
-                "krea trainer: no usable dataset items".into(),
-            ));
-        }
+        Ok((cache, ()))
+    }
 
-        // --- build the trainable DiT + install adapters ---
+    fn build_dit(&self, req: &TrainingRequest, device: &Device) -> Result<KreaTrainDit> {
+        let compute_dtype = flow_match::parse_compute_dtype(&req.config.train_dtype);
         let dit_cfg = Krea2Config::from_snapshot(&self.root)?;
         let dit_w = Weights::from_dir(&self.root.join("transformer"), device, compute_dtype)?;
-        let mut dit = KreaTrainDit::load(&dit_w, &dit_cfg)?;
-        let suffixes = resolve_target_suffixes(cfg);
-        let lora_set = match cfg.network_type {
-            NetworkType::Lora => {
-                build_lora_targets(&mut dit, &suffixes, cfg.rank, cfg.alpha, cfg.seed, device)?
-            }
-            NetworkType::Lokr => build_lokr_targets(
-                &mut dit,
-                &suffixes,
-                cfg.rank,
-                cfg.alpha,
-                cfg.decompose_factor,
-                cfg.seed,
-                device,
-            )?,
-        };
-        let use_checkpoint = cfg.gradient_checkpointing;
+        Ok(KreaTrainDit::load(&dit_w, &dit_cfg)?)
+    }
 
-        // --- optimizer + schedule ---
-        let mae = matches!(normalize_cfg(&cfg.loss_type).as_str(), "mae" | "l1");
-        // AdamW with wd=0 ≡ Adam, so the one optimizer covers both choices.
-        let weight_decay = if cfg.optimizer.eq_ignore_ascii_case("adam") {
-            0.0
-        } else {
-            cfg.weight_decay
-        };
-        let mut opt = TrainOptimizer::from_config(
-            &cfg.optimizer,
-            lora_set.vars.clone(),
-            cfg.learning_rate,
-            weight_decay,
-        )?;
-        let accum = cfg.gradient_accumulation.max(1);
-        let (total_updates, warmup_updates) =
-            schedule_updates(cfg.steps, accum, cfg.lr_warmup_steps);
-        let stem = file_stem(&req.file_name).to_string();
+    fn micro_step(
+        &self,
+        dit: &KreaTrainDit,
+        vars: &[Var],
+        cached: &(Tensor, Tensor),
+        _aux: &(),
+        cfg: &TrainingConfig,
+        step: u32,
+        device: &Device,
+    ) -> Result<(f32, GradStore)> {
+        let (x0, cap) = cached;
+        let sigma = flow_match::sample_unit_timestep(
+            &cfg.timestep_type,
+            &cfg.timestep_bias,
+            flow_match::timestep_seed(cfg.seed, step),
+        );
+        let noise =
+            flow_match::sample_noise(x0.dims(), flow_match::noise_seed(cfg.seed, step), device)?;
+        compute_loss_grads(
+            dit,
+            vars,
+            x0,
+            cap,
+            sigma,
+            &noise,
+            flow_match::is_mae(cfg),
+            flow_match::parse_compute_dtype(&cfg.train_dtype),
+            cfg.gradient_checkpointing,
+        )
+    }
 
-        // --- train loop ---
-        let mut accumulated: Option<GradStore> = None;
-        let mut update_idx = 0u32;
-        let mut last_loss = 0.0f32;
-        let mut steps_run = 0u32;
-        for step in 1..=cfg.steps {
-            if req.cancel.is_cancelled() {
-                break;
-            }
-            let (x0, cap) = &cache[((step - 1) as usize) % cache.len()];
-            let sigma = sample_sigma(
-                &cfg.timestep_type,
-                &cfg.timestep_bias,
-                cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
-            );
-            let noise = sample_noise(
-                x0.dims(),
-                cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
-                device,
-            )?;
-            let (loss, grads) = compute_loss_grads(
-                &dit,
-                &lora_set.vars,
-                x0,
-                cap,
-                sigma,
-                &noise,
-                mae,
-                compute_dtype,
-                use_checkpoint,
-            )?;
-            last_loss = loss;
-            steps_run = step;
-            accumulate_grads(&mut accumulated, grads, &lora_set.vars)?;
-
-            if step % accum == 0 || step == cfg.steps {
-                let mult =
-                    lr_multiplier(cfg.lr_scheduler, update_idx, total_updates, warmup_updates);
-                opt.set_lr_scaled(mult);
-                let mut avg = accumulated
-                    .take()
-                    .expect("an update fires only after accumulation");
-                scale_grads(&mut avg, &lora_set.vars, 1.0 / accum as f64)?;
-                clip_grad_norm(&mut avg, &lora_set.vars, 1.0)?;
-                opt.step(&avg)?;
-                update_idx += 1;
-            }
-
-            on_progress(TrainingProgress::Training {
-                step,
-                total: cfg.steps,
-                loss: last_loss,
-            });
-
-            if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
-                create_output_dir(&req.output_dir)?;
-                let ckpt = req.output_dir.join(checkpoint_filename(&stem, step));
-                save_adapter(&lora_set, &ckpt)?;
-                on_progress(TrainingProgress::Checkpoint { step });
-            }
-        }
-
-        // Cancelled before a single step completed: the factors are still the no-op init (`B = 0`), so
-        // surface the typed cancellation rather than shipping an identity adapter (F-040).
-        if steps_run == 0 {
-            return Err(CandleError::Canceled);
-        }
-
-        // --- save final adapter ---
-        on_progress(TrainingProgress::Saving);
-        create_output_dir(&req.output_dir)?;
-        let adapter_path = req.output_dir.join(&req.file_name);
-        save_adapter(&lora_set, &adapter_path)?;
-        Ok(TrainingOutput {
-            adapter_path,
-            steps: steps_run,
-            final_loss: last_loss,
-        })
+    /// Stamp `baseModel`/`family` provenance into the adapter header so the Turbo cross-apply policy
+    /// (family-match) can validate it.
+    fn save(&self, set: &LoraSet, path: &Path) -> Result<()> {
+        let mut meta = HashMap::new();
+        meta.insert("baseModel".to_string(), KREA_2_RAW_ID.to_string());
+        meta.insert("family".to_string(), "krea_2".to_string());
+        flow_match::save_adapter(set, &meta, path)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::candle_core::Var;
     use candle_gen::gen_core::registry;
     use candle_gen::train::lora::build_lora_targets;
+    use candle_gen::train::optim::{clip_grad_norm, TrainOptimizer};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The smallest valid Krea DiT config: 1 single-stream block, 1 layerwise + 1 refiner text block,
@@ -736,29 +477,8 @@ mod tests {
         (x0, cap, noise)
     }
 
-    /// `sample_sigma` is deterministic in its seed, lands in `[1e-3, 1−1e-3]`, and the bias tilts shift
-    /// the mass the documented way (`low` ⇒ smaller σ than neutral than `high`, on average).
-    #[test]
-    fn sigma_is_deterministic_and_in_range() {
-        for seed in [0u64, 1, 42, 9999] {
-            let a = sample_sigma("sigmoid", "balanced", seed);
-            let b = sample_sigma("sigmoid", "balanced", seed);
-            assert_eq!(a, b, "same seed must reproduce");
-            assert!((1e-3..=1.0 - 1e-3).contains(&a), "σ out of range: {a}");
-        }
-        let mean = |bias: &str| {
-            let s: f32 = (0..256).map(|i| sample_sigma("sigmoid", bias, i)).sum();
-            s / 256.0
-        };
-        let (lo, mid, hi) = (mean("low"), mean("balanced"), mean("high"));
-        assert!(
-            lo < mid && mid < hi,
-            "bias order low {lo} < mid {mid} < high {hi}"
-        );
-    }
-
     /// `build_batch`: `x_t = (1−σ)x0 + σ·noise`, `target = noise − x0`, `timestep = σ` (the Krea raw-σ
-    /// convention — NOT the Z-Image `1−σ`).
+    /// convention — NOT the Z-Image `1−σ` — layered over the shared `flow_match::build_batch`).
     #[test]
     fn build_batch_math() {
         let dev = Device::Cpu;
@@ -974,7 +694,8 @@ mod tests {
     }
 
     /// `validate` rejects an empty dataset, zero rank/steps, an unsupported optimizer, and an
-    /// unrecognized timestep/loss knob — before any load.
+    /// unrecognized timestep/loss knob — before any load (now via the shared
+    /// `flow_match::validate_flow_match_request`).
     #[test]
     fn validate_rejects_bad_requests() {
         use candle_gen::gen_core::runtime::CancelFlag;

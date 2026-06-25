@@ -29,6 +29,7 @@
 //! step) lives in each provider crate's `Trainer`, built from these primitives.
 pub mod checkpoint;
 pub mod dataset;
+pub mod flow_match;
 pub mod gradient_checkpoint;
 pub mod lora;
 pub mod optim;
