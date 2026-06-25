@@ -27,4 +27,4 @@ flash-attn = ["candle-gen/flash-attn"]
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
-sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "7468d03e761f02d4955da79009177f75f1221e0f" }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "1a784cd74d067bb95483d2dba3b4b79bc7aa6b85" }

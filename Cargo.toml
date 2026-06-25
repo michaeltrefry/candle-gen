@@ -216,12 +216,15 @@ resolver = "2"
 # Bumped `c45caec` -> `7468d03` (epic 7841 SD3.5, sc-7871): a PURE gen-core lockstep re-pin so the
 # SceneWorks worker's `--features backend-candle` skew gate resolves ONE gen-core rev (== its mlx pin)
 # when it moves mlx-gen + candle-gen -> 7468d03 to pick up the new `mlx-gen-sd3` SD3.5 Large/Turbo
-# generators (mlx-gen #576-585). gen-core is BYTE-IDENTICAL c45caec..7468d03 (`git diff c45caec..7468d03
-# -- gen-core/ gen-core-testkit/` is EMPTY; the range is mlx-gen-sd3 + PiD provider Rust only — no contract
-# change), so candle-gen compiles UNCHANGED — NO candle source change, no new provider (candle does NOT
-# implement SD3.5; that is epic 7982). Root sceneworks-gen-core dep + the 16 per-crate
-# sceneworks-gen-core-testkit dev-deps move together.
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "7468d03e761f02d4955da79009177f75f1221e0f" }
+# generators (mlx-gen #576-585). gen-core is BYTE-IDENTICAL c45caec..7468d03.
+# Bumped `7468d03` -> `1a784cd` (epic 7841 SD3.5, sc-7871 / S2 completion, M3 merged): re-pin to mlx-gen
+# main HEAD so the worker's skew gate stays single-rev when it moves to 1a784cd to pick up the new
+# `mlx-gen-sd3` SD3.5 **Medium** (MMDiT-X) generator (M3, sc-7869). gen-core is BYTE-IDENTICAL
+# 7468d03..1a784cd (`git diff 7468d03..1a784cd -- gen-core/ gen-core-testkit/` is EMPTY; the range is
+# mlx-gen-sd3 Rust only — no contract change), so candle-gen compiles UNCHANGED — NO candle source change,
+# no new provider (candle does NOT implement SD3.5; that is epic 7982). Root sceneworks-gen-core dep +
+# the 16 per-crate sceneworks-gen-core-testkit dev-deps move together.
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "1a784cd74d067bb95483d2dba3b4b79bc7aa6b85" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels
