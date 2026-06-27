@@ -112,6 +112,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // only valid integrator, so no curated sampler/scheduler menu is advertised (N3: empty list).
             samplers: Vec::new(),
             schedulers: Vec::new(),
+            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,

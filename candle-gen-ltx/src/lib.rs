@@ -415,6 +415,7 @@ pub fn descriptor() -> ModelDescriptor {
                 &["rectified-flow"],
             ),
             schedulers: vec![],
+            supported_guidance_methods: vec![],
             min_size: SIZE_MULTIPLE,
             max_size: 1280,
             max_count: 1,

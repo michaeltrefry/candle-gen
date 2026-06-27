@@ -377,6 +377,7 @@ pub fn descriptor() -> ModelDescriptor {
                 "unipc",
             ],
             schedulers: vec![],
+            supported_guidance_methods: vec![],
             min_size: 32,
             max_size: 1280,
             max_count: 1,

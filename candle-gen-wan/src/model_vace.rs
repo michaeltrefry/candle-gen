@@ -389,6 +389,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Curated `uni_pc` (sc-7296) → Wan's native UniPC; `euler` flow Euler. Legacy `unipc` alias.
             samplers: vec!["uni_pc", "euler", "unipc"],
             schedulers: vec![],
+            supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,

@@ -212,6 +212,7 @@ pub fn descriptor() -> ModelDescriptor {
             // flow-match schedule) is the byte-faithful N1 no-op.
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
+            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,

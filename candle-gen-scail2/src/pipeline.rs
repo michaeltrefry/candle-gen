@@ -77,6 +77,7 @@ pub fn descriptor() -> ModelDescriptor {
             // match the mlx-gen-scail2 descriptor for cross-backend routing parity.
             samplers: vec!["unipc", "dpm++"],
             schedulers: Vec::new(),
+            supported_guidance_methods: vec![],
             min_size: 32,
             max_size: 1280,
             max_count: 1,

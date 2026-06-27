@@ -169,6 +169,7 @@ pub fn descriptor() -> ModelDescriptor {
             // the default `euler` over `EdmModelSampling` reproduces the native v-pred Euler loop (N1).
             samplers: candle_gen::curated_sampler_names(),
             schedulers: Vec::new(),
+            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 1024,
             max_count: 1,

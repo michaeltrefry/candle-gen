@@ -590,6 +590,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
                 &["flow_match"],
             ),
             // Buckets span 736..2080 (all ÷16); allow any ÷16 size in a sane range.
+            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2080,
             max_count: 8,

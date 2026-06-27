@@ -81,6 +81,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // curated solvers/schedulers do not apply.
             samplers: vec!["seedvr2_euler"],
             schedulers: vec!["seedvr2_euler"],
+            supported_guidance_methods: vec![],
             min_size: VAE_SCALE,
             max_size: 4096,
             max_count: 8,

@@ -11,6 +11,7 @@
 //! equality of the draw is NOT a goal (the RNG differs from mlx).
 
 use candle_core::Tensor;
+use gen_core::guidance::GuidanceOps;
 use gen_core::sampling::{LatentOps, TimestepConvention};
 use gen_core::{CancelFlag, Progress};
 use rand::{rngs::StdRng, SeedableRng};
@@ -69,6 +70,64 @@ impl LatentOps for CandleLatentOps {
             .collect();
         let noise = ge(Tensor::from_vec(data, x.shape().clone(), x.device()))?;
         ge(noise.to_dtype(x.dtype()))
+    }
+}
+
+/// Normalize gen-core's (possibly negative) reduction `axes` to candle's `usize` dims for `x`.
+fn candle_dims(x: &Tensor, axes: &[i32]) -> Vec<usize> {
+    let r = x.rank() as i32;
+    axes.iter()
+        .map(|&a| (if a < 0 { a + r } else { a }) as usize)
+        .collect()
+}
+
+/// The guidance-axis op extension (epic 7434 P2, sc-7440) over `candle_core::Tensor` — the candle
+/// twin of mlx-gen's `MlxLatentOps` impl, backing the backend-neutral [`gen_core::guidance`] library
+/// (cfg / cfg_rescale / full APG). candle is EAGER, so no `eval` boundary applies.
+///
+/// The reductions return the **keepdim** tensor (reduced shape); candle has NO implicit broadcasting,
+/// so `mul`/`div` use `broadcast_mul`/`broadcast_div` to let the library's mixed full×reduced combines
+/// broadcast (equal shapes broadcast to themselves). Negative `axes` are normalized via
+/// [`candle_dims`]; `shape` is unused (the `Tensor` carries its own).
+impl GuidanceOps for CandleLatentOps {
+    fn mul(&self, a: &Tensor, b: &Tensor) -> gen_core::Result<Tensor> {
+        ge(a.broadcast_mul(b))
+    }
+
+    fn div(&self, a: &Tensor, b: &Tensor) -> gen_core::Result<Tensor> {
+        ge(a.broadcast_div(b))
+    }
+
+    fn clamp_min(&self, x: &Tensor, s: f32) -> gen_core::Result<Tensor> {
+        ge(x.clamp(s, f32::INFINITY))
+    }
+
+    fn clamp_max(&self, x: &Tensor, s: f32) -> gen_core::Result<Tensor> {
+        ge(x.clamp(f32::NEG_INFINITY, s))
+    }
+
+    fn select_positive(&self, sel: &Tensor, a: &Tensor, b: &Tensor) -> gen_core::Result<Tensor> {
+        let mask = ge(sel.gt(0f32))?;
+        ge(mask.where_cond(a, b))
+    }
+
+    fn norm_over(&self, x: &Tensor, _shape: &[usize], axes: &[i32]) -> gen_core::Result<Tensor> {
+        let dims = candle_dims(x, axes);
+        let sq = ge(x.sqr())?;
+        let summed = ge(sq.sum_keepdim(dims.as_slice()))?;
+        ge(summed.sqrt())
+    }
+
+    fn dot_over(
+        &self,
+        a: &Tensor,
+        b: &Tensor,
+        _shape: &[usize],
+        axes: &[i32],
+    ) -> gen_core::Result<Tensor> {
+        let dims = candle_dims(a, axes);
+        let prod = ge(a.broadcast_mul(b))?;
+        ge(prod.sum_keepdim(dims.as_slice()))
     }
 }
 
@@ -824,5 +883,105 @@ mod tests {
                 "{name} (AV two-stream) produced non-finite output"
             );
         }
+    }
+}
+
+/// Real-backend (candle `Tensor`, CPU) parity for the gen-core guidance library over
+/// [`CandleLatentOps`] (sc-7440) — the candle twin of mlx-gen's `guidance_ops_tests`. Proves the
+/// trait impl reproduces the bespoke Lens/Bernini combine and `apg @ eta=1/nt=0/no-momentum == cfg`
+/// on real `Tensor`, not just `CpuLatentOps`.
+#[cfg(test)]
+mod guidance_ops_tests {
+    use super::*;
+    use candle_core::Device;
+    use gen_core::guidance::{cfg, cfg_rescale, normalized_guidance};
+
+    /// A [B=1, seq=2, C=3] tensor (per-token channel-axis geometry, the Lens case).
+    fn t(data: &[f32]) -> Tensor {
+        Tensor::from_vec(data.to_vec(), (1usize, 2, 3), &Device::Cpu).unwrap()
+    }
+
+    fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
+        let av = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let bv = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        av.iter()
+            .zip(&bv)
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0_f32, f32::max)
+    }
+
+    fn pair() -> (Tensor, Tensor) {
+        let cond = t(&[3.0, 4.0, 0.0, 1.0, 2.0, 2.0]);
+        let uncond = t(&[0.5, -1.0, 0.25, 0.1, 0.3, -0.2]);
+        (cond, uncond)
+    }
+
+    #[test]
+    fn cfg_matches_hand_combine() {
+        let ops = CandleLatentOps;
+        let (cond, uncond) = pair();
+        let got = cfg(&ops, &cond, &uncond, 4.0).unwrap();
+        let want = uncond
+            .add(&cond.sub(&uncond).unwrap().affine(4.0, 0.0).unwrap())
+            .unwrap();
+        assert!(
+            max_abs(&got, &want) < 1e-4,
+            "cfg over candle != hand combine"
+        );
+    }
+
+    /// gen-core `cfg_rescale` over candle == the bespoke Lens formula (per-token channel-axis rescale).
+    #[test]
+    fn cfg_rescale_matches_lens_formula() {
+        let ops = CandleLatentOps;
+        let (cond, uncond) = pair();
+        let shape = [1usize, 2, 3];
+        let got = cfg_rescale(&ops, &cond, &uncond, 2.0, &shape, &[-1]).unwrap();
+        // Hand-rolled Lens reference: comb rescaled to ‖cond‖/‖comb‖ over the channel axis (2).
+        let comb = uncond
+            .add(&cond.sub(&uncond).unwrap().affine(2.0, 0.0).unwrap())
+            .unwrap();
+        let norm = |x: &Tensor| x.sqr().unwrap().sum_keepdim(2).unwrap().sqrt().unwrap();
+        let cond_norm = norm(&cond);
+        let comb_norm = norm(&comb);
+        let denom = comb_norm.clamp(1e-12, f32::INFINITY).unwrap();
+        let ratio = cond_norm.broadcast_div(&denom).unwrap();
+        let want = comb.broadcast_mul(&ratio).unwrap();
+        assert!(
+            max_abs(&got, &want) < 1e-4,
+            "cfg_rescale over candle != Lens formula"
+        );
+    }
+
+    /// The Bernini invariant on real `Tensor`: APG at eta=1, nt=0, no momentum == plain CFG.
+    #[test]
+    fn apg_reduces_to_cfg_on_candle() {
+        let ops = CandleLatentOps;
+        let (cond, uncond) = pair();
+        let shape = [1usize, 2, 3];
+        let got =
+            normalized_guidance(&ops, &cond, &uncond, 4.0, None, 1.0, 0.0, &shape, &[-1]).unwrap();
+        let want = cfg(&ops, &cond, &uncond, 4.0).unwrap();
+        assert!(
+            max_abs(&got, &want) < 1e-4,
+            "apg(eta=1,nt=0) over candle != cfg"
+        );
+    }
+
+    /// eta=0 ⇒ the APG delta is orthogonal to the conditional base: (nd · cond) per token ≈ 0.
+    #[test]
+    fn apg_eta0_is_orthogonal_on_candle() {
+        let ops = CandleLatentOps;
+        let (cond, uncond) = pair();
+        let shape = [1usize, 2, 3];
+        let got =
+            normalized_guidance(&ops, &cond, &uncond, 1.0, None, 0.0, 0.0, &shape, &[-1]).unwrap();
+        let nd = got.sub(&uncond).unwrap();
+        let dot = nd.mul(&cond).unwrap().sum_keepdim(2).unwrap();
+        let zeros = dot.zeros_like().unwrap();
+        assert!(
+            max_abs(&dot, &zeros) < 1e-3,
+            "eta=0 not orthogonal to cond on candle"
+        );
     }
 }

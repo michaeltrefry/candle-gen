@@ -150,6 +150,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_lokr: false,
             samplers: vec![],
             schedulers: vec!["flow_match_euler"],
+            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
