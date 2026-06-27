@@ -117,6 +117,34 @@ fn strip_peft_prefix(key: &str) -> &str {
     key
 }
 
+/// Rewrite a native Krea-2 / ai-toolkit (ostris) module path to the diffusers names the base DiT keys
+/// use (sc-8185). ai-toolkit keys its LoRAs to the **raw checkpoint layout** — `blocks`/`txtfusion`
+/// containers, `attn.{wq,wk,wv,wo,gate}`, an `mlp` FFN — whereas SceneWorks' converter/trainer (and the
+/// base DiT tensor keys this merge folds into) use `transformer_blocks`/`text_fusion`,
+/// `attn.{to_q,to_k,to_v,to_out.0,to_gate}`, `ff`. A path already in diffusers form is returned
+/// unchanged (none of the replacements match it), so this is a no-op for our own LoRAs.
+fn normalize_native_krea_path(path: &str) -> String {
+    // Container (leading segment): native `blocks`/`txtfusion` → diffusers `transformer_blocks`/
+    // `text_fusion`. `transformer_blocks.`/`text_fusion.` don't start with `blocks.`/`txtfusion.`, so
+    // an already-diffusers path is untouched.
+    let mut p = if let Some(rest) = path.strip_prefix("blocks.") {
+        format!("transformer_blocks.{rest}")
+    } else if let Some(rest) = path.strip_prefix("txtfusion.") {
+        format!("text_fusion.{rest}")
+    } else {
+        path.to_string()
+    };
+    // FFN container, then the attention leaf names.
+    p = p.replace(".mlp.", ".ff.");
+    p = p
+        .replace(".attn.wq", ".attn.to_q")
+        .replace(".attn.wk", ".attn.to_k")
+        .replace(".attn.wv", ".attn.to_v")
+        .replace(".attn.wo", ".attn.to_out.0")
+        .replace(".attn.gate", ".attn.to_gate");
+    p
+}
+
 /// Build the kohya `flattened → dotted` lookup table from the base DiT's 2-D Linear weight keys
 /// (`{dotted}.weight`). The `_`-flattening is ambiguous (diffusers names contain `_`), so resolving
 /// against the real key set is what disambiguates a kohya stem.
@@ -154,7 +182,7 @@ fn classify_lora_key(key: &str, table: &BTreeMap<String, String>) -> Option<(Str
         (".alpha", Role::Alpha),
     ] {
         if let Some(path) = rem.strip_suffix(suf) {
-            return Some((path.to_string(), role));
+            return Some((normalize_native_krea_path(path), role));
         }
     }
     None
@@ -171,7 +199,7 @@ fn classify_lokr_key(
             return if let Some(flat) = stem.strip_prefix(KOHYA_PREFIX) {
                 table.get(flat).map(|d| (d.clone(), factor))
             } else {
-                Some((strip_peft_prefix(stem).to_string(), factor))
+                Some((normalize_native_krea_path(strip_peft_prefix(stem)), factor))
             };
         }
     }
@@ -483,6 +511,54 @@ mod tests {
             &table
         )
         .is_none());
+    }
+
+    /// sc-8185: ostris **ai-toolkit** keys Krea-2 LoRAs to the raw checkpoint layout
+    /// (`diffusion_model.blocks.N.attn.wq`, an `mlp` FFN, `txtfusion.…`). Those must resolve to the
+    /// same canonical DiT paths the merge folds into — in particular `wo` → `to_out.0` and
+    /// `mlp` → `ff` — and the normalizer must be a no-op on already-diffusers paths (our own LoRAs).
+    #[test]
+    fn classify_lora_normalizes_native_aitoolkit_naming() {
+        let table = build_kohya_table(&base_map());
+        let cases = [
+            (
+                "diffusion_model.blocks.0.attn.wq.lora_A.weight",
+                "transformer_blocks.0.attn.to_q",
+            ),
+            (
+                "diffusion_model.blocks.3.attn.wo.lora_B.weight",
+                "transformer_blocks.3.attn.to_out.0",
+            ),
+            (
+                "diffusion_model.blocks.5.attn.gate.lora_A.weight",
+                "transformer_blocks.5.attn.to_gate",
+            ),
+            (
+                "diffusion_model.blocks.2.mlp.down.lora_A.weight",
+                "transformer_blocks.2.ff.down",
+            ),
+            (
+                "diffusion_model.txtfusion.layerwise_blocks.0.attn.wk.lora_A.weight",
+                "text_fusion.layerwise_blocks.0.attn.to_k",
+            ),
+            (
+                "diffusion_model.txtfusion.refiner_blocks.1.mlp.up.lora_B.weight",
+                "text_fusion.refiner_blocks.1.ff.up",
+            ),
+        ];
+        for (key, want) in cases {
+            let (p, _) = classify_lora_key(key, &table).unwrap();
+            assert_eq!(p, want, "native key {key} must normalize to {want}");
+        }
+        // No-op on already-diffusers paths (our converter/trainer output).
+        assert_eq!(
+            normalize_native_krea_path("transformer_blocks.0.attn.to_out.0"),
+            "transformer_blocks.0.attn.to_out.0"
+        );
+        assert_eq!(
+            normalize_native_krea_path("text_fusion.refiner_blocks.1.ff.gate"),
+            "text_fusion.refiner_blocks.1.ff.gate"
+        );
     }
 
     /// Bare-dotted LoRA merges into `W += (alpha/rank)·scale·B·A`; base+delta is exact in f32.
