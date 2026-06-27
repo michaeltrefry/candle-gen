@@ -22,7 +22,11 @@ inventory = { workspace = true }
 # Qwen3.6 tool-calling API (`core_llm::Message.tool_calls` et al.); `54ef5a1` is the candle-llm rev that
 # carries the matching wiring (candle-llm #35) so cargo still unifies ONE candle-llm in the worker graph.
 # The shim's own `Message {…}` literals get `tool_calls: Vec::new()` for the new field (see src/lib.rs).
-candle-llm = { git = "https://github.com/SceneWorks/candle-llm", rev = "54ef5a1ed43b8918f01858fe431bfec0eb2a3f25" }
+# Bumped `54ef5a1` -> `bf99e5b` (sc-8177): the SceneWorks worker's mlx-llm bump (PR #928) pulls `core-llm`
+# forward to `3870ed1`, which added `Content::Video`, `TextLlmCapabilities.supports_video`, and
+# `TextLlmRegistration.weightless_vision`; `bf99e5b` is the candle-llm rev that adds the matching (text-only,
+# additive) wiring so candle-llm still compiles against the unified `core-llm` in the worker graph.
+candle-llm = { git = "https://github.com/SceneWorks/candle-llm", rev = "bf99e5b48082fa09eaec6eb98c1245d92feed5ae" }
 
 [features]
 default = []

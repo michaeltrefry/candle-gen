@@ -553,7 +553,7 @@ dependencies = [
 [[package]]
 name = "candle-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/candle-llm?rev=54ef5a1ed43b8918f01858fe431bfec0eb2a3f25#54ef5a1ed43b8918f01858fe431bfec0eb2a3f25"
+source = "git+https://github.com/SceneWorks/candle-llm?rev=bf99e5b48082fa09eaec6eb98c1245d92feed5ae#bf99e5b48082fa09eaec6eb98c1245d92feed5ae"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -713,7 +713,7 @@ dependencies = [
 [[package]]
 name = "core-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=main#a49ca6d9738d5e0786f29634d57c8d1bd1939c38"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#3870ed1c7495caa6bcb8cc0836b9dd4356969737"
 dependencies = [
  "inventory",
  "minijinja",
@@ -1008,7 +1008,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2600,7 +2600,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3476,7 +3476,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
