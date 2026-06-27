@@ -57,6 +57,16 @@ pub const MIN_TILE_PX: i32 = 256;
 /// Spatial-tile overlap (px, multiple of [`SPATIAL_ALIGN`]) for the feather blend (sc-5201).
 pub const SPATIAL_OVERLAP: i32 = 64;
 
+/// Largest output edge (px) the SeedVR2 **VAE decoder** reconstructs faithfully in a single pass.
+/// A *correctness* cap, not a memory one: on the MLX/Metal backend the decoder silently corrupts/blurs
+/// its output above this in one pass (sc-8228 — a large-tensor limit; real-weight round-trip cos vs
+/// input 1536² 0.9955 (good) → 2048² 0.803 (−88% sharpness)). The mflux reference always tiles the
+/// decode (512²) to avoid it; we tile the whole pass on this cap even when the memory budget would
+/// permit a single pass (sc-8261). Mirrored from `mlx-gen-seedvr2` for backend parity (the Metal limit
+/// may not bite on CUDA, but the cap also bounds peak decode memory and keeps the two backends aligned).
+/// `1536 = 96 · SPATIAL_ALIGN`, so it is a valid tile edge.
+pub const VAE_SAFE_DECODE_EDGE_PX: i32 = 1536;
+
 /// Total VRAM (GiB) of the smallest visible CUDA device, read from `nvidia-smi` (the SceneWorks
 /// worker's GPU-discovery convention — ships with the driver on Windows + Linux). The MIN across
 /// devices is conservative on a heterogeneous box; `None` when `nvidia-smi` is absent or fails.
@@ -293,7 +303,10 @@ pub fn plan_spatial_tile_px(weights_bytes: usize, safe_gib: f64) -> i32 {
     let avail = (safe_gib - weights_gib).max(0.0);
     let max_area_px2 = avail / (GB_PER_MPX_FRAME * 1e-6); // = tile² (px²)
     let edge = (max_area_px2.max(0.0).sqrt() as i32) / SPATIAL_ALIGN * SPATIAL_ALIGN;
-    edge.max(MIN_TILE_PX)
+    // Clamp the memory-sized edge *down* to the VAE correctness cap so each tile decodes within the
+    // decoder's safe limit on any VRAM (sc-8261). MIN_TILE_PX (256) ≤ VAE_SAFE_DECODE_EDGE_PX (1536),
+    // so the clamp bounds are always valid.
+    edge.clamp(MIN_TILE_PX, VAE_SAFE_DECODE_EDGE_PX)
 }
 
 /// Per-pixel feather weights `(th·tw)` for a tile, tapering linearly to ~0 over `overlap` px on each
@@ -486,6 +499,21 @@ mod tests {
         // Generous budget → a large multiple-of-16 edge above the floor.
         let big = plan_spatial_tile_px(wb, 108.0);
         assert!(big > MIN_TILE_PX && big % SPATIAL_ALIGN == 0);
+    }
+
+    #[test]
+    fn spatial_tile_never_exceeds_vae_cap() {
+        // sc-8261: however generous the budget, no spatial tile decodes past the VAE correctness edge.
+        let wb = (7.3 * GIB) as usize;
+        for safe in [40.0, 80.0, 200.0, 1000.0] {
+            let tile = plan_spatial_tile_px(wb, safe);
+            assert!(
+                tile <= VAE_SAFE_DECODE_EDGE_PX,
+                "tile {tile} exceeds VAE cap {VAE_SAFE_DECODE_EDGE_PX} at safe={safe}"
+            );
+            assert!(tile >= MIN_TILE_PX);
+            assert_eq!(tile % SPATIAL_ALIGN, 0);
+        }
     }
 
     #[test]
