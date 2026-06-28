@@ -1,0 +1,51 @@
+[package]
+name = "candle-gen-sd3"
+version = "0.0.0"
+edition = "2021"
+description = "Stable Diffusion 3.5 (Large MMDiT + triple text-encoder aggregator + 16-channel VAE) provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-sd3 (epic 7841)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "diffusion", "stable-diffusion-3", "inference"]
+categories = ["science"]
+
+[dependencies]
+# Core crate — re-exports gen_core + candle, so this provider links exactly one gen-core / candle
+# build (single resolution; see scripts/check-gen-core-skew.sh).
+candle-gen = { path = "../candle-gen" }
+# Link-time self-registration into gen-core's model registry (the `register_generators!` below).
+inventory = { workspace = true }
+# SD3.5 building blocks reused from candle-transformers: the dual CLIP text encoders (CLIP-L +
+# OpenCLIP bigG via `stable_diffusion::clip`), the T5-XXL encoder (`t5::T5EncoderModel`), and the
+# 16-channel AutoencoderKL VAE (`z_image::vae`, parameterized scale/shift). Backend features pass
+# through so it shares candle-gen's exact candle build.
+candle-transformers = { workspace = true }
+# Direct candle deps for the vendored SD3.5 MMDiT (`src/transformer.rs`) — the joint/double-stream
+# blocks with learned positional embedding + AdaLN-continuous modulation are ported here (adapted
+# from candle-gen-flux2's MMDiT template, RoPE stripped). Same workspace pin candle-gen uses, so
+# cargo unifies to one candle build (no skew).
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+# CLIP / T5 tokenizer.json loading (the underlying HF `tokenizers` runtime), shared at the workspace
+# pin. Used by the conditioning aggregator (C2 wires the real encode; C1 keeps it config-driven).
+tokenizers = { workspace = true }
+# Deterministic CPU-seeded initial noise (sc-3673 parity) — NOT candle's CUDA `randn`.
+rand = { workspace = true }
+rand_distr = { workspace = true }
+# Read trained adapter `.safetensors` + the diffusers `config.json` for the DiT/VAE at load.
+safetensors = "0.7"
+serde_json = { workspace = true }
+
+[features]
+# Pass the backend selection through to the core crate AND candle-transformers so a downstream
+# `--features metal`/`cuda` on this provider crate selects the matching candle backend everywhere.
+default = []
+metal = ["candle-gen/metal", "candle-transformers/metal"]
+cuda = ["candle-gen/cuda", "candle-transformers/cuda"]
+flash-attn = ["candle-gen/flash-attn", "candle-transformers/flash-attn"]
+
+[dev-dependencies]
+# `examples/sd3-txt2img.rs` smoke driver (C2) — encode the produced `gen_core::Image` (RGB8) to PNG.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# gen-core conformance suite — pinned to the SAME gen-core rev the workspace pins so it shares one
+# contract build. Used by cuda-gated, `#[ignore]`d real-weight tests (C2/C6).
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "98ddb6b29fbbc9d378e1f175bfccc2ac7b87f8f3" }

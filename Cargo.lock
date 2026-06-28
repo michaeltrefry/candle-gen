@@ -456,6 +456,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-sd3"
+version = "0.0.0"
+dependencies = [
+ "candle-core",
+ "candle-gen",
+ "candle-nn",
+ "candle-transformers",
+ "image",
+ "inventory",
+ "rand",
+ "rand_distr",
+ "safetensors 0.7.0",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "tokenizers 0.22.2",
+]
+
+[[package]]
 name = "candle-gen-sdxl"
 version = "0.0.0"
 dependencies = [
