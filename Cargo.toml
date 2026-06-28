@@ -244,7 +244,13 @@ resolver = "2"
 # (which fixes LoKr/LoHa apply in BFL/ComfyUI fused naming on FLUX.1/FLUX.2 — mlx-gen #609). `git diff
 # 39ef575..98ddb6b -- gen-core/` is EMPTY — gen-core BYTE-IDENTICAL, candle compiles UNCHANGED; no new
 # provider. Root sceneworks-gen-core dep + the 16 per-crate sceneworks-gen-core-testkit dev-deps move together.
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "db6d83468e97551299b49dc43b86fa3253f9906e" }
+# Bumped `db6d834` -> `b6538cb` (sc-8395): lockstep gen-core rev-alignment so the SceneWorks worker's
+# `--features backend-candle` skew gate resolves ONE gen-core rev when it re-pins mlx-gen to b6538cb
+# (which strips the `diffusion_model.` prefix on the third-party LoKr/LoHa apply path so ai-toolkit Krea
+# adapters load — mlx-gen #611). `git diff db6d834..b6538cb` touches only `src/adapters/loader.rs` —
+# gen-core BYTE-IDENTICAL, candle compiles UNCHANGED; no new provider. The 16 per-crate testkit dev-deps
+# stay at 98ddb6b (pre-existing lag; the `candle-gen` umbrella the skew gate targets does not pull them).
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "b6538cb4c4b3a9c70ac8e0db73084fb3ccb6eeac" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels
