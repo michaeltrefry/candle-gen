@@ -239,7 +239,12 @@ resolver = "2"
 # (which clamps the SeedVR2 tiling budget by Metal `maxBufferLength`). `git diff 221a171..1d2479b --
 # gen-core/` is EMPTY — gen-core BYTE-IDENTICAL, candle compiles UNCHANGED; no new provider. Root
 # sceneworks-gen-core dep + the 16 per-crate sceneworks-gen-core-testkit dev-deps move together.
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "39ef575eeb8cc8c81a04b230ab6c19208c37098d" }
+# Bumped `39ef575` -> `98ddb6b` (sc-8345): lockstep gen-core rev-alignment so the SceneWorks worker's
+# `--features backend-candle` skew gate resolves ONE gen-core rev when it re-pins mlx-gen to 98ddb6b
+# (which fixes LoKr/LoHa apply in BFL/ComfyUI fused naming on FLUX.1/FLUX.2 — mlx-gen #609). `git diff
+# 39ef575..98ddb6b -- gen-core/` is EMPTY — gen-core BYTE-IDENTICAL, candle compiles UNCHANGED; no new
+# provider. Root sceneworks-gen-core dep + the 16 per-crate sceneworks-gen-core-testkit dev-deps move together.
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "98ddb6b29fbbc9d378e1f175bfccc2ac7b87f8f3" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels
