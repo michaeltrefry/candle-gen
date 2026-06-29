@@ -28,11 +28,14 @@
 
 pub mod conditioning;
 pub mod config;
+pub mod memory;
 pub mod pipeline;
+pub mod quant;
 pub mod transformer;
 pub mod vae;
 
 pub use config::Sd3Config;
+pub use memory::{min_memory_gb, MemoryProfile, ParamCounts, Precision};
 pub use pipeline::Variant;
 
 use std::path::PathBuf;
@@ -41,7 +44,7 @@ use std::sync::Mutex;
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, WeightsSource,
+    ModelDescriptor, Progress, Quant, WeightsSource,
 };
 
 use pipeline::{Components, Pipeline};
@@ -71,6 +74,9 @@ pub struct Sd3Generator {
     device: Device,
     dtype: DType,
     variant: Variant,
+    /// Optional DiT quantization (`Q4`/`Q8`) applied at first component load (sc-7879). `None` ⇒
+    /// dense bf16. The text encoders + VAE stay dense regardless.
+    quant: Option<Quant>,
     /// Cached components. `Mutex` because `Generator` is shared and `generate` takes `&self`; the lock
     /// is held only to read/populate the cache, never across the denoise.
     components: Mutex<Option<Components>>,
@@ -136,7 +142,13 @@ impl Generator for Sd3Generator {
         // The light `Pipeline` handle carries the snapshot/device/variant; the heavy components come
         // from the cache. The rich-`CandleError` tail (including the typed `Canceled`) bridges into
         // `gen_core::Error` via `?`.
-        let pipe = Pipeline::load(&self.root, &self.device, self.dtype, self.variant);
+        let pipe = Pipeline::load(
+            &self.root,
+            &self.device,
+            self.dtype,
+            self.variant,
+            self.quant,
+        );
         let components = self.components(&pipe)?;
         let images = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Images(images))
@@ -198,7 +210,9 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             max_size: 2048,
             max_count: 8,
             mac_only: false,
-            supported_quants: &[],
+            // The MMDiT projections fold to Q4_0/Q8_0 at load (sc-7879, dequant-on-forward); the TE +
+            // VAE stay dense. All three variants share the quant path.
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             // SD3.5 is a flow-match model; the resolution-independent σ-shift is applied by the
             // pipeline, so it does not require the loader to pre-shift.
@@ -210,7 +224,8 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
 /// Construct the candle SD3.5 **Large** generator from a [`LoadSpec`]. `spec.weights` must be a
 /// [`WeightsSource::Dir`] pointing at a `stabilityai/stable-diffusion-3.5-large`-layout diffusers
 /// snapshot (`text_encoder/`, `text_encoder_2/`, `text_encoder_3/`, `transformer/`, `vae/`, plus the
-/// tokenizers). Quantization / control / adapters are refused (not wired yet).
+/// tokenizers). `spec.quantize` (Q4/Q8) folds the MMDiT at load (sc-7879); control / adapters are
+/// still refused (not wired yet).
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_variant(spec, Variant::Large)
 }
@@ -243,11 +258,9 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
             )));
         }
     };
-    if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "candle {id} does not support on-the-fly Q4/Q8 quantization yet (C4, sc-7879)"
-        )));
-    }
+    // sc-7879: Q4/Q8 quantize the MMDiT at load (dequant-on-forward). `Quant` only has Q4/Q8, so any
+    // requested level is supported; `None` ⇒ dense bf16.
+    let quant = spec.quantize;
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {id} does not support control / IP-adapter overlays (txt2img only)"
@@ -266,6 +279,7 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
         device,
         dtype: DType::BF16,
         variant,
+        quant,
         components: Mutex::new(None),
     }))
 }
@@ -305,7 +319,14 @@ mod tests {
         assert!(!d.capabilities.mac_only);
         assert!(d.capabilities.conditioning.is_empty());
         assert!(!d.capabilities.supports_lora);
-        assert!(d.capabilities.supported_quants.is_empty());
+        // sc-7879: the MMDiT folds to Q4/Q8 at load (TE+VAE stay dense).
+        assert_eq!(
+            d.capabilities.supported_quants,
+            &[
+                candle_gen::gen_core::Quant::Q4,
+                candle_gen::gen_core::Quant::Q8
+            ]
+        );
         assert_eq!(d.capabilities.min_size, 256);
         assert_eq!(d.capabilities.max_size, 2048);
         assert_eq!(d.capabilities.samplers, candle_gen::curated_sampler_names());
@@ -434,11 +455,18 @@ mod tests {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec, Quant};
         // `Box<dyn Generator>` is not `Debug`, so `unwrap_err()` won't compile here; bind the error
         // with a `let Err(..) else { panic! }` instead.
+        // sc-7879: Q4/Q8 quant is now ACCEPTED (the MMDiT folds at load); loading is lazy so this
+        // builds the generator without touching the (nonexistent) snapshot.
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
-        let Err(e) = load(&quant) else {
-            panic!("quant load must be refused")
-        };
-        assert!(matches!(e, gen_core::Error::Unsupported(_)), "got: {e:?}");
+        assert!(
+            load(&quant).is_ok(),
+            "Q8 quant load must be accepted (sc-7879)"
+        );
+        let quant4 = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q4);
+        assert!(
+            load(&quant4).is_ok(),
+            "Q4 quant load must be accepted (sc-7879)"
+        );
 
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),

@@ -25,8 +25,10 @@
 
 use candle_gen::candle_core::{DType, Module, Result, Tensor, D};
 use candle_gen::candle_nn::{self, Linear, RmsNorm, VarBuilder};
+use candle_gen::gen_core::Quant;
 
 use crate::config::Sd3Config;
+use crate::quant::QLinear;
 
 /// Affine-free LayerNorm eps (diffusers `elementwise_affine=False, eps=1e-6` on the AdaLN norms).
 const LN_EPS: f64 = 1e-6;
@@ -250,14 +252,14 @@ fn attention(q: &Tensor, k: &Tensor, v: &Tensor, head_dim: usize) -> Result<Tens
 /// (NO RoPE), split back. Returns `(image_out, text_out)`; `text_out` is `None` when the block is
 /// `context_pre_only` (the final block has no `to_add_out`).
 struct JointAttention {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
-    to_out: Linear,
-    add_q: Linear,
-    add_k: Linear,
-    add_v: Linear,
-    to_add_out: Option<Linear>,
+    to_q: QLinear,
+    to_k: QLinear,
+    to_v: QLinear,
+    to_out: QLinear,
+    add_q: QLinear,
+    add_k: QLinear,
+    add_v: QLinear,
+    to_add_out: Option<QLinear>,
     norm_q: Option<RmsNorm>,
     norm_k: Option<RmsNorm>,
     norm_added_q: Option<RmsNorm>,
@@ -281,21 +283,21 @@ impl JointAttention {
             (None, None, None, None)
         };
         // The image-stream output projection lives at `to_out.0`.
-        let to_out = candle_nn::linear(inner, inner, vb.pp("to_out").pp("0"))?;
+        let to_out = QLinear::linear(inner, inner, vb.pp("to_out").pp("0"))?;
         // The text-stream output projection is absent on the `context_pre_only` (final) block.
         let to_add_out = if context_pre_only {
             None
         } else {
-            Some(candle_nn::linear(inner, inner, vb.pp("to_add_out"))?)
+            Some(QLinear::linear(inner, inner, vb.pp("to_add_out"))?)
         };
         Ok(Self {
-            to_q: candle_nn::linear(inner, inner, vb.pp("to_q"))?,
-            to_k: candle_nn::linear(inner, inner, vb.pp("to_k"))?,
-            to_v: candle_nn::linear(inner, inner, vb.pp("to_v"))?,
+            to_q: QLinear::linear(inner, inner, vb.pp("to_q"))?,
+            to_k: QLinear::linear(inner, inner, vb.pp("to_k"))?,
+            to_v: QLinear::linear(inner, inner, vb.pp("to_v"))?,
             to_out,
-            add_q: candle_nn::linear(inner, inner, vb.pp("add_q_proj"))?,
-            add_k: candle_nn::linear(inner, inner, vb.pp("add_k_proj"))?,
-            add_v: candle_nn::linear(inner, inner, vb.pp("add_v_proj"))?,
+            add_q: QLinear::linear(inner, inner, vb.pp("add_q_proj"))?,
+            add_k: QLinear::linear(inner, inner, vb.pp("add_k_proj"))?,
+            add_v: QLinear::linear(inner, inner, vb.pp("add_v_proj"))?,
             to_add_out,
             norm_q,
             norm_k,
@@ -304,6 +306,21 @@ impl JointAttention {
             heads: cfg.num_heads,
             head_dim: hd,
         })
+    }
+
+    /// Fold every projection (image q/k/v/out + text add_q/k/v + to_add_out) to `Q4_0`/`Q8_0`.
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.to_q.quantize(quant)?;
+        self.to_k.quantize(quant)?;
+        self.to_v.quantize(quant)?;
+        self.to_out.quantize(quant)?;
+        self.add_q.quantize(quant)?;
+        self.add_k.quantize(quant)?;
+        self.add_v.quantize(quant)?;
+        if let Some(p) = &mut self.to_add_out {
+            p.quantize(quant)?;
+        }
+        Ok(())
     }
 
     /// `norm_img` / `norm_txt`: the modulated, normed streams. Returns `(img_out, Option<txt_out>)`.
@@ -352,10 +369,10 @@ impl JointAttention {
 /// but it does NOT touch the text stream and runs over the image sequence alone (NO RoPE, like the
 /// rest of SD3.5). Only constructed for `dual_attention_layers` blocks.
 struct SelfAttention {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
-    to_out: Linear,
+    to_q: QLinear,
+    to_k: QLinear,
+    to_v: QLinear,
+    to_out: QLinear,
     norm_q: Option<RmsNorm>,
     norm_k: Option<RmsNorm>,
     heads: usize,
@@ -375,15 +392,24 @@ impl SelfAttention {
             (None, None)
         };
         Ok(Self {
-            to_q: candle_nn::linear(inner, inner, vb.pp("to_q"))?,
-            to_k: candle_nn::linear(inner, inner, vb.pp("to_k"))?,
-            to_v: candle_nn::linear(inner, inner, vb.pp("to_v"))?,
-            to_out: candle_nn::linear(inner, inner, vb.pp("to_out").pp("0"))?,
+            to_q: QLinear::linear(inner, inner, vb.pp("to_q"))?,
+            to_k: QLinear::linear(inner, inner, vb.pp("to_k"))?,
+            to_v: QLinear::linear(inner, inner, vb.pp("to_v"))?,
+            to_out: QLinear::linear(inner, inner, vb.pp("to_out").pp("0"))?,
             norm_q,
             norm_k,
             heads: cfg.num_heads,
             head_dim: hd,
         })
+    }
+
+    /// Fold the image-only `attn2` projections (q/k/v/out) to `Q4_0`/`Q8_0`.
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.to_q.quantize(quant)?;
+        self.to_k.quantize(quant)?;
+        self.to_v.quantize(quant)?;
+        self.to_out.quantize(quant)?;
+        Ok(())
     }
 
     /// `norm_img2`: the modulated, normed image stream (from the `shift_msa2/scale_msa2` chunks).
@@ -400,17 +426,24 @@ impl SelfAttention {
 
 /// GELU feed-forward (diffusers `FeedForward` with `gelu` activation): `proj -> gelu -> out`.
 struct FeedForward {
-    proj: Linear,
-    out: Linear,
+    proj: QLinear,
+    out: QLinear,
 }
 
 impl FeedForward {
     fn new(in_dim: usize, hidden: usize, vb: VarBuilder) -> Result<Self> {
         // diffusers FeedForward nests the input projection at `net.0.proj` and the output at `net.2`.
         Ok(Self {
-            proj: candle_nn::linear(in_dim, hidden, vb.pp("net").pp("0").pp("proj"))?,
-            out: candle_nn::linear(hidden, in_dim, vb.pp("net").pp("2"))?,
+            proj: QLinear::linear(in_dim, hidden, vb.pp("net").pp("0").pp("proj"))?,
+            out: QLinear::linear(hidden, in_dim, vb.pp("net").pp("2"))?,
         })
+    }
+
+    /// Fold both projections to `Q4_0`/`Q8_0` (the MLP is the largest per-block footprint).
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.proj.quantize(quant)?;
+        self.out.quantize(quant)?;
+        Ok(())
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -473,6 +506,22 @@ impl JointBlock {
             ff_context,
             context_pre_only,
         })
+    }
+
+    /// Fold the block's compute-heavy projections (joint attention, the GELU MLP, the dual `attn2`,
+    /// and the text-stream `ff_context`) to `Q4_0`/`Q8_0`. The small AdaLN modulation linears
+    /// (`norm1.linear` / `norm1_context.linear`) stay dense — their footprint is negligible and they
+    /// drive the chaos-sensitive modulation chunks.
+    fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.attn.quantize(quant)?;
+        if let Some(a2) = &mut self.attn2 {
+            a2.quantize(quant)?;
+        }
+        self.ff.quantize(quant)?;
+        if let Some(ffc) = &mut self.ff_context {
+            ffc.quantize(quant)?;
+        }
+        Ok(())
     }
 
     /// `(image, text, temb)` → updated `(image, text)`. For the final (`context_pre_only`) block the
@@ -568,10 +617,10 @@ impl AdaLayerNormContinuous {
 pub struct Sd3Transformer {
     pos_embed: PatchEmbed,
     time_text_embed: CombinedTimestepTextEmbed,
-    context_embedder: Linear,
+    context_embedder: QLinear,
     blocks: Vec<JointBlock>,
     norm_out: AdaLayerNormContinuous,
-    proj_out: Linear,
+    proj_out: QLinear,
     cfg: Sd3Config,
 }
 
@@ -594,16 +643,31 @@ impl Sd3Transformer {
         Ok(Self {
             pos_embed: PatchEmbed::new(cfg, vb.pp("pos_embed"))?,
             time_text_embed: CombinedTimestepTextEmbed::new(cfg, vb.pp("time_text_embed"))?,
-            context_embedder: candle_nn::linear(
+            context_embedder: QLinear::linear(
                 cfg.joint_attention_dim,
                 inner,
                 vb.pp("context_embedder"),
             )?,
             blocks,
             norm_out: AdaLayerNormContinuous::new(inner, vb.pp("norm_out"))?,
-            proj_out: candle_nn::linear(inner, cfg.patch_dim(), vb.pp("proj_out"))?,
+            proj_out: QLinear::linear(inner, cfg.patch_dim(), vb.pp("proj_out"))?,
             cfg: cfg.clone(),
         })
+    }
+
+    /// Fold every compute-heavy MMDiT projection to `Q4_0`/`Q8_0` **in place** — uniform across the
+    /// `context_embedder`, every joint block (attention + GELU MLP + dual `attn2` + `ff_context`),
+    /// and the `proj_out` head. Call **after** the dense weights load. Uniform Q4 is the sc-7702
+    /// dequant-on-forward design: the int8 `QMatMul` activation-quant path is avoided so coarse Q4
+    /// stays coherent. The small AdaLN/timestep/patch-embed leaves stay dense (negligible footprint).
+    /// Mirrors `LensTransformer::quantize` (sc-5117).
+    pub fn quantize(&mut self, quant: Quant) -> Result<()> {
+        self.context_embedder.quantize(quant)?;
+        for block in &mut self.blocks {
+            block.quantize(quant)?;
+        }
+        self.proj_out.quantize(quant)?;
+        Ok(())
     }
 
     /// Unpatchify image tokens `[B, h*w, patch_dim]` back to a `[B, C, H, W]` latent (the inverse of
@@ -964,5 +1028,118 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(max > 0.0, "MMDiT-X velocity is vacuously zero?");
+    }
+
+    // ---- Q4/Q8 quantization (sc-7879) -----------------------------------------------------------
+
+    /// Cosine similarity over all elements (f64).
+    fn cosine(a: &Tensor, b: &Tensor) -> f32 {
+        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for (x, y) in a.iter().zip(b.iter()) {
+            dot += (*x as f64) * (*y as f64);
+            na += (*x as f64) * (*x as f64);
+            nb += (*y as f64) * (*y as f64);
+        }
+        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
+    }
+
+    /// Build a tiny MMDiT and its full forward inputs (shared by the quant tests). The inner dim is
+    /// bumped to 32 so every quantized contraction is at least one Q4_0/Q8_0 block wide.
+    fn quant_harness(cfg: &Sd3Config) -> (VarMap, Tensor, Tensor, Tensor, Tensor) {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 8, 8), &dev).unwrap();
+        let ctx_seq = cfg.context_seq_len();
+        let context =
+            Tensor::randn(0f32, 1f32, (1, ctx_seq, cfg.joint_attention_dim), &dev).unwrap();
+        let pooled = Tensor::randn(0f32, 1f32, (1, cfg.pooled_dim), &dev).unwrap();
+        let t = Tensor::full(0.5f32, 1, &dev).unwrap();
+        (vm, latent, context, pooled, t)
+    }
+
+    /// A config like [`tiny_cfg`] but with inner=32 (one full Q4_0/Q8_0 block per contraction row).
+    fn quant_cfg() -> Sd3Config {
+        Sd3Config {
+            inner_dim: 32,
+            num_heads: 2,
+            head_dim: 16,
+            ..tiny_cfg()
+        }
+    }
+
+    /// **Q8 forward is near-lossless; Q4 forward stays coherent** vs the dense MMDiT (CPU, random
+    /// weights). Builds one transformer, captures the dense velocity, quantizes a *copy* of the same
+    /// weights, and compares — the full-model analog of the per-linear `quant.rs` round-trip. Asserts
+    /// finite output and a bounded cosine drop (not bit-equality).
+    fn quant_forward_parity(quant: Quant, min_cos: f32) {
+        let cfg = quant_cfg();
+        let (vm, latent, context, pooled, t) = quant_harness(&cfg);
+        let dev = Device::Cpu;
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+
+        // Dense reference.
+        let dense = Sd3Transformer::new(&cfg, vb.clone()).unwrap();
+        let v_dense = dense.forward(&latent, &context, &pooled, &t).unwrap();
+
+        // Quantized model over the SAME weights (re-read from the varmap), folded in place.
+        let mut q = Sd3Transformer::new(&cfg, vb).unwrap();
+        q.quantize(quant).unwrap();
+        let v_q = q.forward(&latent, &context, &pooled, &t).unwrap();
+
+        assert_eq!(v_q.dims(), v_dense.dims());
+        for x in v_q.flatten_all().unwrap().to_vec1::<f32>().unwrap() {
+            assert!(
+                x.is_finite(),
+                "{quant:?} MMDiT produced a non-finite velocity"
+            );
+        }
+        let cos = cosine(&v_dense, &v_q);
+        assert!(
+            cos > min_cos,
+            "{quant:?} MMDiT forward cosine {cos:.5} ≤ {min_cos} vs dense"
+        );
+        // Non-vacuous: the quantized velocity is not all-zero.
+        let max = v_q
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(max > 0.0, "{quant:?} velocity vacuously zero");
+    }
+
+    #[test]
+    fn q8_mmdit_forward_is_near_lossless() {
+        quant_forward_parity(Quant::Q8, 0.99);
+    }
+
+    #[test]
+    fn q4_mmdit_forward_stays_coherent() {
+        quant_forward_parity(Quant::Q4, 0.85);
+    }
+
+    /// `quantize` transitions the model's projections to the `Quantized` arm (idempotently): a second
+    /// pass is a no-op, and the forward still runs finite afterward.
+    #[test]
+    fn quantize_is_idempotent_and_still_forwards() {
+        let cfg = quant_cfg();
+        let (vm, latent, context, pooled, t) = quant_harness(&cfg);
+        let dev = Device::Cpu;
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut model = Sd3Transformer::new(&cfg, vb).unwrap();
+        model.quantize(Quant::Q4).unwrap();
+        model.quantize(Quant::Q4).unwrap(); // no-op, must not panic
+                                            // The image q-projection of block 0 is now quantized.
+        assert!(matches!(
+            model.blocks[0].attn.to_q,
+            crate::quant::QLinear::Quantized { .. }
+        ));
+        let v = model.forward(&latent, &context, &pooled, &t).unwrap();
+        for x in v.flatten_all().unwrap().to_vec1::<f32>().unwrap() {
+            assert!(x.is_finite());
+        }
     }
 }
