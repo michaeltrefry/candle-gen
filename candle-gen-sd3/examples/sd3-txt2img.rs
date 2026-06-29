@@ -14,6 +14,10 @@
 //! # Turbo (distilled, 4-step, CFG-off):
 //! cargo run --release --example sd3-txt2img --features cuda -- \
 //!   --snapshot "C:\…\stable-diffusion-3.5-large-turbo" --variant turbo --steps 4 --out turbo.png
+//! # With a community kohya `lora_sd3` adapter (sc-7881) merged into the MMDiT:
+//! cargo run --release --example sd3-txt2img --features cuda -- \
+//!   --snapshot "C:\…\stable-diffusion-3.5-large" --variant large \
+//!   --lora "C:\…\SD3.5-Turbo-Portrait.safetensors" --lora-strength 1.0 --out portrait.png
 //! ```
 //!
 //! The snapshot must be the diffusers multi-component tree (`tokenizer*/`, `text_encoder*/`,
@@ -22,7 +26,8 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    self, AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, Progress,
+    WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -76,6 +81,23 @@ fn main() -> Result<()> {
     let out = arg(&args, "--out")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("sd3_smoke.png"));
+    // sc-7881: optional LoRA/LoKr adapter merged into the MMDiT at load. `--lora-kind lokr` selects the
+    // Kronecker variant; default is a standard LoRA (the kohya `lora_sd3` portrait format).
+    let lora = arg(&args, "--lora");
+    let lora_strength: f32 = arg(&args, "--lora-strength")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
+    let lora_kind = match arg(&args, "--lora-kind").as_deref() {
+        Some("lokr") => AdapterKind::Lokr,
+        _ => AdapterKind::Lora,
+    };
+    let adapters: Vec<AdapterSpec> = lora
+        .as_ref()
+        .map(|p| vec![AdapterSpec::new(PathBuf::from(p), lora_strength, lora_kind)])
+        .unwrap_or_default();
+    if let Some(p) = &lora {
+        println!("[smoke] lora={p} strength={lora_strength} kind={lora_kind:?}");
+    }
 
     println!(
         "[smoke] snapshot={snapshot} id={model_id}\n[smoke] {width}x{height} steps={steps} \
@@ -86,7 +108,8 @@ fn main() -> Result<()> {
     // it only through the gen_core registry below).
     candle_gen_sd3::force_link();
 
-    let mut spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
+    let mut spec =
+        LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot))).with_adapters(adapters);
     if let Some(q) = arg(&args, "--quant") {
         spec = match q.as_str() {
             "q8" | "Q8" => spec.with_quant(gen_core::Quant::Q8),

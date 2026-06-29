@@ -24,13 +24,14 @@
 //!   (`StdRng`) seeded by `seed`, moved to the device — NOT candle's CUDA `randn`. The Euler step is
 //!   non-stochastic, so generation is a pure function of `(seed, request)`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{self, GenerationRequest, Image, Progress, Quant};
+use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, Progress, Quant};
 use candle_gen::{CandleError, Result};
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
@@ -144,6 +145,9 @@ pub(crate) struct Pipeline {
     /// Optional MMDiT quantization applied right after the (dense) transformer weights load
     /// (sc-7879). `None` ⇒ dense bf16; the TE + VAE stay dense regardless.
     quant: Option<Quant>,
+    /// LoRA/LoKr adapters merged into the MMDiT weights at component-load (sc-7881). Empty ⇒ the stock
+    /// mmap build (zero regression). The merge runs **before** quantization.
+    adapters: Vec<AdapterSpec>,
 }
 
 /// The loaded SD3.5 components, `Arc`-shared so the generator can cache them across `generate` calls.
@@ -164,6 +168,7 @@ impl Pipeline {
         dtype: DType,
         variant: Variant,
         quant: Option<Quant>,
+        adapters: &[AdapterSpec],
     ) -> Self {
         Self {
             root: root.to_path_buf(),
@@ -172,6 +177,7 @@ impl Pipeline {
             variant,
             cfg: variant.config(),
             quant,
+            adapters: adapters.to_vec(),
         }
     }
 
@@ -180,6 +186,11 @@ impl Pipeline {
     pub(crate) fn load_components(&self) -> Result<Components> {
         let encoders =
             Sd3TextEncoders::load(&self.root, self.cfg.t5_seq_len, &self.device, self.dtype)?;
+        // The DiT VarBuilder source depends on whether adapters are merged (sc-7881): with adapters,
+        // base `transformer/` is read into a CPU tensor map and the LoRA/LoKr deltas folded in
+        // (`merge_adapters`) before the build; otherwise the stock mmap build (byte-identical to the
+        // pre-sc-7881 path). The merge always runs **before** quantization so Q4/Q8 folds the adapted
+        // weights. `dit_vb_on(device)` returns the right source on the requested device.
         let transformer = match self.quant {
             // sc-8504 CPU-stage path: build the dense MMDiT on a **CPU** VarBuilder, then
             // `quantize_onto` the compute device — the quantized projections land directly on the GPU
@@ -190,13 +201,12 @@ impl Pipeline {
             // CPU either way). The TE + VAE stay dense bf16.
             Some(q) => {
                 let cpu = Device::Cpu;
-                let mut transformer =
-                    Sd3Transformer::new(&self.cfg, self.component_vb_on("transformer", &cpu)?)?;
+                let mut transformer = Sd3Transformer::new(&self.cfg, self.dit_vb_on(&cpu)?)?;
                 transformer.quantize_onto(q, &self.device)?;
                 transformer
             }
-            // Dense bf16: load straight onto the compute device, unchanged.
-            None => Sd3Transformer::new(&self.cfg, self.component_vb("transformer")?)?,
+            // Dense bf16: load straight onto the compute device.
+            None => Sd3Transformer::new(&self.cfg, self.dit_vb_on(&self.device)?)?,
         };
         let vae = load_vae(self.component_vb("vae")?)?;
         Ok(Components {
@@ -206,16 +216,9 @@ impl Pipeline {
         })
     }
 
-    /// Build a [`VarBuilder`] over every `.safetensors` in the snapshot component subdir `sub`, on the
-    /// pipeline's compute device.
-    fn component_vb(&self, sub: &str) -> Result<VarBuilder<'static>> {
-        self.component_vb_on(sub, &self.device)
-    }
-
-    /// [`Self::component_vb`] but on an explicit `device` — the sc-8504 CPU-stage quant path builds the
-    /// dense MMDiT on the CPU (system RAM) before quantizing each projection onto the GPU, so the dense
-    /// projection weights never land on the GPU.
-    fn component_vb_on(&self, sub: &str, device: &Device) -> Result<VarBuilder<'static>> {
+    /// Resolve the sorted list of `.safetensors` files in the snapshot component subdir `sub`
+    /// (single-file or sharded), erroring if the dir or files are missing.
+    fn component_files(&self, sub: &str) -> Result<Vec<PathBuf>> {
         let dir = self.root.join(sub);
         if !dir.is_dir() {
             return Err(CandleError::Msg(format!(
@@ -235,8 +238,56 @@ impl Pipeline {
                 dir.display()
             )));
         }
+        Ok(files)
+    }
+
+    /// Build a [`VarBuilder`] over every `.safetensors` in the snapshot component subdir `sub`, on the
+    /// pipeline's compute device (the stock mmap path; no adapters).
+    fn component_vb(&self, sub: &str) -> Result<VarBuilder<'static>> {
+        self.component_vb_on(sub, &self.device)
+    }
+
+    /// [`Self::component_vb`] but on an explicit `device` — the sc-8504 CPU-stage quant path builds the
+    /// dense MMDiT on the CPU (system RAM) before quantizing each projection onto the GPU, so the dense
+    /// projection weights never land on the GPU.
+    fn component_vb_on(&self, sub: &str, device: &Device) -> Result<VarBuilder<'static>> {
+        let files = self.component_files(sub)?;
         // SAFETY: mmap of read-only weight files; standard candle loading path.
         Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, self.dtype, device)? })
+    }
+
+    /// The DiT [`VarBuilder`] on `device`: the stock mmap build when no adapters are present, else the
+    /// LoRA/LoKr-merged build ([`Self::transformer_vb_with_adapters`]). Used by
+    /// [`load_components`](Self::load_components) for both the dense (device = GPU) and sc-8504
+    /// CPU-stage-quant (device = CPU) paths, so the adapter merge composes with quantization for free.
+    fn dit_vb_on(&self, device: &Device) -> Result<VarBuilder<'static>> {
+        if self.adapters.is_empty() {
+            self.component_vb_on("transformer", device)
+        } else {
+            self.transformer_vb_with_adapters(device)
+        }
+    }
+
+    /// Build the MMDiT [`VarBuilder`] (on `device`) with the LoRA/LoKr [`AdapterSpec`]s merged into its
+    /// weights (sc-7881). The base `transformer/` tensors are loaded into a CPU map, each adapter's delta
+    /// is folded in ([`crate::adapters::merge_adapters`], f32 math), then the MMDiT is built from the
+    /// merged map — **merge, not residual** (SD3.5's flow-match sampler is chaos-sensitive; `(W+δ)·x` ≠
+    /// `W·x + δ·x` to ~1 ULP). Only reached when adapters are present; quantization (if any) folds the
+    /// merged weights afterwards in [`load_components`](Self::load_components). `device` is the GPU for
+    /// the dense path and the CPU for the sc-8504 CPU-stage-quant path.
+    fn transformer_vb_with_adapters(&self, device: &Device) -> Result<VarBuilder<'static>> {
+        let files = self.component_files("transformer")?;
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+        for f in &files {
+            let part = candle_gen::candle_core::safetensors::load(f, &Device::Cpu)?;
+            tensors.extend(part);
+        }
+        let report = crate::adapters::merge_adapters(&mut tensors, &self.adapters)?;
+        eprintln!(
+            "sd3: merged {} LoRA/LoKr target(s) into the MMDiT ({} key(s) out of surface)",
+            report.merged, report.skipped_keys
+        );
+        Ok(VarBuilder::from_tensors(tensors, self.dtype, device))
     }
 
     /// Build the conditioning for a prompt: the aggregated pooled + context. For CFG the
@@ -805,6 +856,7 @@ mod tests {
                 DType::BF16,
                 Variant::Large,
                 quant,
+                &[],
             );
             let comps = pipe.load_components().expect("load real components");
             // Touch the transformer so the allocation is live, then sample the device's used memory.
@@ -882,6 +934,75 @@ mod tests {
         assert!(
             std > 8.0,
             "degenerate std {std:.2} — render lacks structure"
+        );
+    }
+
+    /// **LoRA before/after real-weight render — GATED (sc-7881).** Renders the SAME seed+prompt at
+    /// Large twice — once stock, once with a community kohya `lora_sd3` adapter merged into the MMDiT —
+    /// and asserts (a) the adapter actually merged (the merge errors loudly if no target matched, so a
+    /// successful adapted load already proves keys mapped) and (b) the adapted image **visibly differs**
+    /// from the base (mean abs pixel delta over a threshold). `#[ignore]`d because the SD3.5 weights +
+    /// the LoRA are not present here; the validation box flips it on:
+    ///   `SD35_LARGE_PATH=/path/to/sd35-large SD35_LORA_PATH=/path/to/lora.safetensors \
+    ///    cargo test -p candle-gen-sd3 --features cuda lora_before_after_render -- --ignored --nocapture`
+    #[test]
+    #[ignore = "gated SD3.5 weights + a LoRA file unavailable here; set SD35_LARGE_PATH + SD35_LORA_PATH (sc-7881)"]
+    fn lora_before_after_render() {
+        use candle_gen::gen_core::{
+            registry, AdapterKind, AdapterSpec, GenerationRequest, LoadSpec, WeightsSource,
+        };
+        let large_path = std::env::var("SD35_LARGE_PATH")
+            .expect("set SD35_LARGE_PATH to a stable-diffusion-3.5-large diffusers snapshot dir");
+        let lora_path = std::env::var("SD35_LORA_PATH")
+            .expect("set SD35_LORA_PATH to a kohya lora_sd3 .safetensors");
+        let strength: f32 = std::env::var("SD35_LORA_STRENGTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
+
+        let req = GenerationRequest {
+            // A portrait prompt so a portrait LoRA's effect is on-distribution and easy to eyeball.
+            prompt: "a portrait photo of a woman, studio lighting, highly detailed".into(),
+            width: 1024,
+            height: 1024,
+            seed: Some(1234),
+            steps: Some(28),
+            ..Default::default()
+        };
+        let render = |adapters: Vec<AdapterSpec>| -> Image {
+            let spec = LoadSpec::new(WeightsSource::Dir(large_path.clone().into()))
+                .with_adapters(adapters);
+            let g = registry::load(crate::MODEL_ID, &spec).expect("load sd3 large");
+            match g
+                .generate(&req, &mut |_p: Progress| {})
+                .expect("real-weight render")
+            {
+                candle_gen::gen_core::GenerationOutput::Images(mut imgs) => imgs.remove(0),
+                other => panic!("expected images, got {other:?}"),
+            }
+        };
+
+        let base = render(vec![]);
+        let adapted = render(vec![AdapterSpec::new(
+            lora_path.into(),
+            strength,
+            AdapterKind::Lora,
+        )]);
+        assert_eq!(base.pixels.len(), adapted.pixels.len());
+
+        // Mean absolute per-channel pixel delta (0..255). A real LoRA at strength 1.0 shifts the image
+        // well clear of seed/sampler jitter; a no-op merge would be ~0.
+        let sum: u64 = base
+            .pixels
+            .iter()
+            .zip(adapted.pixels.iter())
+            .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs() as u64)
+            .sum();
+        let mean = sum as f64 / base.pixels.len() as f64;
+        eprintln!("sc-7881 LoRA before/after: mean abs pixel delta = {mean:.2} (of 255)");
+        assert!(
+            mean > 2.0,
+            "adapted render barely differs from base (mean delta {mean:.2}) — did the LoRA merge?"
         );
     }
 
