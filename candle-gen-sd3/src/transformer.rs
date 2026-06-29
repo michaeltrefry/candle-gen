@@ -23,12 +23,12 @@
 //! The forward predicts the flow-match velocity in patchified space and unpatchifies to the
 //! 16-channel latent. C1 builds the FULL Large forward at real shapes; C2 drives it from a pipeline.
 
-use candle_gen::candle_core::{DType, Module, Result, Tensor, D};
+use candle_gen::candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_gen::candle_nn::{self, Linear, RmsNorm, VarBuilder};
 use candle_gen::gen_core::Quant;
 
 use crate::config::Sd3Config;
-use crate::quant::QLinear;
+use crate::quant::{conv2d_to, linear_to, rms_norm_to, QLinear};
 
 /// Affine-free LayerNorm eps (diffusers `elementwise_affine=False, eps=1e-6` on the AdaLN norms).
 const LN_EPS: f64 = 1e-6;
@@ -96,6 +96,13 @@ impl MlpEmbed {
         })
     }
 
+    /// CPU-stage migration (sc-8504): move both dense linears to `device`.
+    fn migrate_to(&mut self, device: &Device) -> Result<()> {
+        self.linear_1 = linear_to(&self.linear_1, device)?;
+        self.linear_2 = linear_to(&self.linear_2, device)?;
+        Ok(())
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // The sinusoid / pooled inputs arrive in f32; cast to the (loaded) weight dtype so the matmul
         // dtypes agree on real bf16 weights (sc-7881, C6).
@@ -122,6 +129,12 @@ impl CombinedTimestepTextEmbed {
             text: MlpEmbed::new(cfg.pooled_dim, inner, vb.pp("text_embedder"))?,
             timestep_channels: cfg.timestep_channels,
         })
+    }
+
+    /// CPU-stage migration (sc-8504): move both dense MLP embedders to `device`.
+    fn migrate_to(&mut self, device: &Device) -> Result<()> {
+        self.timestep.migrate_to(device)?;
+        self.text.migrate_to(device)
     }
 
     /// `timesteps` `[B]` (already ×1000), `pooled` `[B, pooled_dim]` → `temb [B, inner]`.
@@ -177,6 +190,13 @@ impl PatchEmbed {
         })
     }
 
+    /// CPU-stage migration (sc-8504): move the patchify conv + the learned pos-embed table to `device`.
+    fn migrate_to(&mut self, device: &Device) -> Result<()> {
+        self.proj = conv2d_to(&self.proj, device)?;
+        self.pos_embed = self.pos_embed.to_device(device)?;
+        Ok(())
+    }
+
     /// Centre-crop the `[1, max², inner]` table to an `h×w` token grid → `[1, h*w, inner]`. Mirrors
     /// diffusers `cropped_pos_embed`: reshape to `[1, max, max, inner]`, slice `[top:top+h,
     /// left:left+w]`, flatten.
@@ -221,6 +241,12 @@ impl AdaLayerNormZero {
             linear: candle_nn::linear(inner, n_chunks * inner, vb.pp("linear"))?,
             n_chunks,
         })
+    }
+
+    /// CPU-stage migration (sc-8504): move the dense modulation linear to `device`.
+    fn migrate_to(&mut self, device: &Device) -> Result<()> {
+        self.linear = linear_to(&self.linear, device)?;
+        Ok(())
     }
 
     /// Returns the `n_chunks` modulation slices, each `[B,1,inner]`.
@@ -320,7 +346,8 @@ impl JointAttention {
         })
     }
 
-    /// Fold every projection (image q/k/v/out + text add_q/k/v + to_add_out) to `Q4_0`/`Q8_0`.
+    /// Fold every projection (image q/k/v/out + text add_q/k/v + to_add_out) to `Q4_0`/`Q8_0`
+    /// **in place** on the weights' current device (the original on-device build path).
     fn quantize(&mut self, quant: Quant) -> Result<()> {
         self.to_q.quantize(quant)?;
         self.to_k.quantize(quant)?;
@@ -331,6 +358,38 @@ impl JointAttention {
         self.add_v.quantize(quant)?;
         if let Some(p) = &mut self.to_add_out {
             p.quantize(quant)?;
+        }
+        Ok(())
+    }
+
+    /// CPU-stage path (sc-8504): quantize every projection **onto `device`** (dense never lands on the
+    /// GPU) and migrate the dense-kept per-head q/k RMSNorms there too.
+    fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.to_q.quantize_onto(quant, device)?;
+        self.to_k.quantize_onto(quant, device)?;
+        self.to_v.quantize_onto(quant, device)?;
+        self.to_out.quantize_onto(quant, device)?;
+        self.add_q.quantize_onto(quant, device)?;
+        self.add_k.quantize_onto(quant, device)?;
+        self.add_v.quantize_onto(quant, device)?;
+        if let Some(p) = &mut self.to_add_out {
+            p.quantize_onto(quant, device)?;
+        }
+        self.migrate_norms_to(device)
+    }
+
+    /// Move the dense per-head q/k RMSNorms (image + text streams) to `device`.
+    fn migrate_norms_to(&mut self, device: &Device) -> Result<()> {
+        for rn in [
+            &mut self.norm_q,
+            &mut self.norm_k,
+            &mut self.norm_added_q,
+            &mut self.norm_added_k,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *rn = rms_norm_to(rn, RMS_EPS, device)?;
         }
         Ok(())
     }
@@ -415,12 +474,24 @@ impl SelfAttention {
         })
     }
 
-    /// Fold the image-only `attn2` projections (q/k/v/out) to `Q4_0`/`Q8_0`.
+    /// Fold the image-only `attn2` projections (q/k/v/out) to `Q4_0`/`Q8_0` in place.
     fn quantize(&mut self, quant: Quant) -> Result<()> {
         self.to_q.quantize(quant)?;
         self.to_k.quantize(quant)?;
         self.to_v.quantize(quant)?;
         self.to_out.quantize(quant)?;
+        Ok(())
+    }
+
+    /// CPU-stage path (sc-8504): quantize the `attn2` projections **onto `device`** + migrate q/k norms.
+    fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.to_q.quantize_onto(quant, device)?;
+        self.to_k.quantize_onto(quant, device)?;
+        self.to_v.quantize_onto(quant, device)?;
+        self.to_out.quantize_onto(quant, device)?;
+        for rn in [&mut self.norm_q, &mut self.norm_k].into_iter().flatten() {
+            *rn = rms_norm_to(rn, RMS_EPS, device)?;
+        }
         Ok(())
     }
 
@@ -451,10 +522,17 @@ impl FeedForward {
         })
     }
 
-    /// Fold both projections to `Q4_0`/`Q8_0` (the MLP is the largest per-block footprint).
+    /// Fold both projections to `Q4_0`/`Q8_0` in place (the MLP is the largest per-block footprint).
     fn quantize(&mut self, quant: Quant) -> Result<()> {
         self.proj.quantize(quant)?;
         self.out.quantize(quant)?;
+        Ok(())
+    }
+
+    /// CPU-stage path (sc-8504): quantize both projections **onto `device`** (no dense GPU transient).
+    fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.proj.quantize_onto(quant, device)?;
+        self.out.quantize_onto(quant, device)?;
         Ok(())
     }
 
@@ -533,6 +611,24 @@ impl JointBlock {
         if let Some(ffc) = &mut self.ff_context {
             ffc.quantize(quant)?;
         }
+        Ok(())
+    }
+
+    /// CPU-stage path (sc-8504): quantize the block's compute-heavy projections **onto `device`** and
+    /// migrate the block's dense-kept leaves (the AdaLN modulation linears) there too. After this the
+    /// whole block resides on `device` with NO dense projection ever having touched the GPU.
+    fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.attn.quantize_onto(quant, device)?;
+        if let Some(a2) = &mut self.attn2 {
+            a2.quantize_onto(quant, device)?;
+        }
+        self.ff.quantize_onto(quant, device)?;
+        if let Some(ffc) = &mut self.ff_context {
+            ffc.quantize_onto(quant, device)?;
+        }
+        // Dense-kept leaves: the chaos-sensitive AdaLN modulation linears.
+        self.norm1.migrate_to(device)?;
+        self.norm1_context.migrate_to(device)?;
         Ok(())
     }
 
@@ -616,6 +712,12 @@ impl AdaLayerNormContinuous {
         Ok(Self { linear })
     }
 
+    /// CPU-stage migration (sc-8504): move the dense AdaLN-continuous linear to `device`.
+    fn migrate_to(&mut self, device: &Device) -> Result<()> {
+        self.linear = linear_to(&self.linear, device)?;
+        Ok(())
+    }
+
     fn forward(&self, x: &Tensor, temb: &Tensor) -> Result<Tensor> {
         let emb = self.linear.forward(&temb.silu()?)?.unsqueeze(1)?; // [B,1,2*inner]
         let inner = emb.dim(D::Minus1)? / 2;
@@ -681,6 +783,32 @@ impl Sd3Transformer {
             block.quantize(quant)?;
         }
         self.proj_out.quantize(quant)?;
+        Ok(())
+    }
+
+    /// **CPU-stage → quantize_onto (sc-8504, FLUX.2-dev pattern).** Build the dense MMDiT on a CPU
+    /// VarBuilder, then call this with the GPU `device`: every compute-heavy projection is quantized
+    /// *onto* the GPU (so the dense projection weight never lands on the GPU at all — only the small
+    /// `Q4_0`/`Q8_0` blocks do), and the dense-kept leaves (the patch-embed conv + learned pos-embed
+    /// table, the timestep/text embedders, every block's AdaLN modulation linears + per-head q/k
+    /// norms, the AdaLN-continuous head) are migrated to the GPU alongside. Afterwards the whole
+    /// transformer resides on `device`.
+    ///
+    /// Numerically identical to the in-place [`Self::quantize`] (the quantizer routes through the CPU
+    /// either way, so the blocks are bit-for-bit the same); the only difference is the dense on-device
+    /// transient — and thus the load-time peak — is gone. Mirrors `Flux2Transformer::quantize`
+    /// (sc-7457). Idempotent per `QLinear`.
+    pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        // Quantized projections onto the GPU.
+        self.context_embedder.quantize_onto(quant, device)?;
+        for block in &mut self.blocks {
+            block.quantize_onto(quant, device)?;
+        }
+        self.proj_out.quantize_onto(quant, device)?;
+        // Dense-kept leaves migrated to the GPU.
+        self.pos_embed.migrate_to(device)?;
+        self.time_text_embed.migrate_to(device)?;
+        self.norm_out.migrate_to(device)?;
         Ok(())
     }
 
@@ -1134,6 +1262,155 @@ mod tests {
     #[test]
     fn q4_mmdit_forward_stays_coherent() {
         quant_forward_parity(Quant::Q4, 0.85);
+    }
+
+    // ---- CPU-stage → quantize_onto (sc-8504) ----------------------------------------------------
+
+    /// **CPU-staged quantization is numerically identical to the in-place path.** Build two MMDiTs
+    /// from the SAME varmap weights; quantize one in place (`quantize`) and the other via the
+    /// CPU-stage entry point (`quantize_onto`, target = CPU here). Their forwards must be **bit-exact**
+    /// — the load-time-peak optimization must not perturb a single bit (the quantizer routes the
+    /// source through the CPU in both paths, so the `Q4_0`/`Q8_0` blocks are identical). Run for both
+    /// Q4 and Q8 and across the standard + MMDiT-X (dual) configs.
+    fn cpu_stage_matches_in_place(quant: Quant, cfg: &Sd3Config) {
+        let dev = Device::Cpu;
+        let (vm, latent, context, pooled, t) = quant_harness(cfg);
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+
+        // In-place quantize (the original on-device path; here device == CPU).
+        let mut in_place = Sd3Transformer::new(cfg, vb.clone()).unwrap();
+        in_place.quantize(quant).unwrap();
+        let v_in_place = in_place.forward(&latent, &context, &pooled, &t).unwrap();
+
+        // CPU-stage quantize_onto the SAME device (the dense weight round-trips through the CPU either
+        // way, so the resulting blocks must be bit-identical to the in-place fold).
+        let mut staged = Sd3Transformer::new(cfg, vb).unwrap();
+        staged.quantize_onto(quant, &dev).unwrap();
+        let v_staged = staged.forward(&latent, &context, &pooled, &t).unwrap();
+
+        // The staged projections really transitioned to the Quantized arm.
+        assert!(matches!(
+            staged.blocks[0].attn.to_q,
+            crate::quant::QLinear::Quantized { .. }
+        ));
+
+        let a = v_in_place.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = v_staged.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "{quant:?} CPU-stage forward differs from in-place ({x} vs {y}) — not bit-exact"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_stage_q4_bit_exact_vs_in_place() {
+        cpu_stage_matches_in_place(Quant::Q4, &quant_cfg());
+    }
+
+    #[test]
+    fn cpu_stage_q8_bit_exact_vs_in_place() {
+        cpu_stage_matches_in_place(Quant::Q8, &quant_cfg());
+    }
+
+    /// The CPU-stage path also covers the MMDiT-X (dual-attention) config bit-exactly — its `attn2`
+    /// projections + the 9-chunk AdaLN leaf migrate identically.
+    #[test]
+    fn cpu_stage_dual_bit_exact_vs_in_place() {
+        let cfg = Sd3Config {
+            dual_attention_layers: vec![0, 1],
+            ..quant_cfg()
+        };
+        cpu_stage_matches_in_place(Quant::Q4, &cfg);
+    }
+
+    /// `quantize_onto` is idempotent (a re-run is a no-op per `QLinear`) and the staged model still
+    /// forwards finite output.
+    #[test]
+    fn cpu_stage_is_idempotent_and_forwards() {
+        let cfg = quant_cfg();
+        let (vm, latent, context, pooled, t) = quant_harness(&cfg);
+        let dev = Device::Cpu;
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut model = Sd3Transformer::new(&cfg, vb).unwrap();
+        model.quantize_onto(Quant::Q8, &dev).unwrap();
+        model.quantize_onto(Quant::Q8, &dev).unwrap(); // no-op, must not panic
+        let v = model.forward(&latent, &context, &pooled, &t).unwrap();
+        for x in v.flatten_all().unwrap().to_vec1::<f32>().unwrap() {
+            assert!(x.is_finite());
+        }
+    }
+
+    /// **CUDA CPU-stage smoke (sc-8504).** Build the dense MMDiT on a **CPU** VarBuilder, then
+    /// `quantize_onto` the GPU. Assert (a) the quantized leaves landed on the CUDA device with the
+    /// expected `Q4_0`/`Q8_0` block dtype, (b) the dense-kept leaves (the patch-embed conv, the
+    /// pos-embed table, an AdaLN modulation linear, a per-head q/k norm) are on the GPU too, and (c)
+    /// the forward runs finite + non-zero on the GPU. This is the staging analog of the in-place
+    /// `cuda_quant_forward_smoke`; it proves the dense projection never had to land on the GPU.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_cpu_stage_quant_smoke() {
+        use candle_gen::candle_core::quantized::GgmlDType;
+
+        let gpu = Device::new_cuda(0).expect("CUDA device 0");
+        let cpu = Device::Cpu;
+        let cfg = quant_cfg();
+
+        for quant in [Quant::Q4, Quant::Q8] {
+            // Dense build on CPU (system RAM) — nothing on the GPU yet.
+            let vm = VarMap::new();
+            let vb = VarBuilder::from_varmap(&vm, DType::F32, &cpu);
+            let mut model = Sd3Transformer::new(&cfg, vb).unwrap();
+            model.quantize_onto(quant, &gpu).unwrap();
+
+            // (a) A quantized projection is on the GPU at the expected block dtype.
+            match &model.blocks[0].attn.to_q {
+                crate::quant::QLinear::Quantized { weight, .. } => {
+                    assert!(weight.device().is_cuda(), "quantized leaf not on CUDA");
+                    let expected = match quant {
+                        Quant::Q4 => GgmlDType::Q4_0,
+                        Quant::Q8 => GgmlDType::Q8_0,
+                    };
+                    assert_eq!(weight.dtype(), expected, "wrong GGUF block dtype");
+                }
+                _ => panic!("attn.to_q did not quantize"),
+            }
+
+            // (b) Dense-kept leaves migrated to the GPU.
+            assert!(model.pos_embed.proj.weight().device().is_cuda());
+            assert!(model.pos_embed.pos_embed.device().is_cuda());
+            assert!(model.blocks[0].norm1.linear.weight().device().is_cuda());
+            assert!(model.norm_out.linear.weight().device().is_cuda());
+            if let Some(rn) = &model.blocks[0].attn.norm_q {
+                assert!(rn.weight().device().is_cuda());
+            }
+
+            // (c) Forward runs finite + non-zero on the GPU.
+            let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 8, 8), &gpu).unwrap();
+            let ctx_seq = cfg.context_seq_len();
+            let context =
+                Tensor::randn(0f32, 1f32, (1, ctx_seq, cfg.joint_attention_dim), &gpu).unwrap();
+            let pooled = Tensor::randn(0f32, 1f32, (1, cfg.pooled_dim), &gpu).unwrap();
+            let t = Tensor::full(0.5f32, 1, &gpu).unwrap();
+            let v = model.forward(&latent, &context, &pooled, &t).unwrap();
+            let vals = v
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert!(vals.iter().all(|x| x.is_finite()), "{quant:?} non-finite");
+            assert!(
+                vals.iter().fold(0f32, |m, &x| m.max(x.abs())) > 0.0,
+                "{quant:?} all-zero (dequant no-op?)"
+            );
+        }
     }
 
     /// `quantize` transitions the model's projections to the `Quantized` arm (idempotently): a second

@@ -23,40 +23,47 @@
 //!   Lens/FLUX.2 quantize the DiT (and, for FLUX.2-dev, the giant TE) but the SD3.5 encoders/VAE are
 //!   small relative to the DiT and chaos-sensitive, so C4 quantizes the **DiT only**; the TE/VAE
 //!   bytes are a fixed dense addend across all three precisions.
-//! - **Working set is ADDITIVE, not multiplicative.** C6 (sc-7881) measured the true CUDA peak of a
-//!   real 1024² dual-CFG render (`nvidia-smi`, idle baseline, RTX PRO 6000 Blackwell). The peak
-//!   minus the resident weights is a near-**fixed** ~12.3-14.2 GiB **regardless of variant or
-//!   precision** — it is the two CFG forwards' activations + attention scores at 1MP + the CUDA
-//!   context, which scale with *resolution*, not model size. A multiplicative headroom (the original
+//! - **Working set is ADDITIVE, not multiplicative.** C6 (sc-7881), re-measured under sc-8504's
+//!   CPU-stage load, measured the true CUDA peak of a real 1024² dual-CFG render (`nvidia-smi`, idle
+//!   baseline, RTX PRO 6000 Blackwell). The peak minus the resident weights is a near-**fixed**
+//!   ~12.0-13.6 GiB **regardless of variant or precision** — it is the two CFG forwards' activations +
+//!   attention scores at 1MP + the CUDA context, which scale with *resolution*, not model size. A
+//!   multiplicative headroom (the original
 //!   `HEADROOM = 0.30`) therefore had the wrong shape: 0.30 over-covered Large (which needed ~0.49)
 //!   but badly **under**-covered Medium (which needed ~0.81 — Medium's smaller weights make the same
 //!   fixed ~12.3 GiB a far larger *fraction*), so the gate could admit a Medium request that then
 //!   OOMs. We model it as a fixed [`ACTIVATION_OVERHEAD_GIB`] addend plus a small [`FRAG_MARGIN`].
 //!
-//! ## Measured peaks vs the gate (C6, sc-7881 / PR #180 weights)
+//! ## Measured peaks vs the gate (sc-8504 CPU-stage re-measurement; real weights)
 //!
 //! ```text
 //! variant / precision   resident weights   measured peak   this gate (minMemoryGb)
-//! Large  / bf16             25.7 GiB          38.4 GiB           43.0 GiB
-//! Large  / Q8               21.0 GiB          35.2 GiB           37.9 GiB
-//! Large  / Q4               18.6 GiB          32.6 GiB           35.2 GiB
-//! Medium / bf16             15.2 GiB          27.4 GiB           31.5 GiB
-//! Medium / Q8               13.9 GiB          26.6 GiB           30.1 GiB
-//! Medium / Q4               13.2 GiB          26.0 GiB           29.4 GiB
+//! Large  / bf16             25.7 GiB          38.45 GiB          43.0 GiB
+//! Large  / Q8               21.0 GiB          34.69 GiB          37.9 GiB
+//! Large  / Q4               18.6 GiB          31.60 GiB          35.2 GiB
+//! Medium / bf16             15.2 GiB          27.41 GiB          31.5 GiB
+//! Medium / Q8               13.9 GiB          25.97 GiB          30.1 GiB
+//! Medium / Q4               13.2 GiB          25.22 GiB          29.4 GiB
 //! ```
 //!
-//! Every gate is >= the measured peak with >= 2.6 GiB / >= 7.5 % margin — a safe ceiling, re-validated
+//! Every gate is >= the measured peak with >= 3.2 GiB / >= 8.4 % margin — a safe ceiling, re-validated
 //! on the CUDA box, not silently raised. The [`tests::min_memory_gate_exceeds_measured_peaks`] test
 //! pins this so a future tweak to the constants can't quietly drop the gate below a measured peak.
 //!
-//! **NOTE — the in-place quantize transient is NOT the binding peak.** `Pipeline::load_components`
-//! builds the DiT dense (bf16) on-device and then `Sd3Transformer::quantize`s it in place, so dense +
-//! quantized briefly coexist. But the measurements show that transient (≈ encoders + dense DiT; e.g.
-//! Large Q4 ≈ 26 GiB, Medium Q4 ≈ 15 GiB) sits *below* the steady-state render peak, so the gate is
-//! driven by the render activation set, not the load. CPU-staging the quantize (FLUX.2-dev's
-//! `quantize_onto`-from-CPU, to skip the dense on-device build) would shave only the ~1.5 GiB residue
-//! the transient leaves in the caching allocator's high-water mark — a worthwhile but separate
-//! optimization, tracked in **sc-8504** (the `ACTIVATION_OVERHEAD_GIB` budget already covers it).
+//! **NOTE — the load transient is no longer the binding peak (and never was).** `Pipeline::load_components`
+//! now **CPU-stages** the quantize (sc-8504, the FLUX.2-dev pattern): it builds the dense DiT on a
+//! *CPU* VarBuilder and `Sd3Transformer::quantize_onto`s the GPU, so the dense projection weights
+//! never land on the GPU — only the (small) `Q4_0`/`Q8_0` blocks do. Before this (the sc-7879 in-place
+//! path) the dense bf16 DiT was built on-device and folded in place, so dense + quantized briefly
+//! coexisted, leaving a high-water residue in the caching allocator. The sc-8504 re-measurement
+//! confirms removing it: the **bf16** peaks are unchanged (38.45 / 27.41 — that path is untouched)
+//! while the **quantized** peaks dropped ~0.5-1.0 GiB (Large Q4 32.57→31.60, Large Q8 35.22→34.69,
+//! Medium Q4 25.97→25.22, Medium Q8 26.60→25.97). The implied activation overhead (peak − resident
+//! weights) is now at most ~13.6 GiB (Large Q8), still under the fixed [`ACTIVATION_OVERHEAD_GIB`] =
+//! 14.0 budget — so the gate constants are **unchanged**: the binding peak was always the
+//! resolution-bound render activation set, not the load, and the residue removed (~0.5-1.0 GiB) is
+//! below the ~1.5 GiB the budget already absorbed. The gate is left intact (a conservative ceiling)
+//! rather than tightened by a fraction of a GiB.
 //!
 //! The figures are exposed as [`min_memory_gb`] (and the per-component breakdown [`MemoryProfile`])
 //! so C5 can read them in code; the same numbers are tabulated in the PR.
@@ -71,12 +78,14 @@ use crate::quant::bytes_per_param;
 const BF16_BYTES_PER_PARAM: f64 = 2.0;
 
 /// **Fixed** activation working set + CUDA context, in GiB — an *additive* term, not a fraction of
-/// weights. C6 (sc-7881) measured `peak - resident_weights ≈ 12.3-14.2 GiB` across every
-/// variant × precision on a real 1024² dual-CFG render (see the module doc table); it is the two CFG
-/// forwards' activations + attention scores at 1MP + the CUDA context, which track *resolution*, not
-/// model size. 14.0 covers the worst observed (Large Q8, 14.2) — that case being inflated by the
-/// in-place-quantize dense-build residue the caching allocator retains (sc-8504 CPU-staging would
-/// shave it). Raising this is how you would cover a higher default render resolution.
+/// weights. Measured `peak - resident_weights ≈ 12.0-13.6 GiB` across every variant × precision on a
+/// real 1024² dual-CFG render (see the module doc table); it is the two CFG forwards' activations +
+/// attention scores at 1MP + the CUDA context, which track *resolution*, not model size. 14.0 covers
+/// the worst observed (Large Q8, ~13.6 GiB on the sc-8504 CPU-stage re-measurement; ~14.2 on the old
+/// in-place path, which was inflated by the dense-build residue CPU-staging now removes). Left at 14.0
+/// — the binding peak was always the render activation set, not the load, and the residue removed is
+/// below the headroom 14.0 already carries, so there is no measured justification to tighten it.
+/// Raising this is how you would cover a higher default render resolution.
 pub const ACTIVATION_OVERHEAD_GIB: f64 = 14.0;
 
 /// Allocator-fragmentation slack applied to the *whole* footprint (weights + activation overhead).
@@ -397,14 +406,20 @@ mod tests {
     /// update these if the load/render path changes the footprint.
     #[test]
     fn min_memory_gate_exceeds_measured_peaks() {
-        // (variant, precision, measured peak GiB) — C6 / PR #180 real weights.
+        // (variant, precision, measured peak GiB) — sc-8504 CPU-stage re-measurement (real weights,
+        // D:\sd35\large + D:\sd35\medium, 1024² dual-CFG, 28 steps, nvidia-smi GPU-0 peak sampling,
+        // 4 MiB idle baseline, RTX PRO 6000 Blackwell). The bf16 peaks are unchanged from C6 (that
+        // path is untouched); the quantized peaks dropped ~0.5-1.0 GiB now that the dense-build
+        // transient no longer lands on the GPU (the load high-water residue is gone — see the module
+        // doc). The gate constants are unchanged (the binding peak was already the render
+        // steady-state, not the load transient), so every gate still clears its NEW peak with margin.
         let peaks = [
-            (Variant::Large, Precision::Bf16, 38.44),
-            (Variant::Large, Precision::Q8, 35.22),
-            (Variant::Large, Precision::Q4, 32.57),
+            (Variant::Large, Precision::Bf16, 38.45),
+            (Variant::Large, Precision::Q8, 34.69),
+            (Variant::Large, Precision::Q4, 31.60),
             (Variant::Medium, Precision::Bf16, 27.41),
-            (Variant::Medium, Precision::Q8, 26.60),
-            (Variant::Medium, Precision::Q4, 25.97),
+            (Variant::Medium, Precision::Q8, 25.97),
+            (Variant::Medium, Precision::Q4, 25.22),
         ];
         for (variant, precision, peak) in peaks {
             let gate = min_memory_gb(variant, precision);

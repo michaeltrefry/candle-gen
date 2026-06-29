@@ -180,12 +180,24 @@ impl Pipeline {
     pub(crate) fn load_components(&self) -> Result<Components> {
         let encoders =
             Sd3TextEncoders::load(&self.root, self.cfg.t5_seq_len, &self.device, self.dtype)?;
-        let mut transformer = Sd3Transformer::new(&self.cfg, self.component_vb("transformer")?)?;
-        // sc-7879: fold the MMDiT projections to Q4_0/Q8_0 in place right after the dense load (the
-        // dequant-on-forward seam — see `crate::quant`). The TE + VAE stay dense bf16.
-        if let Some(q) = self.quant {
-            transformer.quantize(q)?;
-        }
+        let transformer = match self.quant {
+            // sc-8504 CPU-stage path: build the dense MMDiT on a **CPU** VarBuilder, then
+            // `quantize_onto` the compute device — the quantized projections land directly on the GPU
+            // (the dense projection weight never touches it) and the dense-kept leaves migrate
+            // alongside. This drops the in-place dense-build transient (sc-7879 built dense on-device
+            // then folded in place, so dense + quantized briefly coexisted on the GPU). The resulting
+            // Q4_0/Q8_0 blocks are bit-identical to the in-place path (the quantizer routes through the
+            // CPU either way). The TE + VAE stay dense bf16.
+            Some(q) => {
+                let cpu = Device::Cpu;
+                let mut transformer =
+                    Sd3Transformer::new(&self.cfg, self.component_vb_on("transformer", &cpu)?)?;
+                transformer.quantize_onto(q, &self.device)?;
+                transformer
+            }
+            // Dense bf16: load straight onto the compute device, unchanged.
+            None => Sd3Transformer::new(&self.cfg, self.component_vb("transformer")?)?,
+        };
         let vae = load_vae(self.component_vb("vae")?)?;
         Ok(Components {
             encoders: Arc::new(Mutex::new(encoders)),
@@ -194,8 +206,16 @@ impl Pipeline {
         })
     }
 
-    /// Build a [`VarBuilder`] over every `.safetensors` in the snapshot component subdir `sub`.
+    /// Build a [`VarBuilder`] over every `.safetensors` in the snapshot component subdir `sub`, on the
+    /// pipeline's compute device.
     fn component_vb(&self, sub: &str) -> Result<VarBuilder<'static>> {
+        self.component_vb_on(sub, &self.device)
+    }
+
+    /// [`Self::component_vb`] but on an explicit `device` — the sc-8504 CPU-stage quant path builds the
+    /// dense MMDiT on the CPU (system RAM) before quantizing each projection onto the GPU, so the dense
+    /// projection weights never land on the GPU.
+    fn component_vb_on(&self, sub: &str, device: &Device) -> Result<VarBuilder<'static>> {
         let dir = self.root.join(sub);
         if !dir.is_dir() {
             return Err(CandleError::Msg(format!(
@@ -216,7 +236,7 @@ impl Pipeline {
             )));
         }
         // SAFETY: mmap of read-only weight files; standard candle loading path.
-        Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, self.dtype, &self.device)? })
+        Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, self.dtype, device)? })
     }
 
     /// Build the conditioning for a prompt: the aggregated pooled + context. For CFG the
