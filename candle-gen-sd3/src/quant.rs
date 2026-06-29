@@ -19,13 +19,21 @@
 //!
 //! **Quantize from CPU, store on the DiT's device.** `QTensor::quantize_onto` requires the source on
 //! the CPU, so each weight round-trips device→CPU→`quantize_onto(dev)`; the resulting `QTensor`
-//! lives on the original device (CPU or CUDA) and the dense copy is dropped. SD3.5 Large's DiT (~8 B
-//! params) fits the GPU dense transiently, so — like Lens, unlike the 32B FLUX.2-dev — we build dense
-//! on the target device and quantize in place (no CPU staging needed).
+//! lives on the target device (CPU or CUDA) and the dense copy is dropped.
+//!
+//! **Two entry points, same numerics.** SD3.5 Large's DiT (~8 B params) *fits* the GPU dense
+//! transiently, so the original [`Self::quantize`] builds dense on the target device and quantizes in
+//! place. [`Self::quantize_onto`] (sc-8504, the FLUX.2-dev CPU-stage pattern) instead takes an
+//! explicit target `device`: build the dense DiT on a **CPU** VarBuilder, then quantize each
+//! projection *onto* the GPU so the dense projection weight never lands on the GPU at all — the GPU
+//! only ever holds the (small) quantized footprint. Because `QTensor::quantize_onto` already routes
+//! the source through the CPU in both paths, the resulting `Q4_0`/`Q8_0` blocks are **bit-identical**
+//! between the in-place and CPU-staged paths (same f32 CPU source → same quantizer → same blocks); the
+//! only difference is that the dense GPU transient is gone.
 
 use candle_gen::candle_core::quantized::{GgmlDType, QTensor};
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
-use candle_gen::candle_nn::{Linear, Module, VarBuilder};
+use candle_gen::candle_nn::{Conv2d, Linear, Module, RmsNorm, VarBuilder};
 use candle_gen::gen_core::Quant;
 
 /// The GGUF block type a [`Quant`] level maps to — `Q4_0` / `Q8_0` (block size 32, the candle-core
@@ -102,19 +110,81 @@ impl QLinear {
     }
 
     /// Fold a dense projection to `Q4_0`/`Q8_0` in place (idempotent — a no-op if already quantized).
-    /// The weight is quantized on the CPU and placed back on its original device via
+    /// The weight is quantized on the CPU and placed back on its **original** device via
     /// `QTensor::quantize_onto`; the bias is kept full-precision for the (dense) post-matmul add.
+    /// The in-place path: the dense weight already lives on the (GPU) compute device.
     pub fn quantize(&mut self, quant: Quant) -> Result<()> {
+        let device = match self {
+            Self::Dense(l) => l.weight().device().clone(),
+            Self::Quantized { .. } => return Ok(()),
+        };
+        self.quantize_onto(quant, &device)
+    }
+
+    /// Fold a dense projection to `Q4_0`/`Q8_0` **onto `device`** in place (idempotent — a no-op if
+    /// already quantized). The CPU-stage path (sc-8504): when the dense `QLinear` was built on a CPU
+    /// VarBuilder, this round-trips the weight through the CPU (the `quantize_onto` source requirement)
+    /// and lands the resulting `QTensor` on `device` (the GPU), so the dense projection never lives on
+    /// the GPU. The bias is moved to `device` and kept full-precision for the post-matmul add.
+    ///
+    /// Numerically identical to [`Self::quantize`]: both feed the same f32 CPU source to
+    /// `QTensor::quantize_onto`, so the `Q4_0`/`Q8_0` blocks are bit-for-bit the same regardless of
+    /// where the dense weight started.
+    pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
         let Self::Dense(l) = self else {
             return Ok(());
         };
-        let device = l.weight().device().clone();
         let w_cpu = l.weight().to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        let weight = QTensor::quantize_onto(&w_cpu, ggml_dtype(quant), &device)?;
-        let bias = l.bias().cloned();
+        let weight = QTensor::quantize_onto(&w_cpu, ggml_dtype(quant), device)?;
+        let bias = match l.bias() {
+            Some(b) => Some(b.to_device(device)?),
+            None => None,
+        };
         *self = Self::Quantized { weight, bias };
         Ok(())
     }
+
+    /// Move a still-**dense** projection (weight + optional bias) to `device`, in place. A no-op once
+    /// quantized (the `QTensor` already lives on its device). Used by the CPU-staged quant path for the
+    /// dense-kept compute leaves (e.g. the few projections that stay dense) so they migrate to the GPU
+    /// alongside the quantized ones.
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        if let Self::Dense(l) = self {
+            let w = l.weight().to_device(device)?;
+            let b = match l.bias() {
+                Some(b) => Some(b.to_device(device)?),
+                None => None,
+            };
+            *self = Self::Dense(Linear::new(w, b));
+        }
+        Ok(())
+    }
+}
+
+/// Move a dense [`Linear`] (weight + optional bias) to `device` — the CPU-stage migration of a
+/// dense-kept leaf (AdaLN modulation linears, the timestep/text embedders, the AdaLN-continuous head).
+pub fn linear_to(l: &Linear, device: &Device) -> Result<Linear> {
+    let w = l.weight().to_device(device)?;
+    let b = match l.bias() {
+        Some(b) => Some(b.to_device(device)?),
+        None => None,
+    };
+    Ok(Linear::new(w, b))
+}
+
+/// Move a dense [`Conv2d`] (the patchify conv) to `device`, preserving its stride/padding config.
+pub fn conv2d_to(c: &Conv2d, device: &Device) -> Result<Conv2d> {
+    let w = c.weight().to_device(device)?;
+    let b = match c.bias() {
+        Some(b) => Some(b.to_device(device)?),
+        None => None,
+    };
+    Ok(Conv2d::new(w, b, *c.config()))
+}
+
+/// Move a dense [`RmsNorm`] (the per-head q/k norms) to `device` at `eps`.
+pub fn rms_norm_to(n: &RmsNorm, eps: f64, device: &Device) -> Result<RmsNorm> {
+    Ok(RmsNorm::new(n.weight().to_device(device)?, eps))
 }
 
 #[cfg(test)]
