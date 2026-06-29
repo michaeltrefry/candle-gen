@@ -26,7 +26,16 @@ inventory = { workspace = true }
 # forward to `3870ed1`, which added `Content::Video`, `TextLlmCapabilities.supports_video`, and
 # `TextLlmRegistration.weightless_vision`; `bf99e5b` is the candle-llm rev that adds the matching (text-only,
 # additive) wiring so candle-llm still compiles against the unified `core-llm` in the worker graph.
-candle-llm = { git = "https://github.com/SceneWorks/candle-llm", rev = "bf99e5b48082fa09eaec6eb98c1245d92feed5ae" }
+# Bumped `bf99e5b` -> `d0ba3e6` (sc-8116, epic 8103): bring the Qwen3-VL vision tower (sc-8080: ViT +
+# DeepStack + interleaved M-RoPE) into the backend-candle graph for the vision-grounded Ideogram caption job.
+# This shim only `use candle_llm as _;` (force-link for the `inventory::submit!` provider registration — it
+# consumes NO candle-llm symbols), so the bump is purely a pin alignment that keeps cargo unifying ONE
+# candle-llm across the worker graph (the worker re-pins its own direct candle-llm dep to the same rev).
+# `d0ba3e6` is candle-llm main (`d15954c`, the vision tower) with its core-llm pin reverted `rev=3870ed1`
+# -> `branch=main` so it unifies with mlx-llm / sceneworks-gen-core (both `branch=main`); candle-llm main's
+# `rev=` spec would otherwise materialise a SECOND core-llm package and clash. Still `candle-core 65ecb58`
+# (the graph-wide rev), so one Tensor type, one core-llm (branch=main#3870ed1).
+candle-llm = { git = "https://github.com/SceneWorks/candle-llm", rev = "d0ba3e66b4d53420bb0b0745a185b975822089be" }
 
 [features]
 default = []
