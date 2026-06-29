@@ -26,6 +26,7 @@
 //! modulation apply order (`x·(1+scale)+shift`, with the correct chunk split) is the documented bug
 //! magnet; see [`transformer`].
 
+pub mod clip_tokenizer;
 pub mod conditioning;
 pub mod config;
 pub mod memory;

@@ -184,8 +184,10 @@ pub struct Sd3TextEncoders {
 
 impl Sd3TextEncoders {
     /// Load the three encoders from a `stabilityai/stable-diffusion-3.5-*` diffusers snapshot:
-    /// `text_encoder/` (CLIP-L), `text_encoder_2/` (CLIP-bigG), `text_encoder_3/` (T5-XXL) with the
-    /// matching `tokenizer*/tokenizer.json`. `t5_seq_len` is the configured T5 length (256 default).
+    /// `text_encoder/` (CLIP-L), `text_encoder_2/` (CLIP-bigG), `text_encoder_3/` (T5-XXL). The two
+    /// CLIP tokenizers load from `tokenizer.json` when present and otherwise are **synthesized** from
+    /// the stock `vocab.json` + `merges.txt` (sc-8500; see [`crate::clip_tokenizer`]); T5 ships its
+    /// own `tokenizer.json`. `t5_seq_len` is the configured T5 length (256 default).
     pub fn load(
         root: &Path,
         t5_seq_len: usize,
@@ -195,10 +197,13 @@ impl Sd3TextEncoders {
         let cfg_l = clip::Config::sdxl(); // CLIP-L (openai/clip-vit-large-patch14, embed 768)
         let cfg_g = clip::Config::sdxl2(); // OpenCLIP bigG (embed 1280)
 
-        let tok_l = Tokenizer::from_file(root.join("tokenizer/tokenizer.json"))
-            .map_err(|e| CandleError::Msg(format!("sd3: load CLIP-L tokenizer: {e}")))?;
-        let tok_g = Tokenizer::from_file(root.join("tokenizer_2/tokenizer.json"))
-            .map_err(|e| CandleError::Msg(format!("sd3: load CLIP-bigG tokenizer: {e}")))?;
+        // CLIP-L / CLIP-bigG: load `tokenizer.json` if present, else SYNTHESIZE the CLIP
+        // byte-level BPE from `vocab.json` + `merges.txt` (a stock gated diffusers SD3.5
+        // download ships no `tokenizer.json` for the CLIP encoders — sc-8500).
+        let tok_l = crate::clip_tokenizer::load_clip_tokenizer(&root.join("tokenizer"), "CLIP-L")?;
+        let tok_g =
+            crate::clip_tokenizer::load_clip_tokenizer(&root.join("tokenizer_2"), "CLIP-bigG")?;
+        // T5 ships its own `tokenizer.json` in a stock snapshot (out of scope for sc-8500).
         let tok_t5 = Tokenizer::from_file(root.join("tokenizer_3/tokenizer.json"))
             .map_err(|e| CandleError::Msg(format!("sd3: load T5 tokenizer: {e}")))?;
 
