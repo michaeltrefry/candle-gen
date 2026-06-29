@@ -51,14 +51,14 @@ use pipeline::{Components, Pipeline};
 
 /// Registry id for SD3.5 **Large** — matches the SceneWorks worker's `payload.model` and the macOS
 /// `mlx-gen-sd3` SD3.5-Large descriptor.
-pub const MODEL_ID: &str = "stable_diffusion_3_5_large";
+pub const MODEL_ID: &str = "sd3_5_large";
 
 /// Registry id for SD3.5 **Large Turbo** — the guidance-distilled 4-step sibling.
-pub const MODEL_ID_TURBO: &str = "stable_diffusion_3_5_large_turbo";
+pub const MODEL_ID_TURBO: &str = "sd3_5_large_turbo";
 
 /// Registry id for SD3.5 **Medium** — the MMDiT-X (dual-attention) model. Matches the SceneWorks
 /// worker's `payload.model` and the macOS `mlx-gen-sd3` SD3.5-Medium descriptor.
-pub const MODEL_ID_MEDIUM: &str = "stable_diffusion_3_5_medium";
+pub const MODEL_ID_MEDIUM: &str = "sd3_5_medium";
 
 /// SD3.5 works in latent space at /8 and the MMDiT patchifies that at /2, so both image dims must be
 /// multiples of **16** for a clean patchify.
