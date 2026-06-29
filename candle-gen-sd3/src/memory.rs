@@ -2,18 +2,19 @@
 //!
 //! The worker's model-eligibility gate routes a request to a backend only when the device has at
 //! least `minMemoryGb` of free VRAM. C5 (sc-7880) wires the candle SD3.5 manifest; this module is the
-//! single source of truth it consumes — a **principled** estimate per variant × precision, computed
-//! from the actual quantized-tensor parameter counts (NOT a measured peak, which needs the gated
-//! real weights — that is C6's `#[ignore]`d profiling test [`crate::pipeline`]).
+//! single source of truth it consumes — a **principled** estimate per variant × precision, built from
+//! the actual quantized-tensor parameter counts and then **calibrated against the C6 (sc-7881)
+//! measured CUDA peaks** so the gate is a safe ceiling, not a guess.
 //!
 //! ## Methodology
 //!
 //! ```text
-//! minMemoryGb  =  (quantized DiT weight bytes        // the projections C4 folds to Q4/Q8
-//!               +  dense-kept DiT leaf bytes          // AdaLN/timestep/patch-embed/pos_embed — always bf16
-//!               +  text-encoder bytes                 // CLIP-L + CLIP-bigG + T5-XXL, kept DENSE (bf16)
-//!               +  VAE bytes)                          // 16-ch AutoencoderKL, kept DENSE (bf16)
-//!               *  (1 + HEADROOM)                      // activation / working-set / fragmentation margin
+//! minMemoryGb  =  ( quantized DiT weight bytes        // the projections C4 folds to Q4/Q8
+//!               +   dense-kept DiT leaf bytes          // AdaLN/timestep/patch-embed/pos_embed — always bf16
+//!               +   text-encoder bytes                 // CLIP-L + CLIP-bigG + T5-XXL, kept DENSE (bf16)
+//!               +   VAE bytes                          // 16-ch AutoencoderKL, kept DENSE (bf16)
+//!               +   ACTIVATION_OVERHEAD_GIB )          // FIXED dual-CFG working set + CUDA context (additive!)
+//!               *   (1 + FRAG_MARGIN)                  // allocator-fragmentation slack on the whole footprint
 //! ```
 //!
 //! - **Quantized DiT weights** use [`crate::quant::bytes_per_param`] (block-scale-inclusive: Q4 ≈
@@ -22,14 +23,43 @@
 //!   Lens/FLUX.2 quantize the DiT (and, for FLUX.2-dev, the giant TE) but the SD3.5 encoders/VAE are
 //!   small relative to the DiT and chaos-sensitive, so C4 quantizes the **DiT only**; the TE/VAE
 //!   bytes are a fixed dense addend across all three precisions.
-//! - **Headroom** (`HEADROOM` = 0.30) covers the denoise working set (latents, attention scores at
-//!   1MP, the two CFG forwards' transient activations), CUDA context, and allocator fragmentation —
-//!   the same order-of-magnitude margin the worker applies to the other diffusion backends. It is a
-//!   ceiling, deliberately conservative so the gate never admits a request the device can't hold.
+//! - **Working set is ADDITIVE, not multiplicative.** C6 (sc-7881) measured the true CUDA peak of a
+//!   real 1024² dual-CFG render (`nvidia-smi`, idle baseline, RTX PRO 6000 Blackwell). The peak
+//!   minus the resident weights is a near-**fixed** ~12.3-14.2 GiB **regardless of variant or
+//!   precision** — it is the two CFG forwards' activations + attention scores at 1MP + the CUDA
+//!   context, which scale with *resolution*, not model size. A multiplicative headroom (the original
+//!   `HEADROOM = 0.30`) therefore had the wrong shape: 0.30 over-covered Large (which needed ~0.49)
+//!   but badly **under**-covered Medium (which needed ~0.81 — Medium's smaller weights make the same
+//!   fixed ~12.3 GiB a far larger *fraction*), so the gate could admit a Medium request that then
+//!   OOMs. We model it as a fixed [`ACTIVATION_OVERHEAD_GIB`] addend plus a small [`FRAG_MARGIN`].
+//!
+//! ## Measured peaks vs the gate (C6, sc-7881 / PR #180 weights)
+//!
+//! ```text
+//! variant / precision   resident weights   measured peak   this gate (minMemoryGb)
+//! Large  / bf16             25.7 GiB          38.4 GiB           43.0 GiB
+//! Large  / Q8               21.0 GiB          35.2 GiB           37.9 GiB
+//! Large  / Q4               18.6 GiB          32.6 GiB           35.2 GiB
+//! Medium / bf16             15.2 GiB          27.4 GiB           31.5 GiB
+//! Medium / Q8               13.9 GiB          26.6 GiB           30.1 GiB
+//! Medium / Q4               13.2 GiB          26.0 GiB           29.4 GiB
+//! ```
+//!
+//! Every gate is >= the measured peak with >= 2.6 GiB / >= 7.5 % margin — a safe ceiling, re-validated
+//! on the CUDA box, not silently raised. The [`tests::min_memory_gate_exceeds_measured_peaks`] test
+//! pins this so a future tweak to the constants can't quietly drop the gate below a measured peak.
+//!
+//! **NOTE — the in-place quantize transient is NOT the binding peak.** `Pipeline::load_components`
+//! builds the DiT dense (bf16) on-device and then `Sd3Transformer::quantize`s it in place, so dense +
+//! quantized briefly coexist. But the measurements show that transient (≈ encoders + dense DiT; e.g.
+//! Large Q4 ≈ 26 GiB, Medium Q4 ≈ 15 GiB) sits *below* the steady-state render peak, so the gate is
+//! driven by the render activation set, not the load. CPU-staging the quantize (FLUX.2-dev's
+//! `quantize_onto`-from-CPU, to skip the dense on-device build) would shave only the ~1.5 GiB residue
+//! the transient leaves in the caching allocator's high-water mark — a worthwhile but separate
+//! optimization, tracked in **sc-8504** (the `ACTIVATION_OVERHEAD_GIB` budget already covers it).
 //!
 //! The figures are exposed as [`min_memory_gb`] (and the per-component breakdown [`MemoryProfile`])
-//! so C5 can read them in code; the same numbers are tabulated in the PR. The `#[ignore]`d
-//! `real_weight_memory_profile` test (env-gated) measures the TRUE peak for C6 to confirm against.
+//! so C5 can read them in code; the same numbers are tabulated in the PR.
 
 use candle_gen::gen_core::Quant;
 
@@ -40,10 +70,20 @@ use crate::quant::bytes_per_param;
 /// bf16 is 2 bytes per parameter — the dense baseline precision SD3.5 loads at.
 const BF16_BYTES_PER_PARAM: f64 = 2.0;
 
-/// Activation / working-set / CUDA-context / fragmentation headroom, as a fraction of the resident
-/// weight bytes. Conservative (the gate must not over-admit); covers the two CFG forwards' transient
-/// attention buffers at up to 1MP, the latent/decoder working set, and allocator slack.
-pub const HEADROOM: f64 = 0.30;
+/// **Fixed** activation working set + CUDA context, in GiB — an *additive* term, not a fraction of
+/// weights. C6 (sc-7881) measured `peak - resident_weights ≈ 12.3-14.2 GiB` across every
+/// variant × precision on a real 1024² dual-CFG render (see the module doc table); it is the two CFG
+/// forwards' activations + attention scores at 1MP + the CUDA context, which track *resolution*, not
+/// model size. 14.0 covers the worst observed (Large Q8, 14.2) — that case being inflated by the
+/// in-place-quantize dense-build residue the caching allocator retains (sc-8504 CPU-staging would
+/// shave it). Raising this is how you would cover a higher default render resolution.
+pub const ACTIVATION_OVERHEAD_GIB: f64 = 14.0;
+
+/// Allocator-fragmentation slack applied to the *whole* footprint (weights + activation overhead).
+/// Small and multiplicative: fragmentation scales with the number/size of live allocations, so a
+/// fraction of the total is the right shape (whereas the activation working set is fixed — hence the
+/// additive [`ACTIVATION_OVERHEAD_GIB`]). 0.08 keeps every gate >= 7.5 % above the measured peak.
+pub const FRAG_MARGIN: f64 = 0.08;
 
 /// 1 GiB in bytes (the `minMemoryGb` unit is gibibytes, matching the worker's free-VRAM probe).
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -221,15 +261,19 @@ pub struct MemoryProfile {
 }
 
 impl MemoryProfile {
-    /// Total resident **weight** bytes (no headroom).
+    /// Total resident **weight** bytes (no activation overhead, no fragmentation margin).
     pub fn weight_bytes(&self) -> f64 {
         self.dit_quantized_bytes + self.dit_dense_bytes + self.text_encoder_bytes + self.vae_bytes
     }
 
-    /// `minMemoryGb`: resident weights × (1 + headroom), in GiB, rounded up to one decimal so the
-    /// worker gate has a clean, conservative threshold.
+    /// `minMemoryGb`: `(resident weights + fixed activation overhead) × (1 + frag margin)`, in GiB,
+    /// rounded up to one decimal so the worker gate has a clean, conservative threshold. The additive
+    /// [`ACTIVATION_OVERHEAD_GIB`] models the resolution-bound dual-CFG working set (which does NOT
+    /// scale with weights); [`FRAG_MARGIN`] is the allocator slack on the whole footprint. Validated
+    /// >= the C6 measured peaks (sc-7881) by [`tests::min_memory_gate_exceeds_measured_peaks`].
     pub fn min_memory_gb(&self) -> f64 {
-        let gib = self.weight_bytes() * (1.0 + HEADROOM) / GIB;
+        let footprint = self.weight_bytes() + ACTIVATION_OVERHEAD_GIB * GIB;
+        let gib = footprint * (1.0 + FRAG_MARGIN) / GIB;
         (gib * 10.0).ceil() / 10.0
     }
 }
@@ -313,8 +357,9 @@ mod tests {
         }
     }
 
-    /// The estimates are positive, finite, and in a plausible VRAM band (single-digit to low-tens of
-    /// GiB for an 8B-param diffusion model with a 4.7B T5 encoder kept dense).
+    /// The estimates are positive, finite, and in a plausible VRAM band (low-tens of GiB for an
+    /// 8B-param diffusion model with a 4.7B T5 encoder kept dense, plus the fixed ~14 GiB dual-CFG
+    /// working set).
     #[test]
     fn estimates_are_finite_and_plausible() {
         for variant in [Variant::Large, Variant::LargeTurbo, Variant::Medium] {
@@ -325,7 +370,7 @@ mod tests {
                     "{variant:?}/{precision:?} = {gb}"
                 );
                 assert!(
-                    (4.0..64.0).contains(&gb),
+                    (16.0..64.0).contains(&gb),
                     "{variant:?}/{precision:?} minMemoryGb {gb} outside a plausible band"
                 );
             }
@@ -343,11 +388,47 @@ mod tests {
         }
     }
 
+    /// **The gate is a safe ceiling over the C6 measured peaks (sc-7881).** These are the true CUDA
+    /// peaks of a real 1024² dual-CFG render (`nvidia-smi`, idle baseline, RTX PRO 6000 Blackwell);
+    /// the gate must stay strictly above each so the worker never admits a request the card can't
+    /// hold. Pinning them here means a future tweak to [`ACTIVATION_OVERHEAD_GIB`] / [`FRAG_MARGIN`]
+    /// that drops the gate below a measured peak fails the build instead of silently shipping an
+    /// OOM-prone threshold. Re-measure (the `sd3-txt2img` example + `nvidia-smi` peak sampling) and
+    /// update these if the load/render path changes the footprint.
+    #[test]
+    fn min_memory_gate_exceeds_measured_peaks() {
+        // (variant, precision, measured peak GiB) — C6 / PR #180 real weights.
+        let peaks = [
+            (Variant::Large, Precision::Bf16, 38.44),
+            (Variant::Large, Precision::Q8, 35.22),
+            (Variant::Large, Precision::Q4, 32.57),
+            (Variant::Medium, Precision::Bf16, 27.41),
+            (Variant::Medium, Precision::Q8, 26.60),
+            (Variant::Medium, Precision::Q4, 25.97),
+        ];
+        for (variant, precision, peak) in peaks {
+            let gate = min_memory_gb(variant, precision);
+            assert!(
+                gate >= peak,
+                "{variant:?}/{precision:?}: gate {gate} GiB must be >= measured peak {peak} GiB"
+            );
+            // And not absurdly over-provisioned (the safe-but-not-wasteful band: < peak + 6 GiB).
+            assert!(
+                gate <= peak + 6.0,
+                "{variant:?}/{precision:?}: gate {gate} GiB is > 6 GiB above peak {peak} — too loose"
+            );
+        }
+    }
+
     /// Print the full minMemoryGb table (run with `--nocapture` to read it) — the source of the PR
     /// table. Also re-asserts the ordering so the printed values are the asserted ones.
     #[test]
     fn print_min_memory_table() {
-        println!("\nSD3.5 minMemoryGb (DiT-only quant; TE+VAE dense bf16; headroom {HEADROOM}):");
+        println!(
+            "\nSD3.5 minMemoryGb (DiT-only quant; TE+VAE dense bf16; \
+             +{ACTIVATION_OVERHEAD_GIB}GiB activation, x{:.2} frag):",
+            1.0 + FRAG_MARGIN
+        );
         println!("{:<20} {:>8} {:>8} {:>8}", "variant", "bf16", "Q8", "Q4");
         for (name, variant) in [
             ("Large", Variant::Large),
