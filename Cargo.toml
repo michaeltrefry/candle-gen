@@ -265,17 +265,18 @@ resolver = "2"
 # already-present `mlx-gen-sana` provider crate). `git diff 875cf7f..bdf3233 -- gen-core/` is EMPTY —
 # gen-core BYTE-IDENTICAL; the range only ADDS Sprint code to the `mlx-gen-sana` provider crate (which
 # candle does NOT link), so candle compiles UNCHANGED and no new candle provider is pulled.
-# Caught up the 17 per-crate `sceneworks-gen-core-testkit` dev-deps `98ddb6b` -> `bdf3233` (sc-8601 +
-# sc-8602): they had been deliberately left lagging because the *worker's* `candle-gen`-umbrella
-# `--features backend-candle` skew gate does not pull dev-deps — but the LOCAL full-workspace CUDA
-# pre-push gate (scripts/check-cuda.ps1) builds every crate's TEST targets, so the lag resolved two
-# gen-core revs in one tree and the conformance test targets (flux2/wan/sdxl, joycaption) failed to
-# COMPILE on type-instance mismatch (`gen_core_testkit` @98ddb6b vs `candle_gen::gen_core` @bdf3233),
-# forcing `--no-verify` throughout epic 8502. `git diff 98ddb6b..bdf3233 -- gen-core-testkit/` is
-# EMPTY (byte-identical), so the catch-up is behavior-neutral and just collapses the tree to ONE rev.
-# ALWAYS bump all 17 testkit dev-deps in the SAME commit as the root dep above — a root-only re-pin
-# (as #186/#187 did) re-opens this and breaks the local pre-push gate again.
+# `sceneworks-gen-core-testkit` is now a SINGLE [workspace.dependencies] pin too (sc-8616, follow-up to
+# sc-8601/8602): the per-crate conformance dev-deps consume it via `{ workspace = true }`. Keep it on
+# the SAME rev as `sceneworks-gen-core` directly below — both lines move together in one edit.
+# (Why centralized: testkit is a dev-dep so it never reaches the worker's `candle-gen`-umbrella
+# `--features backend-candle` skew gate, BUT the LOCAL full-workspace CUDA pre-push gate
+# (scripts/check-cuda.ps1) builds every crate's TEST targets. When 17 hardcoded testkit pins lagged
+# behind a root-only re-pin the graph resolved two gen-core revs and the conformance test targets
+# (flux2/wan/sdxl, joycaption) failed to COMPILE on type-instance mismatch — `gen_core_testkit` @old
+# vs `candle_gen::gen_core` @new — forcing `--no-verify` throughout epic 8502 [sc-8601/8602, #186/#187].
+# One workspace pin kills that failure class: a root-only re-pin can no longer leave testkit behind.)
 sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "bdf3233c92a7198086def67d271d45d7f5c1bccf" }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "bdf3233c92a7198086def67d271d45d7f5c1bccf" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels
