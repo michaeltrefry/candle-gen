@@ -340,16 +340,19 @@ pub(crate) fn render_core(
             // sinusoid). f32 here is correct — the embedder upcasts internally.
             let t = Tensor::from_vec(vec![sigma * 1000.0], (1,), &device)?;
             let v_cond = transformer.forward(latents, &cond.context, &cond.pooled, &t)?;
-            match uncond {
+            let v = match uncond {
                 // Large CFG: v = uncond + cfg·(cond − uncond).
                 Some(uncond) => {
                     let v_uncond =
                         transformer.forward(latents, &uncond.context, &uncond.pooled, &t)?;
-                    Ok((&v_uncond + ((&v_cond - &v_uncond)? * cfg_scale as f64)?)?)
+                    (&v_uncond + ((&v_cond - &v_uncond)? * cfg_scale as f64)?)?
                 }
                 // Turbo (distilled): no negative branch — the velocity is used directly.
-                None => Ok(v_cond),
-            }
+                None => v_cond,
+            };
+            // The DiT may run in a different (e.g. f32) dtype than the latent stream; bring the
+            // velocity back to the latent dtype so the flow-match step's add agrees (sc-7881).
+            Ok(v.to_dtype(latents.dtype())?)
         },
     )?;
 
@@ -825,9 +828,41 @@ mod tests {
                 assert_eq!(imgs.len(), 1);
                 assert_eq!(imgs[0].width, 1024);
                 assert_eq!(imgs[0].height, 1024);
+                // sc-7881 C6: the render must be COHERENT — finite (no NaN/Inf clamp artifacts) and
+                // non-degenerate (real spatial structure, not a uniform/noise field). A wrong AdaLN
+                // `norm_out` scale/shift order scrambled this into a unit-variance noise wash.
+                assert_image_coherent(&imgs[0]);
             }
             other => panic!("expected images, got {other:?}"),
         }
+    }
+
+    /// C6 coherence floor for a real-weight render: every pixel is finite (a `u8` buffer is finite by
+    /// construction, but the upstream latent isn't — a NaN latent decodes to a flat clamp), the image
+    /// spans a real dynamic range, and the per-pixel std is well above a degenerate noise/flat field.
+    /// A correct SD3.5 render lands std ≈ 40–50 on a 0–255 luma; a uniform or pure-noise wash is far
+    /// lower in structure. We assert a conservative floor that the scrambled (pre-fix) renders failed
+    /// the *eyeball* on but passed numerically, so this is paired with the saved-PNG human check.
+    #[cfg(test)]
+    fn assert_image_coherent(img: &Image) {
+        let px = &img.pixels;
+        assert!(!px.is_empty(), "empty image buffer");
+        let n = px.len() as f64;
+        let mean = px.iter().map(|&b| b as f64).sum::<f64>() / n;
+        let var = px.iter().map(|&b| (b as f64 - mean).powi(2)).sum::<f64>() / n;
+        let std = var.sqrt();
+        let min = *px.iter().min().unwrap();
+        let max = *px.iter().max().unwrap();
+        // Non-uniform: a real render spans most of the 0..255 range.
+        assert!(
+            max as i32 - min as i32 > 64,
+            "degenerate dynamic range (min={min} max={max}) — render is near-uniform"
+        );
+        // Non-flat: meaningful spatial contrast (a flat fill is std≈0).
+        assert!(
+            std > 8.0,
+            "degenerate std {std:.2} — render lacks structure"
+        );
     }
 
     /// **Medium real-weight smoke — GATED (sc-7878 / C6).** A real SD3.5-Medium (MMDiT-X) render
@@ -859,6 +894,8 @@ mod tests {
                 assert_eq!(imgs.len(), 1);
                 assert_eq!(imgs[0].width, 1024);
                 assert_eq!(imgs[0].height, 1024);
+                // sc-7881 C6: the MMDiT-X (dual-attention) render must be coherent too.
+                assert_image_coherent(&imgs[0]);
             }
             other => panic!("expected images, got {other:?}"),
         }

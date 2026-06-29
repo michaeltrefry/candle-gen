@@ -35,13 +35,20 @@ const LN_EPS: f64 = 1e-6;
 /// Per-head QK RMSNorm eps (diffusers `qk_norm="rms_norm"`, eps 1e-6).
 const RMS_EPS: f64 = 1e-6;
 
-/// Affine-free LayerNorm over the last axis (eps 1e-6), in f32 — the base norm inside every AdaLN.
+/// Affine-free LayerNorm over the last axis (eps 1e-6) — the base norm inside every AdaLN. The
+/// mean/variance reduction is computed in **f32** for numerical stability, then the normalized output
+/// is cast **back to the input dtype** so the downstream modulation + projections all run in one
+/// consistent dtype (the loaded weight dtype). On real bf16 weights, forcing the output to stay f32
+/// produced an `F32 × BF16` matmul mismatch in the very first block (sc-7881, C6); the parameterless
+/// reduction stays f32 but must not leak its dtype into the rest of the block.
 fn layer_norm(x: &Tensor) -> Result<Tensor> {
+    let in_dtype = x.dtype();
     let x = x.to_dtype(DType::F32)?;
     let mean = x.mean_keepdim(D::Minus1)?;
     let xc = x.broadcast_sub(&mean)?;
     let var = xc.sqr()?.mean_keepdim(D::Minus1)?;
-    xc.broadcast_div(&(var + LN_EPS)?.sqrt()?)
+    xc.broadcast_div(&(var + LN_EPS)?.sqrt()?)?
+        .to_dtype(in_dtype)
 }
 
 /// AdaLN-continuous / AdaLN-Zero apply: `(1 + scale) * norm + shift`, broadcasting modulation
@@ -90,7 +97,10 @@ impl MlpEmbed {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.linear_2.forward(&self.linear_1.forward(x)?.silu()?)
+        // The sinusoid / pooled inputs arrive in f32; cast to the (loaded) weight dtype so the matmul
+        // dtypes agree on real bf16 weights (sc-7881, C6).
+        let x = x.to_dtype(self.linear_1.weight().dtype())?;
+        self.linear_2.forward(&self.linear_1.forward(&x)?.silu()?)
     }
 }
 
@@ -184,7 +194,9 @@ impl PatchEmbed {
     /// `latent [B, C, H, W]` → image tokens `[B, h*w, inner]` with the learned pos-embed added.
     /// `(h, w)` is the patchified grid (`H/patch_size`, `W/patch_size`).
     fn forward(&self, latent: &Tensor) -> Result<(Tensor, usize, usize)> {
-        let latent = latent.to_dtype(DType::F32)?;
+        // Cast the latent to the conv weight dtype (the loaded weight dtype, e.g. bf16) so the
+        // patchify conv + the learned-pos-embed add run in one consistent dtype (sc-7881, C6).
+        let latent = latent.to_dtype(self.proj.weight().dtype())?;
         // conv2d patchify -> [B, inner, h, w]
         let x = self.proj.forward(&latent)?;
         let (b, _c, h, w) = x.dims4()?;
@@ -587,9 +599,11 @@ impl JointBlock {
 }
 
 /// AdaLayerNormContinuous output head (the diffusers `norm_out`): `emb = linear(silu(temb))`, then
-/// `shift, scale = emb.chunk(2)` — **shift is the first half, scale the second** — and the result is
-/// `(1 + scale)·LN(x) + shift`. The chunk order (shift narrowed first, scale second) is pinned by
-/// [`tests`].
+/// `scale, shift = emb.chunk(2)` — **scale is the first half, shift the second** — and the result is
+/// `(1 + scale)·LN(x) + shift`. This chunk order is the one diffusers `AdaLayerNormContinuous` uses
+/// (`scale, shift = torch.chunk(emb, 2)`); getting it backwards swaps every output token's scale and
+/// shift and scrambles the predicted velocity into spatial noise (sc-7881, C6 — the epic-7841 AdaLN
+/// bug magnet, caught against real weights). Pinned by [`tests`].
 struct AdaLayerNormContinuous {
     linear: Linear,
 }
@@ -605,10 +619,10 @@ impl AdaLayerNormContinuous {
     fn forward(&self, x: &Tensor, temb: &Tensor) -> Result<Tensor> {
         let emb = self.linear.forward(&temb.silu()?)?.unsqueeze(1)?; // [B,1,2*inner]
         let inner = emb.dim(D::Minus1)? / 2;
-        // diffusers `AdaLayerNormContinuous`: `shift, scale = emb.chunk(2)` — shift is the first
-        // half, scale the second; result is `(1 + scale)·LN(x) + shift`.
-        let shift = emb.narrow(D::Minus1, 0, inner)?;
-        let scale = emb.narrow(D::Minus1, inner, inner)?;
+        // diffusers `AdaLayerNormContinuous`: `scale, shift = emb.chunk(2)` — scale is the FIRST
+        // half, shift the second; result is `(1 + scale)·LN(x) + shift`.
+        let scale = emb.narrow(D::Minus1, 0, inner)?;
+        let shift = emb.narrow(D::Minus1, inner, inner)?;
         modulate(&layer_norm(x)?, &scale, &shift)
     }
 }
@@ -696,9 +710,11 @@ impl Sd3Transformer {
     ) -> Result<Tensor> {
         let temb = self.time_text_embed.forward(timesteps, pooled)?; // [B, inner]
         let (mut img, h, w) = self.pos_embed.forward(latent)?; // [B, h*w, inner]
+                                                               // Run the whole DiT in the image stream's (loaded weight) dtype so every joint matmul agrees
+                                                               // — the context arrives in f32 (aggregator) and must be cast to match (sc-7881, C6).
         let mut txt = self
             .context_embedder
-            .forward(&context.to_dtype(DType::F32)?)?; // [B, ctx_seq, inner]
+            .forward(&context.to_dtype(img.dtype())?)?; // [B, ctx_seq, inner]
 
         for block in &self.blocks {
             let (i, t) = block.forward(&img, &txt, &temb)?;
@@ -784,32 +800,31 @@ mod tests {
         }
     }
 
-    /// `AdaLayerNormContinuous` splits the linear output as `shift, scale = chunk(2)` (shift FIRST),
-    /// then applies `(1+scale)·LN(x) + shift`. Drive it with a hand-built linear so the chunk order
-    /// is observable: a constant LN(x)=0 input isolates the shift, and a constant LN(x)=1 isolates
-    /// `(1+scale)+shift`.
+    /// `AdaLayerNormContinuous` splits the linear output as `scale, shift = chunk(2)` (scale FIRST,
+    /// shift second — diffusers order), then applies `(1+scale)·LN(x) + shift`. Drive it with a
+    /// hand-built linear so the chunk order is observable: a constant LN(x)=0 input isolates the
+    /// shift. Getting this backwards is the sc-7881 real-weight bug (it produced spatial-noise renders).
     #[test]
-    fn adaln_continuous_chunk_order_is_shift_then_scale() {
+    fn adaln_continuous_chunk_order_is_scale_then_shift() {
         let dev = Device::Cpu;
         let inner = 4usize;
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
         let mut ada = AdaLayerNormContinuous::new(inner, vb.pp("norm_out")).unwrap();
-        // Replace the linear with a known one: weight maps silu(temb) -> [shift(4)=7, scale(4)=2].
-        // Use a zero weight + a bias of [7,7,7,7, 2,2,2,2] so the output is constant regardless of
-        // temb: emb = bias = [shift..., scale...].
+        // Replace the linear with a known one: a zero weight + a bias of [scale(4)=7, shift(4)=2] so
+        // emb = bias = [scale..., shift...] regardless of temb.
         let w = Tensor::zeros((2 * inner, inner), DType::F32, &dev).unwrap();
         let b = Tensor::from_vec(vec![7f32, 7., 7., 7., 2., 2., 2., 2.], 2 * inner, &dev).unwrap();
         ada.linear = Linear::new(w, Some(b));
         let temb = Tensor::randn(0f32, 1f32, (1, inner), &dev).unwrap();
-        // x already zero-mean-unit-ish: feed an x whose LN is ~constant. A single token row of all-1s
-        // normalizes to 0 (zero variance) → LN(x)=0, so out = shift = 7 everywhere (NOT scale=2).
+        // A single token row of all-1s normalizes to 0 (zero variance) → LN(x)=0, so
+        // out = (1+scale)·0 + shift = shift. With scale FIRST, shift is the SECOND half = 2.
         let x = Tensor::ones((1, 1, inner), DType::F32, &dev).unwrap();
         let out = ada.forward(&x, &temb).unwrap();
         for v in out.flatten_all().unwrap().to_vec1::<f32>().unwrap() {
             assert!(
-                (v - 7.0).abs() < 1e-4,
-                "shift must be the FIRST chunk (got {v}, expected 7)"
+                (v - 2.0).abs() < 1e-4,
+                "shift must be the SECOND chunk (got {v}, expected 2)"
             );
         }
     }

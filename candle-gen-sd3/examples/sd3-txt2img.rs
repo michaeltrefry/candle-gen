@@ -44,6 +44,7 @@ fn main() -> Result<()> {
     let variant = arg(&args, "--variant").unwrap_or_else(|| "large".into());
     let model_id = match variant.as_str() {
         "turbo" | "large-turbo" | "large_turbo" => candle_gen_sd3::MODEL_ID_TURBO,
+        "medium" => candle_gen_sd3::MODEL_ID_MEDIUM,
         _ => candle_gen_sd3::MODEL_ID,
     };
     let prompt = arg(&args, "--prompt").unwrap_or_else(|| {
@@ -85,7 +86,15 @@ fn main() -> Result<()> {
     // it only through the gen_core registry below).
     candle_gen_sd3::force_link();
 
-    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
+    let mut spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
+    if let Some(q) = arg(&args, "--quant") {
+        spec = match q.as_str() {
+            "q8" | "Q8" => spec.with_quant(gen_core::Quant::Q8),
+            "q4" | "Q4" => spec.with_quant(gen_core::Quant::Q4),
+            other => return Err(format!("--quant must be q4 or q8 (got {other})").into()),
+        };
+        println!("[smoke] DiT quant = {q}");
+    }
     let gen = gen_core::registry::load(model_id, &spec)?;
     println!(
         "[smoke] resolved engine id={} backend={}",
