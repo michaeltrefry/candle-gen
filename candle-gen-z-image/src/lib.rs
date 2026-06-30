@@ -26,6 +26,13 @@ mod dit;
 mod pipeline;
 mod training;
 
+// Base (non-Turbo) `z_image` text-to-image generator (sc-8414, the candle sibling of mlx sc-8320).
+// Registers its own engine id `z_image` via `inventory` alongside the Turbo `z_image_turbo` below; it
+// reuses the identical DiT/VAE/encoder + [`pipeline`] components, differing only in the render path —
+// real classifier-free guidance over the static **shift=6.0** flow-match schedule (vs Turbo's
+// CFG-free 4-step shift-3.0 distillation). The Turbo path is completely untouched (additive).
+pub mod base;
+
 // Fun-ControlNet (strict-pose) provider (sc-5489, epic 5480) — VACE-style dual-injection control on
 // the vendored DiT (`alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1`). Invoked directly by the
 // worker (a bespoke pose stream), not gen-core-registered — the `z_image_turbo` descriptor stays
@@ -49,6 +56,10 @@ pub mod edit;
 mod edit_validate;
 
 pub use adapters::{merge_adapters, MergeReport};
+// Base (non-Turbo) `z_image` generator (sc-8414). Its `descriptor`/`load`/`MODEL_ID` share the names
+// of the Turbo model's free functions below, so reach them through the `base` module path (consumers
+// use the registry id `"z_image"`).
+pub use base::ZImageBaseGenerator;
 pub use control::{ZImageControl, ZImageControlPaths, ZImageControlRequest, DEFAULT_CONTROL_SCALE};
 pub use edit::{ZImageEdit, ZImageEditPaths, ZImageEditRequest, DEFAULT_EDIT_STRENGTH};
 
@@ -69,7 +80,7 @@ pub const MODEL_ID: &str = "z_image_turbo";
 
 /// Z-Image works in latent space at /8 and the DiT patchifies that at /2, so both image dims must be
 /// multiples of **16** for a clean patchify. Enforced in [`validate`](Generator::validate).
-const SIZE_MULTIPLE: u32 = 16;
+pub(crate) const SIZE_MULTIPLE: u32 = 16;
 
 /// Process-global accelerated-attention runtime toggle (the Z-Image analogue of the SDXL flash-attn
 /// switch, sc-3674). The DiT's fused attention dispatch (CUDA flash-attn / Metal SDPA) is a **build

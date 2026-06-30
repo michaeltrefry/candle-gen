@@ -68,6 +68,23 @@ use rand_distr::{Distribution, StandardNormal};
 /// `steps`. Matches `mlx-gen-z-image`'s `DEFAULT_STEPS`.
 pub(crate) const DEFAULT_STEPS: usize = 4;
 
+/// Base (non-Turbo) Z-Image default steps — undistilled foundation model. The card recommends 28–50;
+/// 50 matches the reference `ZImagePipeline` example (`num_inference_steps=50`) and the mlx base
+/// provider (`mlx-gen-z-image::model_base::DEFAULT_STEPS`, sc-8320). Used when a base request omits
+/// `steps`.
+pub(crate) const BASE_DEFAULT_STEPS: usize = 50;
+
+/// Flow-match time-shift for the **base** Z-Image: `scheduler/scheduler_config.json`
+/// (`FlowMatchEulerDiscreteScheduler`, `shift=6.0`, `use_dynamic_shifting=false`) — static,
+/// resolution-independent. **This is the sole scheduler delta vs Turbo (3.0).** Mirrors
+/// `mlx-gen-z-image::model_base::SCHEDULE_SHIFT`.
+pub(crate) const BASE_SCHEDULE_SHIFT: f64 = 6.0;
+
+/// Default CFG scale for the base — the card recommends 3.0–5.0; 4.0 matches the reference
+/// `ZImagePipeline` example (`guidance_scale=4`) and the mlx base provider. Used when a base request
+/// omits `guidance`.
+pub(crate) const BASE_DEFAULT_GUIDANCE: f32 = 4.0;
+
 /// VAE spatial downscale — the latent is image/8 per side (the 4-stage `block_out_channels`
 /// `[128,256,512,512]` AutoencoderKL has 3 downsamplers). Matches `mlx-gen-z-image`'s `SPATIAL_SCALE`.
 const SPATIAL_SCALE: u32 = 8;
@@ -95,6 +112,18 @@ pub(crate) const TOKENIZER_MAX_LEN: usize = 512;
 /// pure function so the law is unit-testable without a GPU.
 pub(crate) fn image_seed(base_seed: u64, index: u32) -> u64 {
     base_seed.wrapping_add(index as u64)
+}
+
+/// The **base** (non-Turbo) Z-Image flow-match scheduler config: `shift = 6.0`,
+/// `use_dynamic_shifting = false` (the base model's `scheduler/scheduler_config.json`). Distinct from
+/// `SchedulerConfig::z_image_turbo()` (shift 3.0) — the sole scheduler delta the base introduces
+/// (sc-8414). Built explicitly because candle-transformers only ships a `z_image_turbo()` constructor.
+pub(crate) fn base_scheduler_config() -> SchedulerConfig {
+    SchedulerConfig {
+        num_train_timesteps: 1000,
+        shift: BASE_SCHEDULE_SHIFT,
+        use_dynamic_shifting: false,
+    }
 }
 
 /// A txt2img pipeline handle: the snapshot `root` + the compute device/dtype (bf16) + any LoRA/LoKr
@@ -248,6 +277,19 @@ impl Pipeline {
         Ok(enc.squeeze(0)?.to_dtype(self.dtype)?) // (L, 2560)
     }
 
+    /// Prompt → `cap_feats` for the **unconditional** (negative-prompt) CFG branch of the base path
+    /// (sc-8414). Identical encoding to [`text_embeddings`](Self::text_embeddings) — same Qwen chat
+    /// template, same encoder — but the prompt may be the **empty string** (the unconditional
+    /// embedding), which the chat template still wraps into a non-empty token sequence, so the
+    /// empty-`ids` guard in `text_embeddings` never applies here.
+    pub(crate) fn uncond_embeddings(
+        &self,
+        te: &ZImageTextEncoder,
+        negative_prompt: &str,
+    ) -> Result<Tensor> {
+        self.text_embeddings(te, negative_prompt)
+    }
+
     /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring
     /// `req.cancel`. Returns one `gen_core::Image` per `req.count` (each with seed `base_seed + index`).
     pub(crate) fn render(
@@ -346,6 +388,133 @@ impl Pipeline {
         Ok(images)
     }
 
+    /// Render `req` against pre-loaded `components` on the **base** (non-Turbo) path: real
+    /// classifier-free guidance over the static **shift=6.0** flow-match schedule (sc-8414, the candle
+    /// sibling of `mlx-gen-z-image::model_base`). Emits per-step progress and honors `req.cancel`.
+    ///
+    /// Differences from [`render`](Self::render) (the Turbo path), all from the base model card /
+    /// `scheduler/scheduler_config.json`:
+    ///
+    /// - **Static shift = 6.0** (Turbo's effective inference schedule is linear/un-shifted because its
+    ///   `set_timesteps(steps, Some(mu))` call no-ops under `use_dynamic_shifting=false`). The base
+    ///   builds its σ table with `set_timesteps(steps, None)` against a `shift=6.0` config, so the
+    ///   static-shift branch actually fires. We feed that σ table to [`run_flow_sampler`] with
+    ///   [`TimestepConvention::OneMinusSigma`], which derives the DiT timestep `t = 1−σ` from the σ
+    ///   schedule **itself** — so the Turbo `None`-path "timesteps desync" speckle bug is structurally
+    ///   absent here (we never read the scheduler's `timesteps`/`current_timestep_normalized`).
+    /// - **Real CFG**: each step runs the DiT twice (cond + uncond) and combines
+    ///   `v = v_uncond + guidance·(v_cond − v_uncond)`. `guidance == 1.0` collapses to a single cond
+    ///   forward (Turbo-equivalent cost). The uncond branch encodes the negative prompt (empty string
+    ///   when unset — the unconditional embedding).
+    /// - **Default 50 steps** when `req.steps` is unset ([`BASE_DEFAULT_STEPS`]).
+    pub(crate) fn render_base(
+        &self,
+        req: &GenerationRequest,
+        components: &Components,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
+        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let lat_h = (req.height / SPATIAL_SCALE) as usize;
+        let lat_w = (req.width / SPATIAL_SCALE) as usize;
+
+        // Real CFG: `req.guidance` is the classifier-free guidance scale (default 4.0). A value of 1.0
+        // turns CFG off (single cond forward, Turbo-equivalent cost).
+        let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
+        let cfg_on = guidance != 1.0;
+
+        // Text embeddings are seed- and image-independent: encode once for the whole batch. The uncond
+        // branch (negative prompt, empty when unset) is only encoded when CFG is active.
+        let cap = self.text_embeddings(&components.text_encoder, &req.prompt)?;
+        let neg_cap = if cfg_on {
+            let neg = req.negative_prompt.as_deref().unwrap_or("");
+            Some(self.uncond_embeddings(&components.text_encoder, neg)?)
+        } else {
+            None
+        };
+
+        let mut images = Vec::with_capacity(req.count as usize);
+        for index in 0..req.count {
+            let seed = image_seed(base_seed, index);
+
+            // sc-3673 parity — deterministic, launch-portable initial noise (see `render`).
+            let n = LATENT_CHANNELS * lat_h * lat_w;
+            let mut rng = StdRng::seed_from_u64(seed);
+            let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+            let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
+                .to_device(&self.device)?
+                .to_dtype(self.dtype)?;
+
+            // Static shift=6.0 schedule (the base model's scheduler_config.json). Unlike the Turbo
+            // path's `Some(mu)` no-op, the base passes `None` so the static-shift branch actually
+            // shifts the σ table; `run_flow_sampler`'s `OneMinusSigma` derives the DiT timestep from
+            // these σ directly, so there is no timesteps desync to guard against.
+            let mut scheduler = FlowMatchEulerDiscreteScheduler::new(base_scheduler_config());
+            scheduler.set_timesteps(steps, None);
+            let native: Vec<f32> = scheduler.sigmas.iter().map(|&s| s as f32).collect();
+
+            // Curated scheduler axis (epic 7114): an unset `req.scheduler` returns `native` verbatim
+            // (the byte-exact shift=6.0 default); a curated name re-shapes σ over the same shift
+            // (`mu = ln(shift)`), exactly as `mlx-gen-z-image::model_base`.
+            let sigmas = candle_gen::resolve_flow_schedule(
+                req.scheduler.as_deref(),
+                (BASE_SCHEDULE_SHIFT as f32).ln(),
+                steps,
+                &native,
+            );
+
+            // `prepare_inputs` pads cap_feats to SEQ_MULTI_OF (+ attention mask) for both the cond and
+            // (when CFG is on) the uncond branch, and adds the singleton frame axis to the latents.
+            let prepared = prepare_inputs(&noise, std::slice::from_ref(&cap), &self.device)?;
+            let cap_feats = prepared.cap_feats;
+            let cap_mask = prepared.cap_mask;
+            let uncond = match neg_cap.as_ref() {
+                Some(neg) => {
+                    let p = prepare_inputs(&noise, std::slice::from_ref(neg), &self.device)?;
+                    Some((p.cap_feats, p.cap_mask))
+                }
+                None => None,
+            };
+
+            let latents = candle_gen::run_flow_sampler(
+                req.sampler.as_deref(),
+                TimestepConvention::OneMinusSigma,
+                &sigmas,
+                prepared.latents,
+                seed,
+                &req.cancel,
+                on_progress,
+                |latents, t| -> Result<Tensor> {
+                    let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
+                    // Conditional velocity (Z-Image sign convention: the DiT output is negated before
+                    // the flow-match step). The CFG combine is done on the negated velocities, which is
+                    // linear so the result is identical to combining-then-negating.
+                    let v_cond = components
+                        .transformer
+                        .forward(latents, &t_tensor, &cap_feats, &cap_mask)?
+                        .neg()?;
+                    let velocity = match uncond.as_ref() {
+                        Some((neg_feats, neg_mask)) => {
+                            let v_uncond = components
+                                .transformer
+                                .forward(latents, &t_tensor, neg_feats, neg_mask)?
+                                .neg()?;
+                            // v = v_uncond + guidance·(v_cond − v_uncond)
+                            let delta = (&v_cond - &v_uncond)?;
+                            (v_uncond + (delta * guidance as f64)?)?
+                        }
+                        None => v_cond,
+                    };
+                    Ok(velocity)
+                },
+            )?;
+
+            on_progress(Progress::Decoding);
+            images.push(self.decode(&components.vae, &latents)?);
+        }
+        Ok(images)
+    }
+
     /// VAE-decode the final latents `(1, 16, 1, h, w)` to an RGB8 [`Image`]. The VAE applies its own
     /// `/scaling_factor + shift_factor` un-scale inside `decode`; `postprocess_image` maps the
     /// `[-1, 1]` output to `[0, 255]` u8.
@@ -381,6 +550,66 @@ mod tests {
         assert_eq!(SPATIAL_SCALE, 8);
         assert_eq!(LATENT_CHANNELS, 16);
         assert_eq!(PATCH_SIZE, 2);
+    }
+
+    /// Base (non-Turbo) parity constants vs Turbo + the mlx base provider (sc-8414 / mlx sc-8320):
+    /// shift 6.0 (Turbo's config is 3.0), default 50 steps (Turbo 4), default CFG 4.0. These are the
+    /// load-bearing port values from the base `scheduler_config.json` + the model card. GPU-free.
+    #[test]
+    fn base_constants_match_the_model_card() {
+        assert_eq!(BASE_SCHEDULE_SHIFT, 6.0);
+        assert_eq!(BASE_DEFAULT_STEPS, 50);
+        assert_eq!(BASE_DEFAULT_GUIDANCE, 4.0);
+        // The base scheduler config differs from Turbo only in the static shift.
+        let base = base_scheduler_config();
+        let turbo = SchedulerConfig::z_image_turbo();
+        assert_eq!(base.shift, 6.0);
+        assert_eq!(turbo.shift, 3.0);
+        assert!(!base.use_dynamic_shifting && !turbo.use_dynamic_shifting);
+        assert_eq!(base.num_train_timesteps, turbo.num_train_timesteps);
+    }
+
+    /// The base static **shift=6.0** schedule (built `set_timesteps(steps, None)`) must: have
+    /// `num_steps + 1` sigmas, start at max-σ **1.0**, strictly decrease, terminate at 0 — and, the
+    /// load-bearing delta vs Turbo, actually apply the shift so its σ table is NOT the linear ramp.
+    /// The shift biases the schedule toward high-noise steps (σ at a given fraction is ≥ the linear
+    /// value), which is what an undistilled CFG model needs. GPU-free.
+    #[test]
+    fn base_schedule_applies_shift_six() {
+        let steps = 50usize;
+        let mut s = FlowMatchEulerDiscreteScheduler::new(base_scheduler_config());
+        s.set_timesteps(steps, None);
+        assert_eq!(s.sigmas.len(), steps + 1);
+        assert!(
+            (s.sigmas[0] - 1.0).abs() < 1e-9,
+            "max sigma: {}",
+            s.sigmas[0]
+        );
+        assert!(s.sigmas[steps].abs() < 1e-9, "terminal sigma must be 0");
+        for w in s.sigmas.windows(2) {
+            assert!(w[0] > w[1], "sigmas must strictly decrease: {:?}", s.sigmas);
+        }
+        // Shift actually applied: shift*x/(1+(shift-1)*x) > x for x in (0,1), so the shifted σ table
+        // is strictly above the linear ramp at every interior node (and differs from Turbo's table).
+        let mut turbo = FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo());
+        turbo.set_timesteps(steps, None);
+        for i in 1..steps {
+            let linear = 1.0 - (i as f64) / (steps as f64);
+            assert!(
+                s.sigmas[i] > linear + 1e-9,
+                "shift=6.0 must lift σ[{i}]={} above the linear ramp {linear}",
+                s.sigmas[i]
+            );
+            assert!(
+                s.sigmas[i] > turbo.sigmas[i] + 1e-9,
+                "shift=6.0 σ[{i}]={} must exceed Turbo shift=3.0 σ={}",
+                s.sigmas[i],
+                turbo.sigmas[i]
+            );
+        }
+        // The DiT timestep the base render feeds (1 − σ, OneMinusSigma) is derived from THIS σ table,
+        // so it is consistent by construction — no `timesteps` desync (the Turbo `None`-path speckle
+        // bug cannot occur on the base path).
     }
 
     /// Per-image seed in a `count`-batch is `base + index` (wrapping), so image *n* reproduces in
