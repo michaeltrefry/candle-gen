@@ -260,6 +260,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-depth"
+version = "0.0.0"
+dependencies = [
+ "candle-core",
+ "candle-gen",
+ "candle-nn",
+]
+
+[[package]]
 name = "candle-gen-face"
 version = "0.0.0"
 dependencies = [
