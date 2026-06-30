@@ -70,14 +70,18 @@ pub(crate) const DEFAULT_STEPS: usize = 4;
 
 /// VAE spatial downscale — the latent is image/8 per side (the 4-stage `block_out_channels`
 /// `[128,256,512,512]` AutoencoderKL has 3 downsamplers). Matches `mlx-gen-z-image`'s `SPATIAL_SCALE`.
-const SPATIAL_SCALE: u32 = 8;
+/// `pub(crate)` so the trainer's preview-sample path (sc-8650) shapes its seeded noise at the identical
+/// /8 latent geometry inference uses (single source of truth).
+pub(crate) const SPATIAL_SCALE: u32 = 8;
 
 /// DiT patch size on each spatial axis (`Config::z_image_turbo().all_patch_size[0]`). The flow-match
 /// `mu` shift is computed from the post-patchify image sequence length, so it is needed here.
-const PATCH_SIZE: u32 = 2;
+/// `pub(crate)` so the trainer's preview `mu` (sc-8650) is derived identically to inference.
+pub(crate) const PATCH_SIZE: u32 = 2;
 
 /// Z-Image latent channel count (the VAE's `latent_channels` and the DiT's `in_channels`).
-const LATENT_CHANNELS: usize = 16;
+/// `pub(crate)` so the trainer's preview noise (sc-8650) is the identical 16-channel prior.
+pub(crate) const LATENT_CHANNELS: usize = 16;
 
 /// Qwen3 pad token id (`<|endoftext|>`). Only consulted when padding to a fixed length, which the
 /// txt2img path does not do (`pad_to_max_length: false`); the DiT's `prepare_inputs` does the

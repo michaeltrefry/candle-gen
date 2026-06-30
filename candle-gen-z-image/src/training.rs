@@ -49,30 +49,48 @@
 //! resolutions / smaller cards rather than a correctness requirement.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use candle_core::backprop::GradStore;
-use candle_core::{DType, Device, Tensor, Var};
+use candle_core::{DType, Device, IndexOp, Tensor, Var};
 
+use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
-use candle_gen::gen_core::{self, LoadSpec, Modality, WeightsSource};
+use candle_gen::gen_core::{self, Image, LoadSpec, Modality, WeightsSource};
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
 use candle_gen::train::flow_match::{
     self, run_flow_match_training, validate_flow_match_request, velocity_loss, FlowMatchTrainer,
+    SamplePlan,
 };
 use candle_gen::train::gradient_checkpoint::checkpointed_backward_with_input_grad;
 use candle_gen::{CandleError, Result};
 
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
+use candle_transformers::models::z_image::sampling::postprocess_image;
+use candle_transformers::models::z_image::scheduler::{
+    calculate_shift, FlowMatchEulerDiscreteScheduler, SchedulerConfig, BASE_IMAGE_SEQ_LEN,
+    BASE_SHIFT, MAX_IMAGE_SEQ_LEN, MAX_SHIFT,
+};
 use candle_transformers::models::z_image::text_encoder::{TextEncoderConfig, ZImageTextEncoder};
 use candle_transformers::models::z_image::transformer::Config as DitConfig;
-use candle_transformers::models::z_image::vae::{Encoder as VaeEncoder, VaeConfig};
+use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder, VaeConfig};
+use rand::{rngs::StdRng, SeedableRng};
+use rand_distr::{Distribution, StandardNormal};
 
 use crate::dit::{ZImageTransformer2DModel, Z_IMAGE_ATTN_TARGETS};
-use crate::pipeline::{QWEN_PAD_TOKEN_ID, TOKENIZER_MAX_LEN};
+use crate::pipeline::{
+    LATENT_CHANNELS, PATCH_SIZE, QWEN_PAD_TOKEN_ID, SPATIAL_SCALE, TOKENIZER_MAX_LEN,
+};
 use crate::MODEL_ID;
+
+/// Cap on preview prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-8650) — the
+/// candle twin of the MLX sc-5637 cap. Bounds per-cadence preview cost regardless of how many
+/// `sample_prompts` the request carries.
+const SAMPLE_PROMPT_CAP: usize = 4;
 
 /// Error-message prefix shared by [`validate_flow_match_request`] and the driver's `no usable dataset
 /// items` guard.
@@ -215,6 +233,59 @@ fn encode_caption(
     Ok(enc.squeeze(0)?.to_dtype(DType::F32)?) // (L, 2560)
 }
 
+/// The Z-Image preview-sample render state (sc-8650) — everything [`ZImageTrainer::render_sample`]
+/// needs to run the family's CFG-free, guidance-distilled denoise on the **in-progress** trainable
+/// DiT, built once in [`ZImageTrainer::cache`] while the text encoder is still resident:
+///
+///  * `caps` — the per-prompt pre-encoded Qwen3 conditioning, each `(L, 2560)` at f32 (exactly what
+///    [`encode_caption`] returns and `prepare_inputs` consumes), 1:1 with [`SamplePlan::prompts`].
+///  * `vae` — the resident `AutoEncoderKL` **decoder** (`Arc` as inference holds it); the cache pass
+///    loads only the VAE `Encoder`, so the full VAE is loaded here for the preview decode path.
+///  * `edge` — the square training-resolution edge (`bucket_resolution(cfg.resolution)`, the same edge
+///    the cached latents use) the seeded preview noise + the `mu` shift are shaped at.
+pub struct ZImageSampleState {
+    caps: Vec<Tensor>,
+    vae: Arc<AutoEncoderKL>,
+    edge: u32,
+}
+
+/// Seeded initial Gaussian latent noise `[1, 16, edge/8, edge/8]` (f32) for a preview render — the
+/// training-side twin of [`crate::pipeline::Pipeline::render`]'s noise init (sc-8650): a
+/// fixed-algorithm CPU `StdRng` (sc-3673 launch-portable discipline) seeded by `seed`, built on CPU
+/// then moved to `device`, exactly as inference draws its prior.
+fn sample_noise_latent(edge: u32, seed: u64, device: &Device) -> Result<Tensor> {
+    let lat = (edge / SPATIAL_SCALE) as usize;
+    let n = LATENT_CHANNELS * lat * lat;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    Ok(Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat, lat), &Device::Cpu)?.to_device(device)?)
+}
+
+/// VAE-decode a final preview latent `[1, 16, 1, h, w]` → RGB8 [`Image`] — the training-side twin of
+/// [`crate::pipeline::Pipeline::decode`] (sc-8650): drop the singleton frame axis, `AutoEncoderKL::
+/// decode` applies its own `/scaling + shift` un-scale internally and returns `[1, 3, H, W]` in
+/// `[-1, 1]`, and `postprocess_image` maps that to `[0, 255]` u8.
+fn decode_preview(vae: &AutoEncoderKL, latents: &Tensor) -> Result<Image> {
+    // Drop the singleton frame axis: (1, 16, 1, h, w) -> (1, 16, h, w).
+    let latents = latents.squeeze(2)?;
+    let decoded = vae.decode(&latents)?.to_dtype(DType::F32)?; // (1, 3, H, W) in [-1, 1]
+    let img = postprocess_image(&decoded)? // u8 (1, 3, H, W)
+        .i(0)?
+        .to_device(&Device::Cpu)?;
+    let (c, h, w) = img.dims3()?;
+    if c != 3 {
+        return Err(CandleError::Msg(format!(
+            "z_image trainer: preview decode expected 3 channels, got {c}"
+        )));
+    }
+    let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
+    Ok(Image {
+        width: w as u32,
+        height: h as u32,
+        pixels,
+    })
+}
+
 /// Load the Qwen tokenizer with the inference-identical config.
 fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
     TextTokenizer::from_file(
@@ -314,6 +385,9 @@ impl FlowMatchTrainer for ZImageTrainer {
     /// `(x0 latent [1,16,h,w], caption embed (L, 2560))`, both f32.
     type Cached = (Tensor, Tensor);
     type Aux = ();
+    /// Preview-sample render state (sc-8650): per-prompt `(L, 2560)` conditioning + the resident VAE
+    /// decoder + the training edge. See [`ZImageSampleState`].
+    type SampleState = ZImageSampleState;
     const LABEL: &'static str = LABEL;
 
     fn device(&self) -> &Device {
@@ -329,7 +403,7 @@ impl FlowMatchTrainer for ZImageTrainer {
         req: &TrainingRequest,
         device: &Device,
         on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> Result<(Vec<(Tensor, Tensor)>, ())> {
+    ) -> Result<(Vec<(Tensor, Tensor)>, (), SamplePlan<ZImageSampleState>)> {
         let edge = bucket_resolution(req.config.resolution);
         let vae_cfg = VaeConfig::z_image();
         let vae_encoder = VaeEncoder::new(
@@ -362,10 +436,41 @@ impl FlowMatchTrainer for ZImageTrainer {
             let cap = encode_caption(&tokenizer, &text_encoder, &item.caption, device)?;
             cache.push((x0, cap));
         }
+
+        // Preview samples (sc-8650): while the text encoder is still resident, pre-encode up to
+        // `SAMPLE_PROMPT_CAP` prompts with the SAME `encode_caption` the cache loop uses, and load a
+        // resident VAE **decoder** (the cache pass only loaded the `Encoder`). The driver renders these
+        // from the in-progress adapter at the `sample_every` cadence. Disabled (no state) when the
+        // request opts out, so a non-sampling run loads no decoder and trains exactly as before.
+        let cfg = &req.config;
+        let sample_plan = if cfg.sample_every == 0 || cfg.sample_prompts.is_empty() {
+            SamplePlan::disabled()
+        } else {
+            let mut prompts = Vec::new();
+            let mut caps = Vec::new();
+            for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
+                caps.push(encode_caption(&tokenizer, &text_encoder, prompt, device)?);
+                prompts.push(prompt.clone());
+            }
+            // The full `AutoEncoderKL` (encoder + decoder); inference holds it `Arc`-shared.
+            let vae = AutoEncoderKL::new(
+                &vae_cfg,
+                flow_match::component_vb(&self.root, "vae", device, DType::F32, LABEL)?,
+            )?;
+            SamplePlan {
+                prompts,
+                state: Some(ZImageSampleState {
+                    caps,
+                    vae: Arc::new(vae),
+                    edge,
+                }),
+            }
+        };
+
         // Encoders are dead weight once cached — drop them before the DiT (working set) loads.
         drop(text_encoder);
         drop(vae_encoder);
-        Ok((cache, ()))
+        Ok((cache, (), sample_plan))
     }
 
     fn build_dit(
@@ -409,6 +514,83 @@ impl FlowMatchTrainer for ZImageTrainer {
             flow_match::parse_compute_dtype(&cfg.train_dtype),
             cfg.gradient_checkpointing,
         )
+    }
+
+    /// Render preview prompt `index` from the **in-progress** trainable DiT (sc-8650). Mirrors the
+    /// Z-Image inference denoise ([`crate::pipeline::Pipeline::render`]) on the trainable
+    /// [`ZImageTransformer2DModel`] (adapters live as eager `Var`s, so its plain `forward` runs the
+    /// partially-trained LoRA): seed the latent prior, drive the distilled flow-match Euler schedule
+    /// with `set_timesteps(steps, Some(mu))` (the speckle-free arm), and step with the **Z-Image sign
+    /// convention** — the DiT is fed the `1 − σ` timestep ([`TimestepConvention::OneMinusSigma`]) and
+    /// its predicted velocity is **negated** before the Euler step, exactly as inference does. Z-Image-
+    /// Turbo is guidance-distilled (CFG-free), so `cfg.sample_guidance_scale` is ignored. Best-effort:
+    /// any error here is logged + skipped by the driver, never aborting the run.
+    fn render_sample(
+        &self,
+        dit: &ZImageTransformer2DModel,
+        state: &ZImageSampleState,
+        index: usize,
+        cfg: &TrainingConfig,
+        seed: u64,
+    ) -> Result<Image> {
+        let device = self.device();
+        let cap = state.caps.get(index).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "z_image trainer: preview prompt index {index} out of range"
+            ))
+        })?;
+        let steps = (cfg.sample_steps as usize).max(1);
+        let lat = (state.edge / SPATIAL_SCALE) as usize;
+
+        // Seeded launch-portable prior at the training resolution (square `edge`). `prepare_inputs`
+        // pads `cap` to SEQ_MULTI_OF (+ mask) and adds the singleton frame axis to the latents →
+        // (1, 16, 1, lat, lat) — the exact tensor surface train + infer feed the DiT.
+        let noise = sample_noise_latent(state.edge, seed, device)?;
+        let prepared = prepare_inputs(&noise, std::slice::from_ref(cap), device)?;
+        let cap_feats = prepared.cap_feats;
+        let cap_mask = prepared.cap_mask;
+
+        // Distilled flow-match Euler schedule — pass `Some(mu)` (the resolution-dependent shift) so the
+        // σ table stays consistent with the `1 − σ` conditioning (the `None` arm desyncs them and
+        // speckles; see `pipeline::Pipeline::render`). `mu` is derived from the post-patchify seq len.
+        let image_seq_len = ((lat as u32 / PATCH_SIZE) * (lat as u32 / PATCH_SIZE)) as usize;
+        let mu = calculate_shift(
+            image_seq_len,
+            BASE_IMAGE_SEQ_LEN,
+            MAX_IMAGE_SEQ_LEN,
+            BASE_SHIFT,
+            MAX_SHIFT,
+        );
+        let mut scheduler = FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo());
+        scheduler.set_timesteps(steps, Some(mu));
+        // `TrainingConfig` carries no sampler/scheduler knob — preview uses the native distilled σ table
+        // verbatim (`None` ⇒ the scheduler's own schedule) and the default `euler` sampler (the N1 no-op
+        // = the legacy Euler step), exactly the Z-Image inference default.
+        let native: Vec<f32> = scheduler.sigmas.iter().map(|&s| s as f32).collect();
+        let sigmas = candle_gen::resolve_flow_schedule(None, 0.0, steps, &native);
+
+        // A preview never honors mid-denoise cancel; a fresh never-cancelled token suffices.
+        let nocancel = CancelFlag::new();
+        let latents = candle_gen::run_flow_sampler(
+            None,
+            TimestepConvention::OneMinusSigma,
+            &sigmas,
+            prepared.latents,
+            seed,
+            &nocancel,
+            &mut |_| {},
+            |latents, t| -> Result<Tensor> {
+                // `t` is the `1 − σ` conditioning the DiT embeds; the raw velocity is NEGATED to match
+                // inference's `noise_pred.neg()` (the Z-Image sign convention).
+                let t_tensor = Tensor::from_vec(vec![t], (1,), device)?;
+                let velocity = dit
+                    .forward(latents, &t_tensor, &cap_feats, &cap_mask)?
+                    .neg()?;
+                Ok(velocity)
+            },
+        )?;
+
+        decode_preview(&state.vae, &latents)
     }
 }
 
