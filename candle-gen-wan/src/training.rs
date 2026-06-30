@@ -271,6 +271,10 @@ fn render_one_preview(
 ) -> Result<Image> {
     let dit_cfg = TransformerConfig::t2v_14b();
     let steps = cfg.sample_steps.max(1) as usize;
+    // The experts are built at the bf16 compute dtype; their `forward` does NOT cast inputs (like
+    // `compute_loss_grads`, which casts `x_t` → `compute_dtype`), so run the denoise in that dtype — the
+    // F32 `create_noise` prior would otherwise hit an F32×BF16 matmul mismatch on the first block.
+    let compute_dtype = flow_match::parse_compute_dtype(&cfg.train_dtype);
 
     // Single-frame latent geometry (F = 1) at the square training edge, z16 strides.
     let t_lat = 1usize;
@@ -286,7 +290,7 @@ fn render_one_preview(
     let ctx_low = experts[1].dit.embed_text(umt5)?;
 
     // Seeded [1, 16, 1, h_lat, w_lat] noise (the inference `create_noise`, frame axis pinned to 1).
-    let noise = create_noise(seed, 16, t_lat, h_lat, w_lat, device)?;
+    let noise = create_noise(seed, 16, t_lat, h_lat, w_lat, device)?.to_dtype(compute_dtype)?;
 
     // Wan's native flow-σ schedule (descending, trailing 0.0) integrated by the shared euler flow
     // sampler — the dual-expert MoE band switch lives inside the closure (boundary on σ·N).
@@ -311,13 +315,14 @@ fn render_one_preview(
                 (&experts[1].dit, &ctx_low)
             };
             let v = dit.forward(x, ctx, ts, &cos, &sin)?; // raw velocity (no negation)
-            Ok(v.to_dtype(DType::F32)?)
+            Ok(v.to_dtype(compute_dtype)?)
         },
     )?;
 
     // Decode the single-frame latent [1,16,1,h,w] → [1,3,1,8h,8w]; the frame axis (dim 2) carries one
-    // frame, so `frames_to_images` (the inference frame→Image conversion) yields exactly one Image.
-    let decoded = state.vae.decode(&lat)?; // [1, 3, 1, H, W] in [-1, 1]
+    // frame, so `frames_to_images` (the inference frame→Image conversion) yields exactly one Image. The
+    // denoise ran in `compute_dtype`; the resident VAE is F32 → cast back before decode.
+    let decoded = state.vae.decode(&lat.to_dtype(DType::F32)?)?; // [1, 3, 1, H, W] in [-1, 1]
     frames_to_images(&decoded)?
         .into_iter()
         .next()

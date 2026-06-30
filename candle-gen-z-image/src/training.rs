@@ -541,13 +541,17 @@ impl FlowMatchTrainer for ZImageTrainer {
         })?;
         let steps = (cfg.sample_steps as usize).max(1);
         let lat = (state.edge / SPATIAL_SCALE) as usize;
+        // The DiT is built at the bf16 compute dtype (`build_dit`); the inference forward does NOT cast
+        // its inputs (unlike Krea's), so feed bf16 latents + conditioning — exactly as `compute_loss_grads`
+        // does (`x_t`/`cap_feats` → `compute_dtype`) — or the first matmul hits an F32×BF16 mismatch.
+        let compute_dtype = flow_match::parse_compute_dtype(&cfg.train_dtype);
 
         // Seeded launch-portable prior at the training resolution (square `edge`). `prepare_inputs`
         // pads `cap` to SEQ_MULTI_OF (+ mask) and adds the singleton frame axis to the latents →
         // (1, 16, 1, lat, lat) — the exact tensor surface train + infer feed the DiT.
         let noise = sample_noise_latent(state.edge, seed, device)?;
         let prepared = prepare_inputs(&noise, std::slice::from_ref(cap), device)?;
-        let cap_feats = prepared.cap_feats;
+        let cap_feats = prepared.cap_feats.to_dtype(compute_dtype)?;
         let cap_mask = prepared.cap_mask;
 
         // Distilled flow-match Euler schedule — pass `Some(mu)` (the resolution-dependent shift) so the
@@ -575,7 +579,7 @@ impl FlowMatchTrainer for ZImageTrainer {
             None,
             TimestepConvention::OneMinusSigma,
             &sigmas,
-            prepared.latents,
+            prepared.latents.to_dtype(compute_dtype)?,
             seed,
             &nocancel,
             &mut |_| {},
@@ -590,7 +594,8 @@ impl FlowMatchTrainer for ZImageTrainer {
             },
         )?;
 
-        decode_preview(&state.vae, &latents)
+        // The denoise ran in `compute_dtype`; the resident VAE is F32 → cast back before decode.
+        decode_preview(&state.vae, &latents.to_dtype(DType::F32)?)
     }
 }
 

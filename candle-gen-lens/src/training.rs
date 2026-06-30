@@ -555,7 +555,8 @@ impl FlowMatchTrainer for LensTrainer {
                 Ok(cfg_rescale(&pos, &neg, guidance)?)
             },
         )?;
-        decode_preview(&state.vae, &lat, latent_h, latent_w)
+        // The denoise ran in the bf16 loop dtype; the resident VAE is F32 → cast back before decode.
+        decode_preview(&state.vae, &lat.to_dtype(DType::F32)?, latent_h, latent_w)
     }
 }
 
