@@ -490,4 +490,49 @@ mod tests {
         let err = load(&spec).err().expect("expected an error").to_string();
         assert!(err.contains("snapshot directory"), "got: {err}");
     }
+
+    /// sc-8647: a `Qwen/Qwen-Image-2512` snapshot is a structural drop-in for the original
+    /// `Qwen/Qwen-Image` — same diffusers layout (`text_encoder/ transformer/ vae/ tokenizer/`),
+    /// same 60-layer MMDiT, same Qwen2.5-VL text encoder, same Qwen2 BPE tokenizer (the worker's
+    /// `DERIVED_TOKENIZER_OVERLAYS` materializes `tokenizer/tokenizer.json` for 2512 too). The
+    /// candle loader keys nothing on the repo string — it loads the dir structurally — so a
+    /// 2512-shaped snapshot is accepted exactly like the base. Pin that: a synthetic 2512 snapshot
+    /// dir loads, and the per-release config used is byte-identical to the base config.
+    #[test]
+    fn loads_qwen_image_2512_shaped_snapshot() {
+        // The 2512 base reuses the base config verbatim (sc-8271 parity); the candle loader uses
+        // these for the DiT + text encoder regardless of which snapshot dir is supplied.
+        assert_eq!(
+            TransformerConfig::qwen_image_2512(),
+            TransformerConfig::qwen_image(),
+            "2512 MMDiT config must be a verbatim drop-in (same 60-layer dual-stream MMDiT)"
+        );
+        assert_eq!(
+            TextEncoderConfig::qwen_image_2512(),
+            TextEncoderConfig::qwen_image(),
+            "2512 text-encoder config must be a verbatim drop-in (same Qwen2.5-VL + BPE tokenizer)"
+        );
+
+        // A 2512 snapshot ships the identical diffusers directory layout; the worker overlays a
+        // built `tokenizer/tokenizer.json`. Build that shape and confirm the loader accepts it (no
+        // repo-string gate rejects 2512) and that `Pipeline::load` resolves the tokenizer path that
+        // `encode` reads.
+        let tmp = std::env::temp_dir().join(format!("qwen2512_snap_{}", std::process::id()));
+        for sub in ["text_encoder", "transformer", "vae", "tokenizer"] {
+            std::fs::create_dir_all(tmp.join(sub)).unwrap();
+        }
+        std::fs::write(tmp.join("tokenizer/tokenizer.json"), b"{}").unwrap();
+
+        let spec = LoadSpec::new(WeightsSource::Dir(tmp.clone()));
+        let g = load(&spec).expect("a 2512-shaped snapshot dir must load like the base");
+        assert_eq!(g.descriptor().id, MODEL_ID);
+
+        let pipe = Pipeline::load(&tmp, &Device::Cpu);
+        assert!(
+            pipe.root.join("tokenizer/tokenizer.json").is_file(),
+            "loader must resolve the overlaid tokenizer.json under tokenizer/"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 }

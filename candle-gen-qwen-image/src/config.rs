@@ -58,6 +58,17 @@ impl TransformerConfig {
         }
     }
 
+    /// `Qwen/Qwen-Image-2512` (sc-8647 — parity with mlx-gen sc-8271). The Dec-2025 base refresh is
+    /// architecturally identical to the original `Qwen/Qwen-Image`: the same 60-layer dual-stream
+    /// MMDiT, the same 24×128 head geometry, the same 3-axis RoPE, and the same Qwen2.5-VL text
+    /// width. Only the trained weights differ, so the config is a verbatim drop-in. We expose it as a
+    /// distinct named constructor so the parity is explicit and test-pinned (mirroring mlx, where
+    /// `qwenimage-2512` aliases `qwenimage`), and so the upcoming 2512-Fun control overlay (sc-8350)
+    /// has a named base config to reference.
+    pub fn qwen_image_2512() -> Self {
+        Self::qwen_image()
+    }
+
     /// `num_heads * head_dim` — the model width (3072).
     pub fn inner_dim(&self) -> usize {
         self.num_heads * self.head_dim
@@ -99,6 +110,14 @@ impl TextEncoderConfig {
             pad_token_id: 151643,
         }
     }
+
+    /// `Qwen/Qwen-Image-2512` text path (sc-8647). The 2512 base reuses the same Qwen2.5-VL text
+    /// encoder and the same Qwen2 BPE tokenizer (unchanged across the Qwen-Image line — see the
+    /// worker's `DERIVED_TOKENIZER_OVERLAYS`, which points 2512 at the same hosted overlay), so the
+    /// text-encoder config is a verbatim drop-in.
+    pub fn qwen_image_2512() -> Self {
+        Self::qwen_image()
+    }
 }
 
 #[cfg(test)]
@@ -120,5 +139,19 @@ mod tests {
         assert_eq!(e.n_layers, 28);
         assert_eq!(e.n_heads / e.n_kv_heads, 7);
         assert_eq!(e.hidden_size, t.joint_attention_dim);
+    }
+
+    /// sc-8647 (parity with mlx-gen sc-8271): `Qwen/Qwen-Image-2512` is architecturally identical to
+    /// the original `Qwen/Qwen-Image`, so both config constructors are verbatim drop-ins.
+    #[test]
+    fn qwen_image_2512_is_a_verbatim_config_dropin() {
+        assert_eq!(
+            TransformerConfig::qwen_image_2512(),
+            TransformerConfig::qwen_image()
+        );
+        assert_eq!(
+            TextEncoderConfig::qwen_image_2512(),
+            TextEncoderConfig::qwen_image()
+        );
     }
 }
