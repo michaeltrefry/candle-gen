@@ -66,6 +66,10 @@ use candle_transformers::models::stable_diffusion::ddim::DDIMSchedulerConfig;
 use candle_transformers::models::stable_diffusion::schedulers::{Scheduler, SchedulerConfig};
 use candle_transformers::models::stable_diffusion::{self, clip, StableDiffusionConfig};
 
+use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
+
+use crate::denoise::decode_image;
+use crate::loaders::load_sdxl_vae;
 use crate::pipeline::{hf_get, snapshot_file, Clip, VAE_FIX_FILE, VAE_FIX_REPO, VAE_SCALE};
 use crate::unet::{
     BlockConfig, UNet2DConditionModel, UNet2DConditionModelConfig, VaeMomentsEncoder,
@@ -75,6 +79,11 @@ use crate::MODEL_ID;
 /// DDPM training-noise schedule length (the diffusers `num_train_timesteps`). `t` is sampled uniform
 /// over `[0, NUM_TRAIN_TIMESTEPS)`, matching torch's `randint(0, num_train_timesteps)`.
 const NUM_TRAIN_TIMESTEPS: usize = 1000;
+
+/// Cap on preview prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-8650). Mirrors the
+/// `SAMPLE_PROMPT_CAP` the FlowMatch driver applies to the flow-match families — a preview is a
+/// best-effort progress signal, so a long `sample_prompts` list never blows the per-cadence cost up.
+const SAMPLE_PROMPT_CAP: usize = 4;
 
 /// The exact SDXL UNet config (`stabilityai/stable-diffusion-xl-base-1.0/unet/config.json`) — 3 blocks
 /// `320/640/1280` with transformer depths `[—, 2, 10]` and 5/10/20 attention heads, `cross_attention_dim
@@ -249,6 +258,80 @@ fn eps_loss(eps: &Tensor, target_f32: &Tensor, mae: bool) -> candle_core::Result
     } else {
         diff.sqr()?.mean_all()
     }
+}
+
+/// The resident preview state (sc-8650) pre-built in the cache phase, before the dual CLIP is dropped:
+/// the per-prompt **CFG-batched** conditioning `[2, 77, 2048]` (`[uncond, cond]`, exactly the inference
+/// `text_embeddings` layout) and a resident f16 VAE **decoder** (the cache pass only loaded the moments
+/// *encoder*, which is dropped post-cache). `None` when sampling is disabled (`sample_every == 0` or no
+/// `sample_prompts`). The conditioning lives at the compute dtype so the in-training UNet consumes it
+/// directly; the prompt strings are carried alongside so the loop can label each `Sample` event.
+struct SamplePreview {
+    /// `[uncond, cond]` dual-CLIP conditioning per prompt, `[2, 77, 2048]` in the compute dtype.
+    conds: Vec<Tensor>,
+    /// The prompts (1:1 with `conds`), surfaced on each emitted [`TrainingProgress::Sample`].
+    prompts: Vec<String>,
+    /// The f16-stable SDXL VAE decoder (`madebyollin/sdxl-vae-fp16-fix`), resident for the run so each
+    /// preview decodes its final latent without a per-cadence reload.
+    vae: AutoEncoderKL,
+}
+
+/// Render one preview image (sc-8650) on the **in-training** UNet — adapters live as eager `Var`s, so
+/// this denoise sees the partially-trained adapter exactly as a train step would. Mirrors the inference
+/// txt2img DDIM path ([`crate::pipeline::Pipeline::render`]'s default branch): seeded launch-portable
+/// noise (the sc-3673 CPU-`StdRng` discipline via [`sample_noise`]), DDIM (eta=0) over
+/// `cfg.sample_steps.max(1)` steps, classifier-free guidance with `cfg.sample_guidance_scale`, then a
+/// VAE decode to `gen_core::Image`. `cond` is the `[uncond, cond]` `[2, 77, 2048]` batch
+/// ([`SamplePreview::conds`]); `(lat_h, lat_w)` are the training latent dims (the cached `x0`'s /8 grid).
+/// Best-effort — any error propagates so the loop logs and skips this preview (never aborts the run).
+#[allow(clippy::too_many_arguments)]
+fn render_one_preview(
+    unet: &UNet2DConditionModel,
+    vae: &AutoEncoderKL,
+    cond: &Tensor,
+    cfg: &TrainingConfig,
+    lat_h: usize,
+    lat_w: usize,
+    compute_dtype: DType,
+    seed: u64,
+    device: &Device,
+) -> Result<gen_core::Image> {
+    let steps = (cfg.sample_steps as usize).max(1);
+    let guidance = cfg.sample_guidance_scale as f64;
+    // CFG fires only above 1.0 (parity with the inference path's `use_guide`); the conditioning is
+    // already the `[uncond, cond]` batch, so a no-CFG preview narrows to the cond row.
+    let use_guide = guidance > 1.0;
+
+    // sc-3673 launch-portable initial noise: N(0,1) from a seeded CPU `StdRng` moved to the device,
+    // then scaled by the scheduler's `init_noise_sigma` — exactly the inference txt2img init.
+    let mut scheduler = DDIMSchedulerConfig::default().build(steps)?;
+    let timesteps = scheduler.timesteps().to_vec();
+    let init = sample_noise(&[1, 4, lat_h, lat_w], seed, device)?;
+    let mut latents = (init * scheduler.init_noise_sigma())?.to_dtype(compute_dtype)?;
+
+    let cond_c = cond.to_dtype(compute_dtype)?;
+    let cond_only = cond_c.narrow(0, 1, 1)?;
+    for &timestep in timesteps.iter() {
+        let model_in = if use_guide {
+            Tensor::cat(&[&latents, &latents], 0)?
+        } else {
+            latents.clone()
+        };
+        let model_in = scheduler.scale_model_input(model_in, timestep)?;
+        let cond_in = if use_guide { &cond_c } else { &cond_only };
+        let noise_pred = unet.forward(&model_in, timestep as f64, cond_in)?;
+        let noise_pred = if use_guide {
+            let chunks = noise_pred.chunk(2, 0)?;
+            let (uncond, cond) = (&chunks[0], &chunks[1]);
+            (uncond + ((cond - uncond)? * guidance)?)?
+        } else {
+            noise_pred
+        };
+        latents = scheduler.step(&noise_pred, timestep, &latents)?;
+    }
+    // The shared decode expects compute-dtype latents (like the inference DDIM loop); un-scale +
+    // `x/2 + 0.5` + clamp + ×255 → RGB8 `Image` lives in `crate::denoise::decode_image`.
+    decode_image(vae, &latents.to_dtype(compute_dtype)?)
 }
 
 /// One micro-step's forward+backward over the installed adapter `Var`s: build the noised latent at
@@ -497,6 +580,34 @@ impl SdxlTrainer {
             let cond = clip.encode(&item.caption)?;
             cache.push((x0, cond));
         }
+
+        // --- preview samples (sc-8650): pre-encode the prompts + load a resident VAE decoder ---
+        // While the dual CLIP is still resident, encode up to SAMPLE_PROMPT_CAP sample prompts into the
+        // CFG batch `[uncond, cond]` (`cat([empty-negative, positive])`, exactly the inference
+        // `text_embeddings` layout) and load the f16 VAE *decoder* (the cache pass only built the moments
+        // *encoder*). `None` when sampling is off, so the no-preview path keeps the prior footprint.
+        let preview: Option<SamplePreview> =
+            if cfg.sample_every > 0 && !cfg.sample_prompts.is_empty() {
+                // The empty-negative conditioning is prompt-independent — encode it once and reuse it
+                // as the CFG `uncond` row for every preview prompt.
+                let uncond = clip.encode("")?;
+                let mut conds = Vec::new();
+                let mut prompts = Vec::new();
+                for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
+                    let cond = clip.encode(prompt)?;
+                    conds.push(Tensor::cat(&[uncond.clone(), cond], 0)?.to_dtype(compute_dtype)?);
+                    prompts.push(prompt.clone());
+                }
+                let vae_decoder = load_sdxl_vae(device, compute_dtype)?;
+                Some(SamplePreview {
+                    conds,
+                    prompts,
+                    vae: vae_decoder,
+                })
+            } else {
+                None
+            };
+
         // Encoders are dead weight once the dataset is cached — drop them before the UNet loads.
         drop(clip);
         drop(vae);
@@ -554,6 +665,13 @@ impl SdxlTrainer {
         let stem = file_stem(&req.file_name).to_string();
 
         // --- train loop ---
+        // Preview latent grid (sc-8650): the cached `x0`'s spatial dims are the exact /8 latent grid the
+        // dataset was encoded at, so a preview denoises at the training resolution (parity with the
+        // bucketed `edge` the cache loop used). Read once from the first cache entry.
+        let (lat_h, lat_w) = {
+            let (_, _, h, w) = cache[0].0.dims4()?;
+            (h, w)
+        };
         let mut accumulated: Option<GradStore> = None;
         let mut update_idx = 0u32;
         let mut last_loss = 0.0f32;
@@ -603,6 +721,43 @@ impl SdxlTrainer {
                 total: cfg.steps,
                 loss: last_loss,
             });
+
+            // Preview samples (sc-8650): at each cadence render every pre-encoded prompt on the live,
+            // partially-trained UNet (adapters are eager `Var`s — the denoise sees the current factors)
+            // and emit a `Sample` event per image. Best-effort: a render error is logged and skipped so
+            // a transient preview failure never aborts the training run.
+            if cfg.sample_every > 0 && step % cfg.sample_every == 0 {
+                if let Some(preview) = &preview {
+                    let total_previews = preview.prompts.len() as u32;
+                    for (i, prompt) in preview.prompts.iter().enumerate() {
+                        let seed = candle_gen::train::flow_match::sample_seed(cfg.seed, step, i);
+                        match render_one_preview(
+                            &unet,
+                            &preview.vae,
+                            &preview.conds[i],
+                            cfg,
+                            lat_h,
+                            lat_w,
+                            compute_dtype,
+                            seed,
+                            device,
+                        ) {
+                            Ok(image) => on_progress(TrainingProgress::Sample {
+                                step,
+                                index: i as u32 + 1,
+                                total: total_previews,
+                                prompt: prompt.clone(),
+                                image,
+                            }),
+                            Err(e) => eprintln!(
+                                "[sc-8650] sdxl: preview sample failed at step {step} \
+                                 (prompt {}): {e} — skipping",
+                                i + 1
+                            ),
+                        }
+                    }
+                }
+            }
 
             if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
                 create_output_dir(&req.output_dir)?;

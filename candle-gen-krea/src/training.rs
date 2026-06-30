@@ -47,29 +47,45 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use candle_gen::candle_core::backprop::GradStore;
-use candle_gen::candle_core::{DType, Device, Tensor, Var};
+use candle_gen::candle_core::{DType, Device, IndexOp, Tensor, Var};
 
+use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
-use candle_gen::gen_core::{self, LoadSpec, Modality, WeightsSource};
+use candle_gen::gen_core::{self, Image, LoadSpec, Modality, Progress, WeightsSource};
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
 use candle_gen::train::flow_match::{
     self, run_flow_match_training, validate_flow_match_request, velocity_loss, FlowMatchTrainer,
+    SamplePlan,
 };
 use candle_gen::train::gradient_checkpoint::checkpointed_backward;
 use candle_gen::train::lora::LoraSet;
 use candle_gen::{CandleError, Result};
 
-use candle_gen_qwen_image::vae::QwenVaeEncoder;
+use candle_gen_qwen_image::vae::{QwenVae, QwenVaeEncoder};
+use rand::{rngs::StdRng, SeedableRng};
+use rand_distr::{Distribution, StandardNormal};
 
 use crate::config::Krea2Config;
 use crate::loader::Weights;
+use crate::schedule::{turbo_sigmas, TURBO_MU};
 use crate::text_encoder::{KreaTeConfig, KreaTextEncoder};
 use crate::tokenizer::KreaTokenizer;
 use crate::train_dit::{KreaTrainDit, KREA_ATTN_TARGETS};
+
+/// VAE spatial downscale (the latent is image/8 per side) and latent channel count — the Turbo
+/// inference constants ([`crate::pipeline`]) the preview-sample render mirrors.
+const SPATIAL_SCALE: u32 = 8;
+const LATENT_CHANNELS: usize = 16;
+
+/// Max preview prompts pre-encoded + rendered per sample cadence (sc-8650). Matches the
+/// `SAMPLE_PROMPT_CAP` the shared preview contract documents.
+const SAMPLE_PROMPT_CAP: usize = 4;
 
 /// Registry id for the trainable Krea 2 **Raw** base (the undistilled 12B checkpoint LoRAs train on),
 /// distinct from the `krea_2_turbo` inference id — mirrors the MLX trainer (sc-7577).
@@ -154,6 +170,55 @@ fn encode_caption(tok: &KreaTokenizer, te: &KreaTextEncoder, caption: &str) -> R
     Ok(enc.squeeze(0)?.to_dtype(DType::F32)?)
 }
 
+/// The Krea preview-sample render state (sc-8650) — everything [`KreaTrainer::render_sample`] needs to
+/// run the family's CFG-free Turbo denoise on the **in-progress** trainable DiT, built once in
+/// [`KreaTrainer::cache`] while the text encoder is still resident:
+///
+///  * `contexts` — the per-prompt pre-encoded Qwen3-VL conditioning, each `(L, num_text_layers,
+///    text_hidden)` at f32 (exactly what [`encode_caption`] returns and [`KreaTrainDit::forward`]
+///    consumes once unsqueezed to a batch axis), 1:1 with [`SamplePlan::prompts`].
+///  * `vae` — the resident Qwen-Image VAE **decoder** (`Arc` as inference holds it); the cache pass
+///    loads only the encoder, so the decoder is loaded here for the preview path.
+///  * `edge` — the square training-resolution edge (`bucket_resolution(cfg.resolution)`, the same edge
+///    the cached latents use) the seeded preview noise is shaped at.
+pub struct KreaSampleState {
+    contexts: Vec<Tensor>,
+    vae: Arc<QwenVae>,
+    edge: u32,
+}
+
+/// Seeded initial Gaussian latent noise `[1, 16, edge/8, edge/8]` (f32) for a preview render — the
+/// training-side twin of [`crate::pipeline`]'s `init_noise`, square at the bucketed training `edge`
+/// (sc-8650). Deterministic launch-portable CPU RNG (sc-3673), mirroring the inference path.
+fn sample_noise_latent(edge: u32, seed: u64, device: &Device) -> Result<Tensor> {
+    let lat = (edge / SPATIAL_SCALE) as usize;
+    let n = LATENT_CHANNELS * lat * lat;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    Ok(Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat, lat), &Device::Cpu)?.to_device(device)?)
+}
+
+/// VAE-decode a final preview latent `[1, 16, H/8, W/8]` → RGB8 [`Image`] — the training-side twin of
+/// [`crate::pipeline`]'s `decode` (`QwenVae::decode` de-normalizes internally and returns `[1, 3, H, W]`
+/// in `[-1, 1]`; the `(x+1)·127.5` is the reference `clamp(-1,1)·0.5 + 0.5` denormalize) (sc-8650).
+fn decode_preview(vae: &QwenVae, lat: &Tensor) -> Result<Image> {
+    let decoded = vae.decode(lat)?.to_dtype(DType::F32)?; // [1, 3, H, W] in [-1, 1]
+    let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
+    let img = img.i(0)?.to_device(&Device::Cpu)?;
+    let (c, h, w) = img.dims3()?;
+    if c != 3 {
+        return Err(CandleError::Msg(format!(
+            "krea: preview decode expected 3 channels, got {c}"
+        )));
+    }
+    let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
+    Ok(Image {
+        width: w as u32,
+        height: h as u32,
+        pixels,
+    })
+}
+
 /// Identity + capabilities of the candle Krea trainer: LoRA + LoKr, `backend = "candle"`.
 pub fn trainer_descriptor() -> TrainerDescriptor {
     TrainerDescriptor {
@@ -223,6 +288,9 @@ impl FlowMatchTrainer for KreaTrainer {
     /// `(x0 latent [1,16,h,w], caption stack (L, num_text_layers, text_hidden))`, both f32.
     type Cached = (Tensor, Tensor);
     type Aux = ();
+    /// Preview-sample render state: per-prompt pre-encoded conditioning + resident VAE decoder + the
+    /// training-resolution edge (sc-8650).
+    type SampleState = KreaSampleState;
     const LABEL: &'static str = LABEL;
 
     fn device(&self) -> &Device {
@@ -238,7 +306,7 @@ impl FlowMatchTrainer for KreaTrainer {
         req: &TrainingRequest,
         device: &Device,
         on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> Result<(Vec<(Tensor, Tensor)>, ())> {
+    ) -> Result<(Vec<(Tensor, Tensor)>, (), SamplePlan<KreaSampleState>)> {
         let edge = bucket_resolution(req.config.resolution);
         let vae_encoder = QwenVaeEncoder::new(flow_match::component_vb(
             &self.root,
@@ -268,10 +336,41 @@ impl FlowMatchTrainer for KreaTrainer {
             let cap = encode_caption(&tokenizer, &text_encoder, &item.caption)?;
             cache.push((x0, cap));
         }
-        // Encoders are dead weight once cached — drop them before the DiT (working set) loads.
+
+        // Preview samples (sc-8650) — while the text encoder is STILL resident, pre-encode up to
+        // `SAMPLE_PROMPT_CAP` of the configured prompts with the same `encode_caption` the cache loop
+        // uses (train/infer conditioning parity), and load a resident VAE *decoder* (the cache pass
+        // loaded only the encoder). The driver renders these from the in-progress adapter each cadence.
+        let sample_plan = if req.config.sample_every > 0 && !req.config.sample_prompts.is_empty() {
+            let prompts: Vec<String> = req
+                .config
+                .sample_prompts
+                .iter()
+                .take(SAMPLE_PROMPT_CAP)
+                .cloned()
+                .collect();
+            let contexts = prompts
+                .iter()
+                .map(|p| encode_caption(&tokenizer, &text_encoder, p))
+                .collect::<Result<Vec<Tensor>>>()?;
+            let vae = Arc::new(crate::vae::load_vae(&self.root, device)?);
+            SamplePlan {
+                prompts,
+                state: Some(KreaSampleState {
+                    contexts,
+                    vae,
+                    edge,
+                }),
+            }
+        } else {
+            SamplePlan::disabled()
+        };
+
+        // Encoders are dead weight once cached + previews pre-encoded — drop them before the DiT
+        // (working set) loads. The resident VAE *decoder* lives on in the sample plan's state.
         drop(text_encoder);
         drop(vae_encoder);
-        Ok((cache, ()))
+        Ok((cache, (), sample_plan))
     }
 
     fn build_dit(&self, req: &TrainingRequest, device: &Device) -> Result<KreaTrainDit> {
@@ -310,6 +409,55 @@ impl FlowMatchTrainer for KreaTrainer {
             flow_match::parse_compute_dtype(&cfg.train_dtype),
             cfg.gradient_checkpointing,
         )
+    }
+
+    /// Render preview prompt `index` from the **in-progress** trainable DiT (sc-8650) — the training-side
+    /// mirror of [`crate::pipeline`]'s CFG-free Turbo `render`. Krea consumes the **raw** velocity at
+    /// timestep `σ` ([`TimestepConvention::Sigma`]), so the denoise closure feeds `dit.forward` the bare
+    /// σ and returns the raw velocity (no negation, no CFG — the TDM-distilled student is guidance-free,
+    /// so `sample_guidance_scale` is ignored). `TrainingConfig` carries no per-run sampler/scheduler
+    /// knob, so the native exponential-`mu` Turbo schedule is used (the byte-exact inference default).
+    /// Best-effort: any error here is logged + skipped by the driver, never aborting the run.
+    fn render_sample(
+        &self,
+        dit: &KreaTrainDit,
+        state: &KreaSampleState,
+        index: usize,
+        cfg: &TrainingConfig,
+        seed: u64,
+    ) -> Result<Image> {
+        let device = &self.device;
+        let steps = (cfg.sample_steps.max(1)) as usize;
+        // Native exponential-mu Turbo sigmas — the byte-exact default; `None` scheduler (no per-run knob
+        // on `TrainingConfig`) resolves to the native schedule.
+        let sigmas =
+            candle_gen::resolve_flow_schedule(None, TURBO_MU as f32, steps, &turbo_sigmas(steps));
+
+        let noise = sample_noise_latent(state.edge, seed, device)?;
+        // The DiT's `text_fusion` consumes a batched `(1, L, n, d)` context — the cached
+        // `encode_caption` output is `(L, n, d)`, so unsqueeze the batch axis exactly as
+        // `compute_loss_grads` does before its own forward.
+        let context = state.contexts[index].unsqueeze(0)?;
+
+        // A preview need not honor cancel mid-denoise — a fresh never-cancel flag (the trainer's
+        // `req.cancel` is only available in `cache`, not here).
+        let cancel = CancelFlag::new();
+        let mut on_progress = |_: Progress| {};
+        let lat = candle_gen::run_flow_sampler(
+            None,
+            TimestepConvention::Sigma,
+            &sigmas,
+            noise,
+            seed,
+            &cancel,
+            &mut on_progress,
+            |x, timestep| -> Result<Tensor> {
+                let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+                let v = dit.forward(x, &t, &context)?;
+                Ok(v.to_dtype(DType::F32)?)
+            },
+        )?;
+        decode_preview(&state.vae, &lat)
     }
 
     /// Stamp `baseModel`/`family` provenance into the adapter header so the Turbo cross-apply policy

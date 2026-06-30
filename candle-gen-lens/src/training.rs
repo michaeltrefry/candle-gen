@@ -38,26 +38,37 @@
 //! once — the Wan lesson). Adapter factors / loss / grads / optimizer state stay f32 (master weights);
 //! the frozen base + activation stream follow `train_dtype` (bf16 default).
 
-use candle_gen::candle_core::backprop::GradStore;
-use candle_gen::candle_core::{DType, Device, Tensor, Var};
+use std::sync::Arc;
 
+use candle_gen::candle_core::backprop::GradStore;
+use candle_gen::candle_core::{DType, Device, IndexOp, Tensor, Var};
+
+use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
-use candle_gen::gen_core::{self, LoadSpec, Modality, WeightsSource};
+use candle_gen::gen_core::{self, CancelFlag, Image, LoadSpec, Modality, Progress, WeightsSource};
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
 use candle_gen::train::flow_match::{
     self, run_flow_match_training, validate_flow_match_request, velocity_loss, FlowMatchTrainer,
+    SamplePlan,
 };
 use candle_gen::train::gradient_checkpoint::checkpointed_backward;
 use candle_gen::{CandleError, Result};
+use rand::{rngs::StdRng, SeedableRng};
+use rand_distr::{Distribution, StandardNormal};
 
 use crate::dit_train::{LensTransformerTrain, LENS_ATTN_TARGETS};
+use crate::schedule::{cfg_rescale, lens_mu, lens_sigmas};
 use crate::text::{LensTokenizer, TXT_OFFSET};
 use crate::text_encoder::{Config as EncoderConfig, GptOssTextEncoder, DEFAULT_SELECTED_LAYERS};
 use crate::transformer::LensDitConfig;
-use crate::vae::{encode as vae_encode, Flux2Vae};
-use crate::{DEFAULT_DATE, MODEL_ID_BASE};
+use crate::vae::{decode as vae_decode, encode as vae_encode, Flux2Vae};
+use crate::{DEFAULT_DATE, MODEL_ID_BASE, VAE_SCALE_FACTOR};
+
+/// Per-cadence preview-prompt cap (the shared `SAMPLE_PROMPT_CAP` the sc-8650 contract documents) — at
+/// most this many of `cfg.sample_prompts` are pre-encoded + rendered each sample cadence.
+const SAMPLE_PROMPT_CAP: usize = 4;
 
 /// Error-message prefix shared by [`validate_flow_match_request`] and the driver's `no usable dataset
 /// items` guard.
@@ -159,6 +170,100 @@ fn encode_caption(
         .collect()
 }
 
+/// The joint **CFG** conditioning for one preview prompt (sc-8650), assembled in `LensTrainer::cache`
+/// while the gpt-oss encoder is still resident: each feature layer is `[2, S, 2880]` (`[pos; neg]`) and
+/// the shared mask is `[2, S]` (`1` = valid). This is the *exact* shape the inference `Pipeline::denoise`
+/// feeds the DiT — the trainable [`LensTransformerTrain::forward`] takes the same
+/// `(&[Tensor] feats, Some(&mask))` pair, so the preview path is byte-for-byte the inference CFG batch.
+struct LensPromptCond {
+    /// Per-layer joint features `[2, S, 2880]` (`[pos; neg]`), `num_text_layers` of them.
+    features: Vec<Tensor>,
+    /// The joint valid mask `[2, S]` (`1` = valid token).
+    mask: Tensor,
+}
+
+/// The Lens preview-sample render state (sc-8650) — everything the trainer's `render_sample` needs to
+/// run the family's **CFG** denoise on the **in-progress** trainable DiT, built once in the trainer's
+/// `cache` while the gpt-oss text encoder is still resident:
+///
+///  * `conds` — the per-prompt joint CFG conditioning (positive + the shared empty-negative
+///    unconditional branch), 1:1 with [`SamplePlan::prompts`]. Encoded with the same
+///    [`encode_caption`] the cache loop uses (train/infer conditioning parity), then assembled into the
+///    `[2, S, 2880]` / `[2, S]` joint batch exactly like the inference `Pipeline::encode_prompt`.
+///  * `vae` — the resident [`Flux2Vae`] **decoder** (`Arc` as inference holds it); the cache pass loads
+///    only the encoder, so the decoder is loaded here for the preview path.
+///  * `latent_h` / `latent_w` — the packed latent grid (`edge / 16`) the seeded preview noise + the DiT
+///    forward are shaped at — the same square `bucket_resolution(cfg.resolution)` edge the cached
+///    latents use.
+pub struct LensSampleState {
+    conds: Vec<LensPromptCond>,
+    vae: Arc<Flux2Vae>,
+    latent_h: usize,
+    latent_w: usize,
+}
+
+/// Build the joint CFG conditioning for one preview `prompt` from the resident encoder (sc-8650): encode
+/// the positive features with [`encode_caption`], take an **empty negative** (the unconditional branch =
+/// zero features + an all-zero mask, never a second encode — exactly the inference
+/// `Pipeline::encode_prompt` empty-negative path), and `cat([pos; neg], 0)` into the
+/// `[2, S, 2880]` / `[2, S]` joint batch.
+fn encode_prompt_cond(
+    tokenizer: &LensTokenizer,
+    encoder: &GptOssTextEncoder,
+    prompt: &str,
+    device: &Device,
+) -> Result<LensPromptCond> {
+    let pos_feats = encode_caption(tokenizer, encoder, prompt, device)?;
+    let s = pos_feats[0].dim(1)?;
+    // Empty negative = the unconditional branch: zero text features + an all-zero mask (no text
+    // tokens), padded to the positive length (a single preview prompt is unpadded, so pos == neg == s).
+    let pos_mask = Tensor::ones((1, s), DType::F32, device)?;
+    let neg_mask = Tensor::zeros((1, s), DType::F32, device)?;
+    let mut features = Vec::with_capacity(pos_feats.len());
+    for pf in &pos_feats {
+        let nf = pf.zeros_like()?;
+        features.push(Tensor::cat(&[pf, &nf], 0)?);
+    }
+    let mask = Tensor::cat(&[&pos_mask, &neg_mask], 0)?;
+    Ok(LensPromptCond { features, mask })
+}
+
+/// Deterministic packed initial noise `[1, latent_h·latent_w, 128]` for a preview render (sc-8650) — the
+/// training-side twin of the inference `create_noise`: N(0,1) from a fixed CPU RNG (launch-portable, NOT
+/// candle's CUDA `randn`, sc-3673), then moved to `device`.
+fn sample_noise_latent(
+    latent_h: usize,
+    latent_w: usize,
+    seed: u64,
+    device: &Device,
+) -> Result<Tensor> {
+    let seq = latent_h * latent_w;
+    let n = seq * 128;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    Ok(Tensor::from_vec(data, (1, seq, 128), &Device::Cpu)?.to_device(device)?)
+}
+
+/// VAE-decode a final preview latent `[1, h·w, 128]` → RGB8 [`Image`] (sc-8650) — the training-side twin
+/// of the inference `to_image` composed with [`crate::vae::decode`] (`(x.clamp(-1,1)+1)·127.5`).
+fn decode_preview(vae: &Flux2Vae, lat: &Tensor, latent_h: usize, latent_w: usize) -> Result<Image> {
+    let decoded = vae_decode(vae, lat, latent_h, latent_w)?; // [1, 3, H, W] in [-1, 1]
+    let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
+    let img = img.i(0)?.to_device(&Device::Cpu)?;
+    let (c, h, w) = img.dims3()?;
+    if c != 3 {
+        return Err(CandleError::Msg(format!(
+            "lens: preview decode expected 3 channels, got {c}"
+        )));
+    }
+    let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
+    Ok(Image {
+        width: w as u32,
+        height: h as u32,
+        pixels,
+    })
+}
+
 /// Identity + capabilities of the candle Lens trainer: LoRA + LoKr, `backend = "candle"`.
 pub fn trainer_descriptor() -> TrainerDescriptor {
     TrainerDescriptor {
@@ -227,6 +332,9 @@ impl FlowMatchTrainer for LensTrainer {
     type Cached = (Tensor, Vec<Tensor>);
     /// The (constant, per-resolution) latent grid `(lat_h, lat_w)`.
     type Aux = (usize, usize);
+    /// Preview-sample render state: per-prompt joint CFG conditioning + resident VAE decoder + the
+    /// preview latent grid (sc-8650).
+    type SampleState = LensSampleState;
     const LABEL: &'static str = LABEL;
 
     fn device(&self) -> &Device {
@@ -242,7 +350,11 @@ impl FlowMatchTrainer for LensTrainer {
         req: &TrainingRequest,
         device: &Device,
         on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> Result<(Vec<(Tensor, Vec<Tensor>)>, (usize, usize))> {
+    ) -> Result<(
+        Vec<(Tensor, Vec<Tensor>)>,
+        (usize, usize),
+        SamplePlan<LensSampleState>,
+    )> {
         let edge = bucket_resolution(req.config.resolution);
         let tokenizer =
             LensTokenizer::from_file(self.root.join("tokenizer").join("tokenizer.json"))?;
@@ -276,11 +388,56 @@ impl FlowMatchTrainer for LensTrainer {
             grid.get_or_insert((lh, lw));
             cache.push((x0, feats));
         }
+
+        // Preview samples (sc-8650) — while the gpt-oss encoder is STILL resident, pre-encode up to
+        // `SAMPLE_PROMPT_CAP` of the configured prompts into the joint CFG batch (positive + the shared
+        // empty-negative unconditional branch), using the same `encode_caption` the cache loop uses
+        // (train/infer conditioning parity), and load a resident `Flux2Vae` *decoder* (the cache pass
+        // built an encoder-only VAE). The previews render at the same square `bucket_resolution`
+        // edge the cached latents use (`edge / 16` packed grid). The driver renders these from the
+        // in-progress adapter each cadence.
+        let sample_plan = if req.config.sample_every > 0 && !req.config.sample_prompts.is_empty() {
+            let lat = (edge / VAE_SCALE_FACTOR) as usize;
+            let prompts: Vec<String> = req
+                .config
+                .sample_prompts
+                .iter()
+                .take(SAMPLE_PROMPT_CAP)
+                .cloned()
+                .collect();
+            let conds = prompts
+                .iter()
+                .map(|p| encode_prompt_cond(&tokenizer, &encoder, p, device))
+                .collect::<Result<Vec<LensPromptCond>>>()?;
+            // The cache VAE is encoder-only; load a fresh decoder-capable `Flux2Vae` for the preview
+            // decode path (f32, matching inference).
+            let vae_decoder = Flux2Vae::new(flow_match::component_vb(
+                &self.root,
+                "vae",
+                device,
+                DType::F32,
+                LABEL,
+            )?)?;
+            SamplePlan {
+                prompts,
+                state: Some(LensSampleState {
+                    conds,
+                    vae: Arc::new(vae_decoder),
+                    latent_h: lat,
+                    latent_w: lat,
+                }),
+            }
+        } else {
+            SamplePlan::disabled()
+        };
+
+        // The encoders are dead weight once cached + previews pre-encoded — drop them before the DiT
+        // (working set) loads. The resident VAE *decoder* lives on in the sample plan's state.
         drop(encoder);
         drop(vae);
         // The grid is set on the first cached item; `(0, 0)` is a placeholder for an empty cache (the
         // driver maps that to `Canceled`/error before any step reads the aux).
-        Ok((cache, grid.unwrap_or((0, 0))))
+        Ok((cache, grid.unwrap_or((0, 0)), sample_plan))
     }
 
     fn build_dit(&self, req: &TrainingRequest, device: &Device) -> Result<LensTransformerTrain> {
@@ -325,6 +482,80 @@ impl FlowMatchTrainer for LensTrainer {
             flow_match::parse_compute_dtype(&cfg.train_dtype),
             true,
         )
+    }
+
+    /// Render preview prompt `index` from the **in-progress** trainable DiT (sc-8650) — the training-side
+    /// mirror of the inference `Pipeline::render`/`Pipeline::denoise`. Lens is a **standard-guidance
+    /// (CFG) family**, so the denoise closure runs the joint `[2, …]` batch (`cat([x, x], 0)`, the
+    /// cond/uncond branches share `x_t`), one [`LensTransformerTrain::forward`] over the pre-encoded
+    /// `[2, S, 2880]` features + `[2, S]` mask, and norm-rescaled [`cfg_rescale`] at
+    /// `cfg.sample_guidance_scale`. Lens consumes the **raw** velocity at the *shifted sigma* timestep
+    /// ([`TimestepConvention::Sigma`] — the σ is fed to the DiT directly), so the closure passes the bare
+    /// σ as `timestep` and returns the guided velocity (no negation). `TrainingConfig` carries no per-run
+    /// sampler/scheduler knob, so the native empirical-μ flow-match schedule is used (the byte-exact
+    /// inference default — `None` sampler/scheduler resolve to euler over the native sigmas). Best-effort:
+    /// any error here is logged + skipped by the driver, never aborting the run.
+    fn render_sample(
+        &self,
+        dit: &LensTransformerTrain,
+        state: &LensSampleState,
+        index: usize,
+        cfg: &TrainingConfig,
+        seed: u64,
+    ) -> Result<Image> {
+        let device = &self.device;
+        let steps = (cfg.sample_steps.max(1)) as usize;
+        let guidance = cfg.sample_guidance_scale;
+        let (latent_h, latent_w) = (state.latent_h, state.latent_w);
+        let cond = &state.conds[index];
+
+        // Native empirical-μ flow-match sigmas — the byte-exact inference default; `None` scheduler (no
+        // per-run knob on `TrainingConfig`) resolves to the native schedule, `None` sampler to euler.
+        let mu = lens_mu(steps, latent_h, latent_w);
+        let native = lens_sigmas(steps, latent_h, latent_w);
+        let sigmas = candle_gen::resolve_flow_schedule(None, mu, steps, &native);
+
+        // Run the denoise loop in the DiT's compute dtype, exactly like inference (`init.to_dtype(
+        // DIT_DTYPE)` then a bf16 loop) — the sampler's `x + v·dt` update needs the latent + the
+        // closure's velocity to share a dtype, so the closure returns the velocity in the loop dtype
+        // (no F32 cast) just as `Pipeline::denoise` does.
+        let loop_dtype = flow_match::parse_compute_dtype(&cfg.train_dtype);
+        let noise = sample_noise_latent(latent_h, latent_w, seed, device)?.to_dtype(loop_dtype)?;
+        // The joint CFG features are cached f32 (portable); the DiT forward (like the train micro-step,
+        // which casts feats to `compute_dtype`) needs them in the loop dtype — cast once up front.
+        let feats: Vec<Tensor> = cond
+            .features
+            .iter()
+            .map(|f| f.to_dtype(loop_dtype))
+            .collect::<candle_gen::candle_core::Result<_>>()?;
+        let mask = &cond.mask;
+
+        // A preview need not honor cancel mid-denoise — a fresh never-cancel flag (the trainer's
+        // `req.cancel` is only available in `cache`, not here).
+        let cancel = CancelFlag::new();
+        let mut on_progress = |_: Progress| {};
+        let lat = candle_gen::run_flow_sampler(
+            None,
+            TimestepConvention::Sigma,
+            &sigmas,
+            noise,
+            seed,
+            &cancel,
+            &mut on_progress,
+            |latents, sigma| -> Result<Tensor> {
+                // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call over the
+                // pre-encoded `[2, S, 2880]` features + `[2, S]` mask (frame = 1).
+                let hidden = Tensor::cat(&[latents, latents], 0)?; // [2, seq, 128]
+                let velocity =
+                    dit.forward(&hidden, &feats, Some(mask), sigma, 1, latent_h, latent_w)?;
+                let pos = velocity.narrow(0, 0, 1)?;
+                let neg = velocity.narrow(0, 1, 1)?;
+                // `cfg_rescale` preserves the input dtype, so the guided velocity matches the loop
+                // latent — no cast (mirrors `Pipeline::denoise`, which returns it directly).
+                Ok(cfg_rescale(&pos, &neg, guidance)?)
+            },
+        )?;
+        decode_preview(&state.vae, &lat, latent_h, latent_w)
     }
 }
 
