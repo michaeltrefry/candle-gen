@@ -702,6 +702,184 @@ impl QwenControlNet {
     }
 }
 
+/// The Qwen-Image **2512-Fun-Controlnet-Union** VACE control branch (sc-8350) — the candle port of the
+/// alibaba-pai `Qwen-Image-2512-Fun-Controlnet-Union` `QwenImageControlTransformer2DModel` (the
+/// `VideoX-Fun` VACE family, the same shape as the FLUX.2 / Z-Image Fun-Controlnet-Union branches),
+/// which **replaces** the InstantX [`QwenControlNet`] shape on the Qwen control path.
+///
+/// Unlike the InstantX ControlNet (an independent mini-transformer with a zero-init
+/// `controlnet_x_embedder` ADDed onto `img_in(x)`, emitting per-block residuals the base ADDs at a
+/// fixed interval), the 2512-Fun branch is **VACE-style**: a `control_img_in` patch embedder
+/// (`132 → inner`) feeds a control state `c` threaded through `N` control blocks that reuse the base
+/// [`Block`] math (and the base modulation / RoPE / timestep), seeded at block 0 by
+/// `c = before_proj(c) + img_embed`. Each control block emits a hint via a zero-init `after_proj`; the
+/// base transformer adds `hints[n]·control_scale` into its image stream **after** the base block at
+/// `control_layers[n]` (`[0, 12, 24, 36, 48]` — 5 hints across the 60-layer MMDiT). `control_scale = 0`
+/// is byte-identical to the base forward (`+0`).
+///
+/// The control blocks are the *same* [`Block`] as the base (identical on-disk keys), so the loader
+/// reuses [`Block::new`].
+pub struct QwenFunControlBranch {
+    /// `control_img_in`: 132 → inner. Biased patch embedder for the packed 132-ch control context.
+    control_img_in: Linear,
+    /// The `N` control blocks (same math as the base dual-stream block; reuse the base RoPE / temb).
+    blocks: Vec<Block>,
+    /// Zero-init per-block hint projection (`inner → inner`), one per control block (`after_proj`).
+    after_proj: Vec<Linear>,
+    /// Zero-init `before_proj` on control block 0 (`inner → inner`): `c = before_proj(c) + img_embed`.
+    before_proj: Linear,
+    /// Base block indices each control hint injects into (`control_layers`); `places[n]` is the base
+    /// index for hint `n`.
+    places: Vec<usize>,
+}
+
+impl QwenFunControlBranch {
+    /// Load from the 2512-Fun checkpoint. `control_layers` must contain `0` (`before_proj` lives on
+    /// control block 0). Keys: `control_img_in.{weight,bias}`, `control_blocks.{i}.*` (a base block +
+    /// `after_proj` for every `i`, plus `before_proj` on `i == 0`).
+    pub fn new(
+        cfg: &TransformerConfig,
+        control_layers: &[usize],
+        control_in_dim: usize,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let inner = cfg.inner_dim();
+        let n = control_layers.len();
+        let mut blocks = Vec::with_capacity(n);
+        let mut after_proj = Vec::with_capacity(n);
+        for i in 0..n {
+            let blk = vb.pp("control_blocks").pp(i);
+            blocks.push(Block::new(cfg, blk.clone())?);
+            after_proj.push(linear(inner, inner, blk.pp("after_proj"))?);
+        }
+        Ok(Self {
+            control_img_in: linear(control_in_dim, inner, vb.pp("control_img_in"))?,
+            before_proj: linear(
+                inner,
+                inner,
+                vb.pp("control_blocks").pp(0).pp("before_proj"),
+            )?,
+            blocks,
+            after_proj,
+            places: control_layers.to_vec(),
+        })
+    }
+
+    /// Number of control hints (= control layers); drives the base injection sites.
+    pub fn num_hints(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// The hint index injected at base block `idx`, or `None`. Mirrors the fork's
+    /// `control_layers_mapping`.
+    pub fn hint_index(&self, idx: usize) -> Option<usize> {
+        self.places.iter().position(|&p| p == idx)
+    }
+
+    /// Run the VACE control stack → the per-block hints (pre-scale), one per control layer. The fork's
+    /// `forward_control`: `c = control_img_in(control_context)`; block 0 seeds
+    /// `c = before_proj(c) + img_embed`; each control block runs the *base* block math (reusing the base
+    /// modulation / RoPE / timestep) and threads its own text stream to the next; `hint[i] =
+    /// after_proj(c_after_block_i)`. The threaded text is local to the control stack — only the
+    /// image-stream hints leave.
+    #[allow(clippy::too_many_arguments)]
+    fn forward(
+        &self,
+        img_embed: &Tensor,
+        encoder_embed: &Tensor,
+        control_context: &Tensor,
+        temb: &Tensor,
+        img_cos: &Tensor,
+        img_sin: &Tensor,
+        txt_cos: &Tensor,
+        txt_sin: &Tensor,
+    ) -> Result<Vec<Tensor>> {
+        // c = control_img_in(control_context); seed block 0 with `before_proj(c) + img_embed`.
+        let c0 = self.control_img_in.forward(control_context)?;
+        let mut c = (self.before_proj.forward(&c0)? + img_embed)?;
+        let mut encoder = encoder_embed.clone();
+        let mut hints = Vec::with_capacity(self.blocks.len());
+        for (block, ap) in self.blocks.iter().zip(&self.after_proj) {
+            let (e, new_c) =
+                block.forward(&c, &encoder, temb, img_cos, img_sin, txt_cos, txt_sin, None)?;
+            encoder = e;
+            // hint[i] = after_proj(c_after_block_i) (zero-init projection; the fork's `c_skip`).
+            hints.push(ap.forward(&new_c)?);
+            c = new_c;
+        }
+        Ok(hints)
+    }
+}
+
+impl QwenTransformer {
+    /// [`forward`](Self::forward) with the **2512-Fun-Controlnet-Union** VACE control branch (sc-8350).
+    /// Identical to the T2I forward, plus: the control branch's per-block hints are computed once from
+    /// the post-embedder image + text streams (reusing the base modulation / RoPE / timestep), and after
+    /// base block `control_layers[n]` the hint `hints[n]·control_scale` is added to the image stream —
+    /// the fork's `QwenImageControlTransformer2DModel.forward`. `control = None` is **byte-identical** to
+    /// the plain forward, as is `control_scale = 0` (the zero-init `after_proj` + `+0` injection).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_fun_control(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        timestep: f32,
+        lat_h: usize,
+        lat_w: usize,
+        control: Option<(&QwenFunControlBranch, &Tensor)>,
+        control_scale: f32,
+    ) -> Result<Tensor> {
+        let temb = self
+            .time_embed
+            .forward(timestep, &self.device, self.dtype)?;
+        let mut hidden = self.img_in.forward(hidden_states)?;
+        let encoder = self.txt_norm.forward(encoder_hidden_states)?;
+        let mut encoder = self.txt_in.forward(&encoder)?;
+
+        let txt_seq = encoder.dim(1)?;
+        let (img_cos, img_sin) = self.rope.img_cos_sin(lat_h, lat_w, &self.device)?;
+        let (txt_cos, txt_sin) = self.rope.txt_cos_sin(txt_seq, lat_h, lat_w, &self.device)?;
+
+        // VACE control hints (sc-8350): computed once from the post-embedder image + text streams,
+        // before the base block loop (the fork's `forward_control`), then injected per block. The hints
+        // are pre-scaled by `control_scale` once (the scalar is the same across all hints and blocks);
+        // `control = None` or `control_scale = 0` → no injection (byte-identical base).
+        let scaled_hints: Option<Vec<Tensor>> = match control {
+            Some((branch, cc)) => {
+                let hints = branch.forward(
+                    &hidden, &encoder, cc, &temb, &img_cos, &img_sin, &txt_cos, &txt_sin,
+                )?;
+                Some(
+                    hints
+                        .iter()
+                        .map(|h| h * control_scale as f64)
+                        .collect::<Result<Vec<_>>>()?,
+                )
+            }
+            None => None,
+        };
+
+        for (i, block) in self.blocks.iter().enumerate() {
+            let (e, h) = block.forward(
+                &hidden, &encoder, &temb, &img_cos, &img_sin, &txt_cos, &txt_sin, None,
+            )?;
+            encoder = e;
+            // After base block `i`, add the pre-scaled hint for this block (if `i` is a control layer) —
+            // the fork's `hidden_states = hidden_states + hints[block_id] * context_scale`.
+            hidden = match (&scaled_hints, control) {
+                (Some(hints), Some((branch, _))) => match branch.hint_index(i) {
+                    Some(n) => (h + &hints[n])?,
+                    None => h,
+                },
+                _ => h,
+            };
+        }
+
+        let hidden = self.norm_out.forward(&hidden, &temb)?;
+        self.proj_out.forward(&hidden)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,5 +905,164 @@ mod tests {
                 "chunked attention diverged: {x} vs {y}"
             );
         }
+    }
+
+    use candle_gen::candle_nn::var_builder::SimpleBackend;
+    use std::sync::Mutex;
+
+    /// A deterministic random [`SimpleBackend`] for the no-weights control tests: returns a small
+    /// reproducible normal tensor of the requested shape for any key (a fresh seeded RNG per
+    /// `VarBuilder`, advanced per `get` so distinct keys get distinct — but reproducible — tensors).
+    /// `Mutex` (not `RefCell`) because `SimpleBackend: Send + Sync`.
+    struct RandomBackend {
+        rng: Mutex<rand::rngs::StdRng>,
+    }
+
+    impl RandomBackend {
+        fn new(seed: u64) -> Self {
+            use rand::SeedableRng;
+            Self {
+                rng: Mutex::new(rand::rngs::StdRng::seed_from_u64(seed)),
+            }
+        }
+    }
+
+    impl SimpleBackend for RandomBackend {
+        fn get(
+            &self,
+            s: candle_gen::candle_core::Shape,
+            _name: &str,
+            _h: candle_gen::candle_nn::Init,
+            dtype: DType,
+            dev: &Device,
+        ) -> candle_gen::candle_core::Result<Tensor> {
+            use rand_distr::{Distribution, StandardNormal};
+            let n: usize = s.elem_count();
+            let mut rng = self.rng.lock().unwrap();
+            // Small magnitude keeps the tiny DiT numerically sane (and norm-out + RMSNorm stable).
+            let data: Vec<f32> = (0..n)
+                .map(|_| {
+                    let v: f32 = StandardNormal.sample(&mut *rng);
+                    0.05f32 * v
+                })
+                .collect();
+            Tensor::from_vec(data, s, dev)?.to_dtype(dtype)
+        }
+
+        fn get_unchecked(
+            &self,
+            _name: &str,
+            _dtype: DType,
+            _dev: &Device,
+        ) -> candle_gen::candle_core::Result<Tensor> {
+            candle_gen::candle_core::bail!("RandomBackend requires a shape; use get")
+        }
+
+        fn contains_tensor(&self, _name: &str) -> bool {
+            true
+        }
+    }
+
+    /// A tiny Qwen config (4 base blocks, 2 heads × 8) for the no-weights control wiring tests.
+    fn tiny_cfg() -> TransformerConfig {
+        TransformerConfig {
+            in_channels: 8,
+            out_channels: 2,
+            num_layers: 4,
+            num_heads: 2,
+            head_dim: 8,
+            joint_attention_dim: 12,
+            timestep_channels: 16,
+            axes_dim: [2, 3, 3],
+            rope_theta: 10_000.0,
+            eps: 1e-6,
+        }
+    }
+
+    fn random_vb(seed: u64) -> VarBuilder<'static> {
+        VarBuilder::from_backend(Box::new(RandomBackend::new(seed)), DType::F32, Device::Cpu)
+    }
+
+    /// scale=0 (and `control = None`) reproduce the plain base forward **byte-exact** — the zero-init
+    /// `after_proj` plus the `+0` injection means the control branch contributes nothing. This is the
+    /// load-bearing parity guarantee (the base T2I/Edit path is untouched by the new lane).
+    #[test]
+    fn fun_control_scale_zero_is_byte_exact_base() {
+        let cfg = tiny_cfg();
+        let dev = Device::Cpu;
+        // Base transformer + a 2512-Fun control branch (2 control layers for the tiny model) from
+        // independent random backends.
+        let transformer = QwenTransformer::new(&cfg, random_vb(1)).unwrap();
+        let control_layers = [0usize, 2];
+        let control_in_dim = 132; // the real packed control-context width (independent of the tiny DiT)
+        let branch =
+            QwenFunControlBranch::new(&cfg, &control_layers, control_in_dim, random_vb(2)).unwrap();
+
+        let (lat_h, lat_w) = (2usize, 3usize);
+        let seq = lat_h * lat_w;
+        let txt_seq = 5usize;
+        let hidden = Tensor::randn(0f32, 1f32, (1, seq, cfg.in_channels), &dev).unwrap();
+        let encoder =
+            Tensor::randn(0f32, 1f32, (1, txt_seq, cfg.joint_attention_dim), &dev).unwrap();
+        let control_cond = Tensor::randn(0f32, 1f32, (1, seq, control_in_dim), &dev).unwrap();
+        let sigma = 0.7f32;
+
+        let base = transformer
+            .forward(&hidden, &encoder, sigma, lat_h, lat_w)
+            .unwrap();
+
+        // control = None ≡ base.
+        let none = transformer
+            .forward_fun_control(&hidden, &encoder, sigma, lat_h, lat_w, None, 0.0)
+            .unwrap();
+        // control = Some(branch) with scale 0 ≡ base (the injection is `+ hint·0`).
+        let scaled0 = transformer
+            .forward_fun_control(
+                &hidden,
+                &encoder,
+                sigma,
+                lat_h,
+                lat_w,
+                Some((&branch, &control_cond)),
+                0.0,
+            )
+            .unwrap();
+
+        let b = base.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let n = none.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let z = scaled0.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(b, n, "control=None must be byte-exact base");
+        assert_eq!(b, z, "control_scale=0 must be byte-exact base");
+
+        // And a non-zero scale actually changes the output (the lane is wired, not inert).
+        let scaled1 = transformer
+            .forward_fun_control(
+                &hidden,
+                &encoder,
+                sigma,
+                lat_h,
+                lat_w,
+                Some((&branch, &control_cond)),
+                1.0,
+            )
+            .unwrap();
+        let s1 = scaled1.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            b.iter().zip(&s1).any(|(x, y)| (x - y).abs() > 1e-6),
+            "control_scale=1 must change the output (branch must be wired)"
+        );
+    }
+
+    /// The branch wiring: 2 control layers → 2 hints, injected at base blocks `[0, 2]` (and only there).
+    #[test]
+    fn fun_control_branch_hint_wiring() {
+        let cfg = tiny_cfg();
+        let control_layers = [0usize, 2];
+        let branch = QwenFunControlBranch::new(&cfg, &control_layers, 132, random_vb(3)).unwrap();
+        assert_eq!(branch.num_hints(), 2);
+        assert_eq!(branch.hint_index(0), Some(0));
+        assert_eq!(branch.hint_index(2), Some(1));
+        assert_eq!(branch.hint_index(1), None);
+        assert_eq!(branch.hint_index(3), None);
     }
 }
