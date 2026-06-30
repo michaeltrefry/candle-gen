@@ -62,9 +62,10 @@ impl TransformerConfig {
     /// architecturally identical to the original `Qwen/Qwen-Image`: the same 60-layer dual-stream
     /// MMDiT, the same 24×128 head geometry, the same 3-axis RoPE, and the same Qwen2.5-VL text
     /// width. Only the trained weights differ, so the config is a verbatim drop-in. We expose it as a
-    /// distinct named constructor so the parity is explicit and test-pinned (mirroring mlx, where
-    /// `qwenimage-2512` aliases `qwenimage`), and so the upcoming 2512-Fun control overlay (sc-8350)
-    /// has a named base config to reference.
+    /// distinct named constructor so the parity is explicit and test-pinned. (There is no mlx
+    /// registry alias; parity rides the worker-side 2512 base-default plus the shared
+    /// `DERIVED_TOKENIZER_OVERLAYS` `Qwen/Qwen-Image-2512` → `SceneWorks/qwen-image-tokenizer`
+    /// entry — sc-8271.) It also gives the 2512-Fun control overlay (sc-8350) a named base config.
     pub fn qwen_image_2512() -> Self {
         Self::qwen_image()
     }

@@ -62,6 +62,44 @@ pub fn pack_latents(latent: &Tensor, width: u32, height: u32) -> Result<Tensor> 
         .reshape((1, lat_h * lat_w, c * p * p))
 }
 
+/// Pack an arbitrary-channel latent `[1, C, H/8, W/8]` → `[1, seq, C·4]` (the same 2×2 patchify as
+/// [`pack_latents`], but channel-generic). Used to build the **2512-Fun** control context
+/// `[1, 33, H/8, W/8]` → `[1, seq, 132]` (sc-8350) — [`pack_latents`] is hardwired to `C = 16`.
+pub fn pack_channels(latent: &Tensor, channels: usize, width: u32, height: u32) -> Result<Tensor> {
+    let (lat_h, lat_w) = latent_dims(width, height);
+    let c = channels;
+    let p = PATCH;
+    latent
+        .reshape((1, c, lat_h, p, lat_w, p))?
+        .permute((0, 2, 4, 1, 3, 5))?
+        .contiguous()?
+        .reshape((1, lat_h * lat_w, c * p * p))
+}
+
+/// Build the packed **2512-Fun** control context `[1, seq, 132]` from a VAE-encoded control latent —
+/// the fork's `pipeline_qwenimage_control._prepare`: the 16-ch control latent concatenated (on the
+/// channel axis) with a 1-channel mask and a 16-channel inpaint latent, then 2×2-packed
+/// (`33 · 4 = 132 = control_in_dim`). v1 is **pose/canny/depth-only** (no inpaint image / mask), where
+/// the fork's `1 − ones` mask is `0` and the inpaint latent is `0`, so the layout reduces to
+/// `[control_latent | 0(1) | 0(16)]`. Input-agnostic: the kind (pose/canny/depth) is just which
+/// preprocessed image was VAE-encoded — no per-kind branch. The result is constant across denoise
+/// steps + the batch.
+pub fn pack_fun_control_context(
+    control_latent: &Tensor,
+    width: u32,
+    height: u32,
+) -> Result<Tensor> {
+    let (l8h, l8w) = ((height / 8) as usize, (width / 8) as usize);
+    let dt = control_latent.dtype();
+    let dev = control_latent.device();
+    // Pose/canny/depth-only: zero mask (1ch) + zero inpaint latent (16ch). Concatenated on the channel
+    // axis → 33 channels, then 2×2-packed → 132.
+    let mask = Tensor::zeros((1, 1, l8h, l8w), dt, dev)?;
+    let inpaint = Tensor::zeros((1, LATENT_CHANNELS, l8h, l8w), dt, dev)?;
+    let ctx = Tensor::cat(&[control_latent, &mask, &inpaint], 1)?; // [1, 33, H/8, W/8]
+    pack_channels(&ctx, LATENT_CHANNELS * 2 + 1, width, height)
+}
+
 /// The image-area-driven flow-match shift `μ` (the production [`qwen_sigmas`] axis): the fork's
 /// `qwen_scheduler` linear fit `μ = m·(W·H/256) + b` between the base/max shift endpoints. Exposed so
 /// the unified curated scheduler axis (epic 7114 P4, sc-7123) can warp an alternative schedule by the
