@@ -44,11 +44,13 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::backprop::GradStore;
 use candle_gen::candle_core::{DType, Device, Tensor, Var};
 
+use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
-use candle_gen::gen_core::{self, LoadSpec, Modality, WeightsSource};
+use candle_gen::gen_core::{self, Image, LoadSpec, Modality, Progress, WeightsSource};
 use candle_gen::train::checkpoint::file_stem;
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
 use candle_gen::train::flow_match::{self, validate_flow_match_request, velocity_loss};
@@ -60,10 +62,12 @@ use candle_gen::{CandleError, Result};
 
 use crate::config::{
     TextEncoderConfig, TransformerConfig, Vae16Config, MODEL_ID_T2V_14B, NUM_TRAIN_TIMESTEPS,
-    T2V_14B_BOUNDARY,
+    T2V_14B_BOUNDARY, T2V_14B_FLOW_SHIFT, VAE16_STRIDE_SPATIAL,
 };
 use crate::dit_train::{WanTransformerTrain, WAN_ATTN_TARGETS};
+use crate::pipeline::{create_noise, frames_to_images};
 use crate::rope::WanRope;
+use crate::scheduler::flow_sigmas;
 use crate::text_encoder::Umt5Encoder;
 use crate::vae16::WanVae16;
 
@@ -212,6 +216,114 @@ struct ExpertState {
     suffix: &'static str,
 }
 
+/// Cap on the number of preview prompts rendered per [`TrainingConfig::sample_every`] cadence
+/// (sc-8650) — matches the shared `SAMPLE_PROMPT_CAP` the FlowMatchTrainer driver applies. A Wan still
+/// is a full dual-expert denoise + z16 VAE decode, so this keeps the preview cost bounded.
+const SAMPLE_PROMPT_CAP: usize = 4;
+
+/// The Wan preview-sample render state (sc-8650) — everything [`render_one_preview`] needs to render a
+/// single still frame on the **in-progress** experts (both carry their live LoRA/LoKr adapters), built
+/// once in [`WanMoeTrainer::train_impl`]'s cache phase while the UMT5 encoder is still resident and
+/// before the VAE encoder is dropped.
+///
+///  * `prompts` — the prompt strings (≤ [`SAMPLE_PROMPT_CAP`]) reported on each
+///    [`TrainingProgress::Sample`], 1:1 with `umt5`.
+///  * `umt5` — the per-prompt pre-encoded UMT5 caption embeds `[1, 512, 4096]` (f32, the exact context
+///    surface [`encode_caption`] produces), projected per-expert inside the render via
+///    [`WanTransformerTrain::embed_text`].
+///  * `vae` — a resident **decode-only** [`WanVae16`] (the cache pass loads the VAE *with* the encoder
+///    for latent caching, then drops it; the preview path needs only the decoder).
+///  * `edge` — the square training-resolution edge (`bucket_resolution(cfg.resolution)`, the same edge
+///    the cached latents use) the seeded single-frame preview noise is shaped at.
+struct WanSampleState {
+    prompts: Vec<String>,
+    umt5: Vec<Tensor>,
+    vae: WanVae16,
+    edge: u32,
+}
+
+/// Render ONE still preview frame (sc-8650) from the **in-progress** dual-expert A14B onto an RGB8
+/// [`Image`], best-effort. This mirrors the inference T2V denoise ([`crate::wan14b`]'s `render`) but on
+/// a **single-frame** latent (`F = 1`, the cheapest faithful still) and CFG-free.
+///
+/// **Dual-expert (not single-expert).** Both experts are resident with their live adapters during the
+/// loop, so the preview runs the *real* MoE boundary-band schedule — the high-noise expert
+/// (`experts[0]`) while the σ-derived integer timestep is `≥ boundary·1000`, the low-noise expert
+/// (`experts[1]`) below it — exactly as inference switches them. That is the simplest faithful option
+/// (a single-expert preview would denoise the whole trajectory through one band's adapter, which no
+/// inference path does) and it exercises *both* trained adapters, so a preview reflects the full LoRA.
+///
+/// Conventions match [`compute_loss_grads`] / inference: the DiT consumes the **raw** velocity (no sign
+/// flip) at timestep `σ · NUM_TRAIN_TIMESTEPS` (the `[0, 1000]` integer convention), driven over Wan's
+/// native flow-σ schedule by [`candle_gen::run_flow_sampler`] with [`TimestepConvention::Sigma`]. The
+/// schedule uses `steps = cfg.sample_steps.max(1)` and the T2V flow shift, and a fresh never-cancel
+/// flag (a preview need not honor cancel mid-denoise; `req.cancel` is not threaded here).
+///
+/// CFG-free: training pre-encodes only the positive caption, so `cfg.sample_guidance_scale` is ignored
+/// (the Wan trainer trains the velocity directly, no negative branch is cached).
+fn render_one_preview(
+    experts: &[ExpertState],
+    state: &WanSampleState,
+    index: usize,
+    cfg: &TrainingConfig,
+    seed: u64,
+    device: &Device,
+) -> Result<Image> {
+    let dit_cfg = TransformerConfig::t2v_14b();
+    let steps = cfg.sample_steps.max(1) as usize;
+
+    // Single-frame latent geometry (F = 1) at the square training edge, z16 strides.
+    let t_lat = 1usize;
+    let h_lat = (state.edge / VAE16_STRIDE_SPATIAL) as usize;
+    let w_lat = (state.edge / VAE16_STRIDE_SPATIAL) as usize;
+    let (pt, ph, pw) = dit_cfg.patch;
+    let (ppf, pph, ppw) = (t_lat / pt, h_lat / ph, w_lat / pw);
+    let (cos, sin) = WanRope::new(&dit_cfg).cos_sin(ppf, pph, ppw, device)?;
+
+    // Per-expert projected text context (each expert owns its own `condition_embedder.text_embedder`).
+    let umt5 = &state.umt5[index];
+    let ctx_high = experts[0].dit.embed_text(umt5)?;
+    let ctx_low = experts[1].dit.embed_text(umt5)?;
+
+    // Seeded [1, 16, 1, h_lat, w_lat] noise (the inference `create_noise`, frame axis pinned to 1).
+    let noise = create_noise(seed, 16, t_lat, h_lat, w_lat, device)?;
+
+    // Wan's native flow-σ schedule (descending, trailing 0.0) integrated by the shared euler flow
+    // sampler — the dual-expert MoE band switch lives inside the closure (boundary on σ·N).
+    let boundary_ts = T2V_14B_BOUNDARY * NUM_TRAIN_TIMESTEPS as f64;
+    let sigmas = flow_sigmas(steps, T2V_14B_FLOW_SHIFT);
+    let cancel = CancelFlag::new();
+    let mut on_progress = |_: Progress| {};
+    let lat = candle_gen::run_flow_sampler(
+        Some("euler"),
+        TimestepConvention::Sigma,
+        &sigmas,
+        noise,
+        seed,
+        &cancel,
+        &mut on_progress,
+        |x, sigma| -> Result<Tensor> {
+            // σ → integer timestep (σ·1000); MoE: high-noise expert at/above the boundary, low below.
+            let ts = sigma as f64 * NUM_TRAIN_TIMESTEPS as f64;
+            let (dit, ctx) = if ts >= boundary_ts {
+                (&experts[0].dit, &ctx_high)
+            } else {
+                (&experts[1].dit, &ctx_low)
+            };
+            let v = dit.forward(x, ctx, ts, &cos, &sin)?; // raw velocity (no negation)
+            Ok(v.to_dtype(DType::F32)?)
+        },
+    )?;
+
+    // Decode the single-frame latent [1,16,1,h,w] → [1,3,1,8h,8w]; the frame axis (dim 2) carries one
+    // frame, so `frames_to_images` (the inference frame→Image conversion) yields exactly one Image.
+    let decoded = state.vae.decode(&lat)?; // [1, 3, 1, H, W] in [-1, 1]
+    frames_to_images(&decoded)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| CandleError::Msg("wan: preview decode yielded no frame".into()))
+}
+
 /// Identity + capabilities of the candle Wan A14B trainer: LoRA + LoKr, `backend = "candle"`.
 pub fn trainer_descriptor() -> TrainerDescriptor {
     TrainerDescriptor {
@@ -318,6 +430,44 @@ impl WanMoeTrainer {
             let cap = encode_caption(&self.root, &te_cfg, &text_encoder, &item.caption, device)?;
             cache.push((x0, cap));
         }
+
+        // --- preview-sample plan (sc-8650): pre-encode prompts + load a resident decode-only VAE ---
+        // Built here, while the UMT5 encoder is still resident and before the cache VAE is dropped, so
+        // `train_impl`'s loop can render previews from the in-progress experts (mirrors the inline
+        // pattern the bespoke-loop families use; the FlowMatchTrainer families do this in `cache`).
+        // `None` ⇒ sampling disabled (no cadence or no prompts) ⇒ the loop renders nothing.
+        let sample_state: Option<WanSampleState> =
+            if cfg.sample_every > 0 && !cfg.sample_prompts.is_empty() && !req.cancel.is_cancelled()
+            {
+                let mut umt5 = Vec::new();
+                let mut prompts = Vec::new();
+                for p in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
+                    // Same conditioning call the cache loop uses → identical [1, 512, 4096] surface.
+                    umt5.push(encode_caption(
+                        &self.root,
+                        &te_cfg,
+                        &text_encoder,
+                        p,
+                        device,
+                    )?);
+                    prompts.push(p.clone());
+                }
+                // Resident DECODE-ONLY z16 VAE (the cache VAE carried the encoder for latent caching; the
+                // preview path needs only the decoder). Loaded f32, like inference's VAE.
+                let preview_vae = WanVae16::new(
+                    &vae_cfg,
+                    flow_match::component_vb(&self.root, "vae", device, DType::F32, LABEL)?,
+                )?;
+                Some(WanSampleState {
+                    prompts,
+                    umt5,
+                    vae: preview_vae,
+                    edge,
+                })
+            } else {
+                None
+            };
+
         drop(text_encoder);
         drop(vae);
         if cache.is_empty() {
@@ -436,6 +586,36 @@ impl WanMoeTrainer {
                 total: cfg.steps,
                 loss: last_loss,
             });
+
+            // --- preview samples (sc-8650) — render one still per prompt from the in-progress experts ---
+            // Best-effort: a render `Err` logs + skips, never aborting the run (a flaky preview must not
+            // fail a 14B training job). Both experts carry their live adapters, so `render_one_preview`
+            // runs the partially-trained dual-expert MoE directly.
+            if cfg.sample_every > 0 && step % cfg.sample_every == 0 {
+                if let Some(state) = sample_state.as_ref() {
+                    let total = state.prompts.len() as u32;
+                    for (i, prompt) in state.prompts.iter().enumerate() {
+                        if req.cancel.is_cancelled() {
+                            break;
+                        }
+                        let seed = flow_match::sample_seed(cfg.seed, step, i);
+                        match render_one_preview(&experts, state, i, cfg, seed, device) {
+                            Ok(image) => on_progress(TrainingProgress::Sample {
+                                step,
+                                index: i as u32 + 1,
+                                total,
+                                prompt: prompt.clone(),
+                                image,
+                            }),
+                            Err(e) => eprintln!(
+                                "[sc-8650] wan: preview sample failed at step {step} (prompt {}): \
+                                 {e} — skipping this preview, training continues",
+                                i + 1
+                            ),
+                        }
+                    }
+                }
+            }
 
             if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
                 flow_match::create_output_dir(&req.output_dir)?;

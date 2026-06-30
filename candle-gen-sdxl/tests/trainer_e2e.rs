@@ -38,8 +38,9 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    self, AdapterKind, AdapterSpec, CancelFlag, GenerationOutput, GenerationRequest, LoadSpec,
-    NetworkType, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest, WeightsSource,
+    self, AdapterKind, AdapterSpec, CancelFlag, GenerationOutput, GenerationRequest, Image,
+    LoadSpec, NetworkType, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
+    WeightsSource,
 };
 
 /// The SDXL base snapshot dir — `SDXL_SNAPSHOT` or the first HF-cache snapshot.
@@ -327,6 +328,87 @@ fn sdxl_trainer_same_seed_is_reproducible() {
         );
     }
     println!("[sdxl-det] e2e OK — same seed reproduces the adapter bit-for-bit");
+}
+
+/// sc-8650: with a sample cadence set, the trainer renders preview images from the **in-progress
+/// adapter** and emits them as [`TrainingProgress::Sample`] — each a valid, non-empty RGB8 bitmap.
+/// SDXL renders with CFG (guidance 5.0). This is the candle twin of the MLX sc-5637
+/// `*_emits_preview_samples` smokes.
+#[test]
+#[ignore = "needs real SDXL base weights + a GPU; run with --features cuda --release --ignored"]
+fn sdxl_trainer_emits_preview_samples() {
+    if !snapshot().exists() {
+        eprintln!("skipping: no SDXL snapshot (set SDXL_SNAPSHOT)");
+        return;
+    }
+    let tmp = std::env::temp_dir().join("candle_sdxl_trainer_samples_e2e");
+    let items = make_dataset(&tmp);
+    // Link the provider crate's trainer registration into this binary.
+    assert_eq!(candle_gen_sdxl::MODEL_ID, "sdxl");
+    let mut trainer =
+        gen_core::load_trainer("sdxl", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+            .expect("sdxl candle trainer should be registered");
+
+    // 4 steps, render a preview every 2 steps over 2 prompts → 2 cadences × 2 prompts = 4 Sample events.
+    let mut cfg = config(NetworkType::Lora, 4, false);
+    cfg.sample_every = 2;
+    cfg.sample_steps = 6;
+    cfg.sample_guidance_scale = 5.0;
+    cfg.sample_prompts = vec!["a solid red swatch".into(), "a solid blue swatch".into()];
+
+    let req = TrainingRequest {
+        items,
+        config: cfg,
+        output_dir: tmp.join("out"),
+        file_name: "sdxl_samples.safetensors".to_string(),
+        trigger_words: vec![],
+        cancel: CancelFlag::new(),
+    };
+
+    let mut samples: Vec<(u32, u32, u32, String, Image)> = Vec::new();
+    trainer
+        .train(&req, &mut |p| {
+            if let TrainingProgress::Sample {
+                step,
+                index,
+                total,
+                prompt,
+                image,
+            } = p
+            {
+                samples.push((step, index, total, prompt, image));
+            }
+        })
+        .expect("training with sampling succeeds");
+
+    assert_eq!(
+        samples.len(),
+        4,
+        "expected 4 preview samples (2 cadences × 2 prompts), got {}",
+        samples.len()
+    );
+    for (step, index, total, prompt, img) in &samples {
+        assert!(
+            *step == 2 || *step == 4,
+            "preview at a cadence step, got {step}"
+        );
+        assert_eq!(*total, 2, "two prompts per cadence");
+        assert!((1..=2).contains(index), "1-based prompt index, got {index}");
+        assert!(img.width > 0 && img.height > 0, "non-empty preview dims");
+        assert_eq!(
+            img.pixels.len(),
+            (img.width * img.height * 3) as usize,
+            "RGB8 row-major: pixels.len() == w*h*3"
+        );
+        assert!(
+            img.pixels.iter().any(|&b| b != 0),
+            "preview from the in-progress adapter is not all-black (prompt {prompt:?})"
+        );
+        println!(
+            "[sdxl sample] step {step} {index}/{total} {}x{} prompt {prompt:?}",
+            img.width, img.height
+        );
+    }
 }
 
 /// Load a generator with `adapter_path` merged and run a tiny `generate`, asserting a finite,

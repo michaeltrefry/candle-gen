@@ -49,6 +49,7 @@ use rand_distr::{Distribution, StandardNormal};
 use crate::gen_core::train::{
     NetworkType, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
+use crate::gen_core::Image;
 use crate::train::checkpoint::{checkpoint_filename, file_stem};
 use crate::train::lora::{
     build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraHost,
@@ -349,6 +350,45 @@ pub fn apply_update(
     Ok(())
 }
 
+/// The preview-sample plan a [`FlowMatchTrainer::cache`] builds while the text encoder (and any VAE
+/// decoder) are still resident (sc-8650 — the candle twin of the MLX sc-5637 preview samples). It holds
+/// the prompt strings rendered at each [`TrainingConfig::sample_every`] cadence plus the family-defined
+/// [`state`](Self::state) carrying everything [`FlowMatchTrainer::render_sample`] needs (the per-prompt
+/// pre-encoded conditioning, a resident VAE **decoder**, the inference σ-schedule). `state` is `None`
+/// when sampling is disabled (`sample_every == 0` / empty `sample_prompts`) or pre-encoding was skipped,
+/// in which case the driver renders nothing.
+pub struct SamplePlan<S> {
+    /// The 1:1 prompts rendered each cadence (drives `index`/`total` on [`TrainingProgress::Sample`]).
+    pub prompts: Vec<String>,
+    /// Family state for rendering, or `None` to disable sampling for this run.
+    pub state: Option<S>,
+}
+
+impl<S> SamplePlan<S> {
+    /// A disabled plan — the driver renders no previews.
+    pub fn disabled() -> Self {
+        Self {
+            prompts: Vec::new(),
+            state: None,
+        }
+    }
+}
+
+impl<S> Default for SamplePlan<S> {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+/// Per-preview render seed: mix the run seed with the micro-step and the prompt index so each preview is
+/// deterministic yet distinct (mirrors the MLX sc-5637 mix). Distinct from the train-step
+/// timestep/noise seeds so a preview never reuses a training noise draw.
+pub fn sample_seed(base: u64, step: u32, index: usize) -> u64 {
+    base.wrapping_add(step as u64)
+        .wrapping_mul(0xA24B_AED4_4AC9_5F2D)
+        .wrapping_add(index as u64)
+}
+
 /// The per-model hooks the single-model [`run_flow_match_training`] driver calls. A flow-match trainer
 /// with one DiT, one optimizer, and one adapter set (Z-Image, Lens, Krea) implements this; the driver
 /// owns the cache → loop → save scaffolding around it. (Wan's dual-expert loop does not use this — it
@@ -360,6 +400,10 @@ pub trait FlowMatchTrainer {
     type Cached;
     /// Run-derived state shared across steps (e.g. Lens's latent grid `(h, w)`; `()` when unused).
     type Aux;
+    /// Family-defined preview-sample state (resident VAE decoder + per-prompt pre-encoded conditioning +
+    /// inference σ-schedule). `()` opts the family out of preview rendering (with the default
+    /// [`render_sample`](Self::render_sample)). See [`SamplePlan`].
+    type SampleState;
 
     /// Error-message prefix + the `no usable dataset items` label (e.g. `"z_image trainer"`).
     const LABEL: &'static str;
@@ -371,15 +415,22 @@ pub trait FlowMatchTrainer {
     fn default_targets(&self) -> &'static [&'static str];
 
     /// Cache the dataset: encode each item's latent + conditioning (reporting
-    /// [`TrainingProgress::Caching`]) and return the per-sample cache plus any run-derived [`Aux`].
-    /// Honors `req.cancel` (a cancel mid-cache yields a short/empty cache; the driver maps an empty
-    /// cache to `Canceled`). The heavy encoders are loaded and dropped inside this call.
+    /// [`TrainingProgress::Caching`]) and return the per-sample cache plus any run-derived [`Aux`] and a
+    /// [`SamplePlan`]. Honors `req.cancel` (a cancel mid-cache yields a short/empty cache; the driver maps
+    /// an empty cache to `Canceled`). The heavy encoders are loaded and dropped inside this call.
+    ///
+    /// **Preview samples (sc-8650).** When `req.config.sample_every > 0` and `sample_prompts` is
+    /// non-empty, pre-encode each sample prompt's conditioning here — while the text encoder is still
+    /// resident, before it is dropped — and load a resident VAE **decoder** (the cache pass loads only
+    /// the encoder), stashing both in the returned [`SamplePlan::state`] for
+    /// [`render_sample`](Self::render_sample). Return [`SamplePlan::disabled`] when sampling is off.
+    #[allow(clippy::type_complexity)] // the cache + aux + sample-plan tuple is the hook's natural return
     fn cache(
         &self,
         req: &TrainingRequest,
         device: &Device,
         on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> Result<(Vec<Self::Cached>, Self::Aux)>;
+    ) -> Result<(Vec<Self::Cached>, Self::Aux, SamplePlan<Self::SampleState>)>;
 
     /// Build the trainable DiT (no adapters installed — the driver installs them onto the returned
     /// host).
@@ -399,6 +450,32 @@ pub trait FlowMatchTrainer {
         step: u32,
         device: &Device,
     ) -> Result<(f32, GradStore)>;
+
+    /// Render preview prompt `index` of the [`SamplePlan`] into an RGB [`Image`] using the **in-progress
+    /// adapter** (sc-8650). The adapters are already installed on `dit` as eager `Var`s, so a plain
+    /// `dit.forward` runs the partially-trained LoRA — the trainer runs its own family inference denoise
+    /// (the family velocity-sign / timestep convention, reusing [`run_flow_sampler`](crate::run_flow_sampler))
+    /// over `state`'s pre-encoded conditioning for `index`, then VAE-decodes to RGB8. `seed` is the
+    /// per-preview [`sample_seed`].
+    ///
+    /// The driver calls this only when [`cache`](Self::cache) returned a `state` and
+    /// `cfg.sample_every > 0`. **Best-effort:** an `Err` is logged and skipped, never aborting the run —
+    /// so a flaky preview never fails a training job. The default implementation errors (a family that
+    /// returns no [`SamplePlan::state`] never reaches it).
+    #[allow(unused_variables)]
+    fn render_sample(
+        &self,
+        dit: &Self::Dit,
+        state: &Self::SampleState,
+        index: usize,
+        cfg: &TrainingConfig,
+        seed: u64,
+    ) -> Result<Image> {
+        Err(CandleError::Msg(format!(
+            "{}: render_sample not implemented",
+            Self::LABEL
+        )))
+    }
 
     /// Persist the adapter set to `path`. Defaults to the bare-key [`save_adapter`] with no extra
     /// metadata; override to inject provenance (e.g. Krea's `baseModel`/`family`).
@@ -427,7 +504,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
 
     // --- cache (latents + conditioning); the encoders load and drop inside the hook ---
     on_progress(TrainingProgress::LoadingModel);
-    let (cache, aux) = model.cache(req, device, on_progress)?;
+    let (cache, aux, sample_plan) = model.cache(req, device, on_progress)?;
     if cache.is_empty() {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
@@ -489,6 +566,36 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             total: cfg.steps,
             loss: last_loss,
         });
+
+        // --- preview samples (sc-8650) — render from the in-progress adapter at the cadence ---
+        // Best-effort: a render failure logs + skips, never aborting the run. Adapters are eager `Var`s
+        // already installed on `dit`, so `render_sample` runs the partially-trained LoRA directly.
+        if cfg.sample_every > 0 && step % cfg.sample_every == 0 {
+            if let Some(state) = sample_plan.state.as_ref() {
+                let total = sample_plan.prompts.len() as u32;
+                for (index, prompt) in sample_plan.prompts.iter().enumerate() {
+                    if req.cancel.is_cancelled() {
+                        break;
+                    }
+                    let seed = sample_seed(cfg.seed, step, index);
+                    match model.render_sample(&dit, state, index, cfg, seed) {
+                        Ok(image) => on_progress(TrainingProgress::Sample {
+                            step,
+                            index: index as u32 + 1,
+                            total,
+                            prompt: prompt.clone(),
+                            image,
+                        }),
+                        Err(e) => eprintln!(
+                            "[sc-8650] {}: preview sample failed at step {step} (prompt {}): {e} \
+                             — skipping this preview, training continues",
+                            T::LABEL,
+                            index + 1
+                        ),
+                    }
+                }
+            }
+        }
 
         if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
             create_output_dir(&req.output_dir)?;
@@ -648,6 +755,7 @@ mod tests {
         type Dit = MockDit;
         type Cached = ();
         type Aux = ();
+        type SampleState = ();
         const LABEL: &'static str = "mock trainer";
 
         fn device(&self) -> &Device {
@@ -661,14 +769,16 @@ mod tests {
             _req: &TrainingRequest,
             _device: &Device,
             on_progress: &mut dyn FnMut(TrainingProgress),
-        ) -> Result<(Vec<()>, ())> {
+        ) -> Result<(Vec<()>, (), SamplePlan<()>)> {
             for i in 0..self.cache_len {
                 on_progress(TrainingProgress::Caching {
                     current: i as u32 + 1,
                     total: self.cache_len as u32,
                 });
             }
-            Ok((vec![(); self.cache_len], ()))
+            // The mock never exercises preview sampling (default `render_sample` would error if called);
+            // the driver skips rendering when the plan has no state.
+            Ok((vec![(); self.cache_len], (), SamplePlan::disabled()))
         }
         fn build_dit(&self, _req: &TrainingRequest, device: &Device) -> Result<MockDit> {
             let w = Tensor::zeros((4, 4), DType::F32, device)?;

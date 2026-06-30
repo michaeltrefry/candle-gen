@@ -299,6 +299,90 @@ fn krea_lora_gradient_checkpointing() {
     );
 }
 
+/// sc-8650: with a sample cadence set, the trainer renders preview images from the **in-progress
+/// adapter** and emits them as [`TrainingProgress::Sample`] — each a valid, non-empty RGB8 bitmap. This
+/// is the candle twin of the MLX sc-5637 `*_emits_preview_samples` smokes.
+#[test]
+#[ignore = "needs real Krea-2-Raw weights + a GPU; run with --features cuda --release --ignored"]
+fn krea_trainer_emits_preview_samples() {
+    if snapshot().is_none() {
+        eprintln!("skipping: set KREA_RAW_DIR (or KREA_TURBO_DIR)");
+        return;
+    }
+    let tmp = std::env::temp_dir().join("krea_trainer_e2e_samples");
+    let items = make_dataset(&tmp);
+    candle_gen_krea::force_link();
+    let mut trainer = gen_core::load_trainer(
+        "krea_2_raw",
+        &LoadSpec::new(WeightsSource::Dir(snapshot().unwrap())),
+    )
+    .expect("krea_2_raw trainer registered");
+
+    // 4 steps, render a preview every 2 steps over 2 prompts → 2 cadences × 2 prompts = 4 Sample events.
+    let mut cfg = config(NetworkType::Lora, 4, false);
+    cfg.sample_every = 2;
+    cfg.sample_steps = 4;
+    cfg.sample_guidance_scale = 1.0;
+    cfg.sample_prompts = vec![
+        "a solid red swatch".to_string(),
+        "a solid blue swatch".to_string(),
+    ];
+
+    let req = TrainingRequest {
+        items,
+        config: cfg,
+        output_dir: tmp.join("out"),
+        file_name: "krea_samples.safetensors".to_string(),
+        trigger_words: vec![],
+        cancel: CancelFlag::new(),
+    };
+
+    let mut samples: Vec<(u32, u32, u32, String, Image)> = Vec::new();
+    trainer
+        .train(&req, &mut |p| {
+            if let TrainingProgress::Sample {
+                step,
+                index,
+                total,
+                prompt,
+                image,
+            } = p
+            {
+                samples.push((step, index, total, prompt, image));
+            }
+        })
+        .expect("training with sampling succeeds");
+
+    assert_eq!(
+        samples.len(),
+        4,
+        "expected 4 preview samples (2 cadences × 2 prompts), got {}",
+        samples.len()
+    );
+    for (step, index, total, prompt, img) in &samples {
+        assert!(
+            *step == 2 || *step == 4,
+            "preview at a cadence step, got {step}"
+        );
+        assert_eq!(*total, 2, "two prompts per cadence");
+        assert!((1..=2).contains(index), "1-based prompt index, got {index}");
+        assert!(img.width > 0 && img.height > 0, "non-empty preview dims");
+        assert_eq!(
+            img.pixels.len(),
+            (img.width * img.height * 3) as usize,
+            "RGB8 row-major: pixels.len() == w*h*3"
+        );
+        assert!(
+            img.pixels.iter().any(|&b| b != 0),
+            "preview from the in-progress adapter is not all-black (prompt {prompt:?})"
+        );
+        println!(
+            "[krea sample] step {step} {index}/{total} {}x{} prompt {prompt:?}",
+            img.width, img.height
+        );
+    }
+}
+
 // ── sc-7837: the real Raw→Turbo round trip (train on Raw → apply at Turbo inference) ──────────────
 
 /// The Turbo render snapshot — `KREA_TURBO_DIR`, distinct from the Raw training snapshot ([`snapshot`]).

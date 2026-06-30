@@ -34,9 +34,9 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::{
-    self, AdapterKind, AdapterSpec, CancelFlag, GenerationOutput, GenerationRequest, LoadSpec,
-    MoeExpert, NetworkType, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
-    WeightsSource,
+    self, AdapterKind, AdapterSpec, CancelFlag, GenerationOutput, GenerationRequest, Image,
+    LoadSpec, MoeExpert, NetworkType, TrainingConfig, TrainingItem, TrainingProgress,
+    TrainingRequest, WeightsSource,
 };
 
 /// The Wan A14B (T2V) base snapshot dir — `WAN_T2V_14B_SNAPSHOT` or the first HF-cache snapshot.
@@ -374,4 +374,100 @@ fn wan_t2v_14b_trainer_same_seed_is_reproducible() {
         }
     }
     println!("[wan-det] e2e OK — same seed reproduces the adapter pair bit-for-bit");
+}
+
+/// sc-8650: with a sample cadence set, the dual-expert MoE trainer renders preview images from the
+/// **in-progress** experts (both carrying their live adapters) and emits them as
+/// [`TrainingProgress::Sample`] — each a valid, non-empty RGB8 bitmap. Wan T2V's preview is a single
+/// still frame (`F = 1`, already squeezed to RGB8), so a Sample is a normal [`Image`] just like the
+/// image families. The candle twin of the MLX sc-5637 `*_emits_preview_samples` smokes.
+///
+/// CFG-free: the Wan trainer pre-encodes only the positive caption, so `sample_guidance_scale` is
+/// ignored — guidance 1.0. The trainer's main loop runs `for step in 1..=cfg.steps` (one iteration
+/// per overall step, experts alternating *within* the loop), and the preview block fires once per step
+/// when `step % sample_every == 0`, iterating over **all** prompts. So with `steps = 4`,
+/// `sample_every = 2`, 2 prompts → cadence steps {2, 4} × 2 prompts = **exactly 4** Sample events. We
+/// assert that exact count (the loop is deterministic — one preview block per cadence step, prompts
+/// iterated fully).
+#[test]
+#[ignore = "needs real Wan A14B T2V weights + a GPU; run with --features cuda --release --ignored"]
+fn wan_trainer_emits_preview_samples() {
+    if !snapshot().exists() {
+        eprintln!("skipping: set WAN_T2V_14B_SNAPSHOT (or populate the HF cache)");
+        return;
+    }
+    let tmp = std::env::temp_dir().join("candle_wan_trainer_samples_e2e");
+    let items = make_dataset(&tmp);
+    // Reference the provider crate so its `inventory::submit!` trainer registration is linked in.
+    candle_gen_wan::force_link();
+    let mut trainer = gen_core::load_trainer(
+        "wan2_2_t2v_14b",
+        &LoadSpec::new(WeightsSource::Dir(snapshot())),
+    )
+    .expect("wan2_2_t2v_14b candle trainer should be registered");
+
+    // 4 steps, render a preview every 2 steps over 2 prompts → 2 cadences × 2 prompts = 4 Sample events.
+    let mut cfg = config(NetworkType::Lora, 4);
+    cfg.sample_every = 2;
+    cfg.sample_steps = 4;
+    cfg.sample_guidance_scale = 1.0; // CFG-free preview (only the positive caption is cached)
+    cfg.sample_prompts = vec![
+        "a solid red swatch".to_string(),
+        "a solid blue swatch".to_string(),
+    ];
+
+    let req = TrainingRequest {
+        items,
+        config: cfg,
+        output_dir: tmp.join("out"),
+        file_name: "wan_samples.safetensors".to_string(),
+        trigger_words: vec![],
+        cancel: CancelFlag::new(),
+    };
+
+    let mut samples: Vec<(u32, u32, u32, String, Image)> = Vec::new();
+    trainer
+        .train(&req, &mut |p| {
+            if let TrainingProgress::Sample {
+                step,
+                index,
+                total,
+                prompt,
+                image,
+            } = p
+            {
+                samples.push((step, index, total, prompt, image));
+            }
+        })
+        .expect("training with sampling succeeds");
+
+    assert_eq!(
+        samples.len(),
+        4,
+        "expected 4 preview samples (2 cadences × 2 prompts), got {}",
+        samples.len()
+    );
+    for (step, index, total, prompt, img) in &samples {
+        assert!(
+            *step == 2 || *step == 4,
+            "preview at a cadence step, got {step}"
+        );
+        assert_eq!(*total, 2, "two prompts per cadence");
+        assert!((1..=2).contains(index), "1-based prompt index, got {index}");
+        // A Wan T2V preview is a single still frame, already squeezed to an RGB8 `Image`.
+        assert!(img.width > 0 && img.height > 0, "non-empty preview dims");
+        assert_eq!(
+            img.pixels.len(),
+            (img.width * img.height * 3) as usize,
+            "RGB8 row-major still frame: pixels.len() == w*h*3"
+        );
+        assert!(
+            img.pixels.iter().any(|&b| b != 0),
+            "preview from the in-progress dual-expert MoE is not all-black (prompt {prompt:?})"
+        );
+        println!(
+            "[wan sample] step {step} {index}/{total} {}x{} prompt {prompt:?}",
+            img.width, img.height
+        );
+    }
 }
