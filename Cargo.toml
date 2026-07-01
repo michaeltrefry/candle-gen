@@ -291,8 +291,8 @@ resolver = "2"
 # 3rd Group-B crate). `git diff cf74d3c..a41abfc -- gen-core/ gen-core-testkit/` is EMPTY — gen-core
 # BYTE-IDENTICAL; the range only adds `mlx-gen-flux` packed-load/convert code (candle does NOT link
 # it), so candle compiles UNCHANGED. Both lines below move together.
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "a41abfc42d94561643b42a71ae3e36b9ea4c9a7e" }
-sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "a41abfc42d94561643b42a71ae3e36b9ea4c9a7e" }
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "ef43eac9f954233668a1b7cea3132a01bc950da2" }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "ef43eac9f954233668a1b7cea3132a01bc950da2" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels
