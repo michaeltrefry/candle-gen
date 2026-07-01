@@ -13,13 +13,27 @@
 //! control context the base forward is bit-identical to stock (the `dit.rs` parity gate); with
 //! `control_scale = 0` the hints contribute zero — both reproduce plain Z-Image.
 //!
-//! **Distilled, no CFG** (Z-Image-Turbo): single forward per step, no negative prompt / guidance — so
-//! the control branch runs once per step, NOT twice (unlike the Qwen/Kolors true-CFG paths). The whole
-//! control transformer + the control context run at **bf16** (the candle Z-Image native dtype, matching
-//! the validated txt2img path): candle requires explicit dtype matching, so rather than the MLX fork's
-//! mixed-precision (bf16 base + f32 control branch) the candle port runs uniform bf16 — coherence over
-//! fork-bit-parity (the VAE-encode runs f32, then casts the control latents to bf16). The provider is a
-//! plain struct driven **directly** by the worker (a bespoke pose stream, like the Qwen/Kolors control
+//! **Two modes (sc-8680):**
+//!
+//! * **Turbo** (`base = false`, the original path): distilled, **no CFG** (Z-Image-Turbo) — single
+//!   forward per step, no negative prompt / guidance, the control branch runs once per step (NOT twice,
+//!   unlike the Qwen/Kolors true-CFG paths), over the distilled 4-step shift-3.0 schedule. **Byte-unchanged**
+//!   by sc-8680 — Z-Image-Turbo is guidance-distilled, so touching it would break the distillation.
+//! * **Base** (`base = true`, sc-8680): the **undistilled** `Tongyi-MAI/Z-Image` + the base
+//!   `alibaba-pai/Z-Image-Fun-Controlnet-Union-2.1` overlay — the candle sibling of the MLX base control
+//!   variant (`mlx-gen-z-image::model_base_control`, sc-8251). It reuses the identical control transformer
+//!   but drives it with the **base** treatment (mirroring [`crate::pipeline::Pipeline::render_base`]):
+//!   the static **shift = 6.0** scheduler ([`crate::pipeline::base_scheduler_config`]), a ~**50-step**
+//!   default, and **real classifier-free guidance** (`v = v_uncond + guidance·(v_cond − v_uncond)`,
+//!   guidance 3–5 default 4, + a negative prompt). Following the MLX base control loop
+//!   (`denoise_control_cfg_with_progress`), the constant control context threads through **both** the
+//!   cond and uncond forward of the CFG combine — the control residuals inject identically on each pass.
+//!
+//! The whole control transformer + the control context run at **bf16** (the candle Z-Image native dtype,
+//! matching the validated txt2img path): candle requires explicit dtype matching, so rather than the MLX
+//! fork's mixed-precision (bf16 base + f32 control branch) the candle port runs uniform bf16 — coherence
+//! over fork-bit-parity (the VAE-encode runs f32, then casts the control latents to bf16). The provider is
+//! a plain struct driven **directly** by the worker (a bespoke pose stream, like the Qwen/Kolors control
 //! providers), NOT gen-core-registered — the registered `z_image_turbo` descriptor stays txt2img-only.
 
 use std::path::{Path, PathBuf};
@@ -27,6 +41,7 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::{self as nn, Linear, Module, VarBuilder};
 use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
@@ -67,6 +82,14 @@ const CONTROL_REFINER_PLACES: [usize; 2] = [0, 1];
 
 /// Z-Image-Turbo is guidance-distilled to a fixed 4-step schedule (the txt2img default).
 const DEFAULT_STEPS: usize = 4;
+/// **Base** (non-Turbo) control default steps — the undistilled foundation model wants ~50 (sc-8680).
+/// Mirrors [`crate::pipeline::BASE_DEFAULT_STEPS`] and `mlx-gen-z-image::model_base::DEFAULT_STEPS`
+/// (sc-8251). Used when a base-mode request omits `steps`.
+const BASE_DEFAULT_STEPS: usize = 50;
+/// **Base** default classifier-free guidance scale — the card recommends 3.0–5.0; 4.0 matches the
+/// reference `ZImagePipeline` example and `mlx-gen-z-image::model_base::DEFAULT_GUIDANCE` (sc-8251).
+/// Used when a base-mode request omits `guidance`; ignored in Turbo mode (guidance-distilled).
+const BASE_DEFAULT_GUIDANCE: f32 = 4.0;
 /// Qwen3 pad token id (`<|endoftext|>`) — matches the txt2img tokenizer config.
 const QWEN_PAD_TOKEN_ID: i32 = 151643;
 const TOKENIZER_MAX_LEN: usize = 512;
@@ -121,16 +144,24 @@ impl ZImageControlBlock {
 
 /// Paths to the Z-Image control checkpoints.
 pub struct ZImageControlPaths {
-    /// The `Tongyi-MAI/Z-Image-Turbo` base snapshot dir (`tokenizer/`, `text_encoder/`, `transformer/`,
-    /// `vae/`).
-    pub base: PathBuf,
-    /// The `alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1` checkpoint — a single `.safetensors`
-    /// file or a dir containing it.
+    /// The base snapshot dir (`tokenizer/`, `text_encoder/`, `transformer/`, `vae/`) — a
+    /// `Tongyi-MAI/Z-Image-Turbo` (Turbo mode) or `Tongyi-MAI/Z-Image` (base mode) tree.
+    pub snapshot: PathBuf,
+    /// The Fun-Controlnet-Union checkpoint — a single `.safetensors` file or a dir containing it
+    /// (`Z-Image-Turbo-Fun-Controlnet-Union-2.1` for Turbo, `Z-Image-Fun-Controlnet-Union-2.1` for base).
     pub control: PathBuf,
+    /// Select the **base** (undistilled, full-CFG) treatment (sc-8680): shift-6.0 scheduler,
+    /// ~50-step default, and real classifier-free guidance in the control denoise (the candle sibling of
+    /// `mlx-gen-z-image::model_base_control`). `false` = the original distilled Turbo path (no CFG,
+    /// 4-step shift-3.0), byte-unchanged. The control transformer architecture is identical either way.
+    pub base: bool,
 }
 
-/// One Z-Image Fun-ControlNet (strict-pose) generation request. No negative/guidance — Z-Image-Turbo is
-/// guidance-distilled.
+/// One Z-Image Fun-ControlNet generation request.
+///
+/// `guidance` + `negative_prompt` are consumed **only in base mode** (sc-8680): the undistilled base
+/// runs real classifier-free guidance. In Turbo mode they are ignored (Z-Image-Turbo is
+/// guidance-distilled — single cond forward, no negative prompt).
 #[derive(Clone)]
 pub struct ZImageControlRequest {
     pub prompt: String,
@@ -139,6 +170,14 @@ pub struct ZImageControlRequest {
     pub steps: usize,
     /// ControlNet conditioning scale on the pose hints.
     pub control_scale: f32,
+    /// **Base mode only** (sc-8680): the classifier-free guidance scale. `None` → the base default
+    /// (4.0); `Some(1.0)` collapses CFG to a single cond forward (Turbo-equivalent cost). Ignored in
+    /// Turbo mode.
+    pub guidance: Option<f32>,
+    /// **Base mode only** (sc-8680): the negative-prompt text for the uncond CFG branch. `None`/empty →
+    /// the unconditional embedding (empty string, still wrapped by the Qwen chat template). Ignored in
+    /// Turbo mode.
+    pub negative_prompt: Option<String>,
     pub seed: u64,
     pub cancel: CancelFlag,
 }
@@ -151,6 +190,8 @@ impl Default for ZImageControlRequest {
             height: 1024,
             steps: DEFAULT_STEPS,
             control_scale: DEFAULT_CONTROL_SCALE,
+            guidance: None,
+            negative_prompt: None,
             seed: 0,
             cancel: CancelFlag::default(),
         }
@@ -362,6 +403,10 @@ impl ZImageControlTransformer {
 pub struct ZImageControl {
     root: PathBuf,
     device: Device,
+    /// Base (undistilled, full-CFG) vs Turbo (distilled, no-CFG) treatment (sc-8680). Selected at load
+    /// from [`ZImageControlPaths::base`]; drives the scheduler (shift 6.0 vs 3.0), the default step
+    /// count, and whether the denoise runs real CFG.
+    base: bool,
     text_encoder: ZImageTextEncoder,
     transformer: ZImageControlTransformer,
     vae: AutoEncoderKL,
@@ -376,7 +421,7 @@ impl ZImageControl {
     /// runs f32.
     pub fn load(paths: &ZImageControlPaths) -> Result<Self> {
         let device = candle_gen::default_device()?;
-        let root = paths.base.clone();
+        let root = paths.snapshot.clone();
 
         let text_encoder = ZImageTextEncoder::new(
             &TextEncoderConfig::z_image(),
@@ -404,6 +449,7 @@ impl ZImageControl {
         Ok(Self {
             root,
             device,
+            base: paths.base,
             text_encoder,
             transformer,
             vae,
@@ -413,10 +459,15 @@ impl ZImageControl {
         })
     }
 
-    /// Strict-pose generation: condition the Z-Image-Turbo generation on `skeleton` (a rendered
-    /// OpenPose image at the request size) via the Fun-ControlNet, denoising with the distilled
-    /// flow-match Euler schedule (no CFG). The worker renders the skeleton; this VAE-encodes it into the
-    /// 33ch control context once, then runs the dual-injection denoise.
+    /// Strict-pose generation: condition the Z-Image generation on `skeleton` (a rendered OpenPose /
+    /// canny / depth image at the request size) via the Fun-ControlNet. The worker renders the control
+    /// image; this VAE-encodes it into the 33ch control context once, then runs the dual-injection
+    /// denoise. Dispatches on the load-time [`base`](ZImageControl::base) flag (sc-8680):
+    ///
+    /// * **Turbo** ([`generate_turbo`](Self::generate_turbo)): distilled 4-step shift-3.0 schedule, no
+    ///   CFG — byte-unchanged from the original path.
+    /// * **Base** ([`generate_base`](Self::generate_base)): undistilled shift-6.0 ~50-step schedule with
+    ///   real classifier-free guidance (the candle sibling of `mlx-gen-z-image::model_base_control`).
     pub fn generate(
         &self,
         req: &ZImageControlRequest,
@@ -426,6 +477,24 @@ impl ZImageControl {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        if self.base {
+            self.generate_base(req, skeleton, on_progress)
+        } else {
+            self.generate_turbo(req, skeleton, on_progress)
+        }
+    }
+
+    /// The original **Turbo** (distilled, no-CFG) control denoise — condition Z-Image-Turbo on the
+    /// control image via the Fun-ControlNet, denoising with the distilled flow-match Euler schedule
+    /// (4-step shift-3.0, single cond forward per step). **Byte-unchanged by sc-8680** — Z-Image-Turbo is
+    /// guidance-distilled, so this stays exactly as validated (`req.guidance`/`req.negative_prompt` are
+    /// ignored here).
+    fn generate_turbo(
+        &self,
+        req: &ZImageControlRequest,
+        skeleton: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
         let steps = req.steps.max(1);
         let total = steps as u32;
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
@@ -438,12 +507,7 @@ impl ZImageControl {
         let control_context = self.encode_control_context(skeleton, req.width, req.height)?;
 
         // Deterministic, launch-portable initial noise (sc-3673), CPU RNG → device.
-        let n = LATENT_CHANNELS * lat_h * lat_w;
-        let mut rng = StdRng::seed_from_u64(req.seed);
-        let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
-        let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
-            .to_device(&self.device)?
-            .to_dtype(DTYPE)?;
+        let noise = self.seed_noise(req.seed, lat_h, lat_w)?;
 
         // Flow-match Euler schedule (the txt2img construction: Some(mu), no static shift).
         let image_seq_len = ((lat_h as u32 / PATCH_SIZE) * (lat_w as u32 / PATCH_SIZE)) as usize;
@@ -484,6 +548,143 @@ impl ZImageControl {
 
         on_progress(Progress::Decoding);
         self.decode(&latents)
+    }
+
+    /// The **base** (undistilled, full-CFG) control denoise (sc-8680) — the candle sibling of
+    /// `mlx-gen-z-image::model_base_control` / `pipeline::denoise_control_cfg_with_progress`. It reuses
+    /// the identical dual-injection control transformer but mirrors [`crate::pipeline::render_base`]:
+    ///
+    /// * **Static shift = 6.0** schedule ([`crate::pipeline::base_scheduler_config`], `set_timesteps(N,
+    ///   None)`), default ~**50 steps** ([`BASE_DEFAULT_STEPS`]). We feed that σ table to
+    ///   [`run_flow_sampler`](candle_gen::run_flow_sampler) with [`TimestepConvention::OneMinusSigma`],
+    ///   which derives the DiT timestep `t = 1−σ` from the σ schedule itself — structurally free of the
+    ///   Turbo `Some(mu)`-vs-`None` timesteps-desync speckle (we never read `current_timestep_normalized`).
+    /// * **Real CFG**: each step runs the control DiT **twice** — once on the prompt conditioning and
+    ///   once on the negative/uncond conditioning — both threading the **same** constant control context +
+    ///   scale (control residuals inject identically on each pass, per the MLX base control loop), and
+    ///   combines `v = v_uncond + guidance·(v_cond − v_uncond)`. `guidance == 1.0` (or no CFG) collapses
+    ///   to a single cond forward, byte-identical cost to a Turbo step.
+    fn generate_base(
+        &self,
+        req: &ZImageControlRequest,
+        skeleton: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let steps = if req.steps == 0 {
+            BASE_DEFAULT_STEPS
+        } else {
+            req.steps
+        };
+        let lat_h = (req.height / SPATIAL_SCALE) as usize;
+        let lat_w = (req.width / SPATIAL_SCALE) as usize;
+        let scale = req.control_scale as f64;
+
+        // Real CFG: default 4.0 (the base card); 1.0 turns CFG off (single cond forward).
+        let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
+        let cfg_on = guidance != 1.0;
+
+        // Text embeddings (bf16). The uncond branch (negative prompt, empty when unset — the
+        // unconditional embedding) is only encoded when CFG is active.
+        let cap = self.text_embeddings(&req.prompt)?;
+        let neg_cap = if cfg_on {
+            let neg = req.negative_prompt.as_deref().unwrap_or("");
+            Some(self.text_embeddings(neg)?)
+        } else {
+            None
+        };
+
+        // VAE-encode the control image → the constant 33ch control context (shared by BOTH CFG branches).
+        let control_context = self.encode_control_context(skeleton, req.width, req.height)?;
+
+        // Deterministic, launch-portable initial noise (sc-3673).
+        let noise = self.seed_noise(req.seed, lat_h, lat_w)?;
+
+        // Static shift=6.0 schedule (the base model's scheduler_config.json). Unlike the Turbo path's
+        // `Some(mu)` no-op, `None` fires the static-shift branch; `run_flow_sampler`'s `OneMinusSigma`
+        // reads t = 1−σ from these σ directly, so there is no timesteps desync to guard against.
+        let mut scheduler =
+            FlowMatchEulerDiscreteScheduler::new(crate::pipeline::base_scheduler_config());
+        scheduler.set_timesteps(steps, None);
+        let sigmas: Vec<f32> = scheduler.sigmas.iter().map(|&s| s as f32).collect();
+
+        // prepare_inputs pads cap_feats (+ mask) and adds the frame axis for the cond and (when CFG is
+        // on) the uncond branch.
+        let prepared = prepare_inputs(&noise, std::slice::from_ref(&cap), &self.device)?;
+        let cap_feats = prepared.cap_feats;
+        let cap_mask = prepared.cap_mask;
+        let uncond = match neg_cap.as_ref() {
+            Some(neg) => {
+                let p = prepare_inputs(&noise, std::slice::from_ref(neg), &self.device)?;
+                Some((p.cap_feats, p.cap_mask))
+            }
+            None => None,
+        };
+
+        let latents = candle_gen::run_flow_sampler(
+            None,
+            TimestepConvention::OneMinusSigma,
+            &sigmas,
+            prepared.latents,
+            req.seed,
+            &req.cancel,
+            on_progress,
+            |latents, t| -> Result<Tensor> {
+                let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
+                // Conditional velocity (Z-Image sign convention: the DiT output is negated before the
+                // flow-match step). The control context + scale thread through this forward.
+                let v_cond = self
+                    .transformer
+                    .forward_control(
+                        latents,
+                        &t_tensor,
+                        &cap_feats,
+                        &cap_mask,
+                        &control_context,
+                        scale,
+                    )?
+                    .neg()?;
+                let velocity = match uncond.as_ref() {
+                    Some((neg_feats, neg_mask)) => {
+                        // The uncond branch threads the SAME constant control context + scale (residuals
+                        // inject identically on both passes — the MLX base control loop's behaviour).
+                        let v_uncond = self
+                            .transformer
+                            .forward_control(
+                                latents,
+                                &t_tensor,
+                                neg_feats,
+                                neg_mask,
+                                &control_context,
+                                scale,
+                            )?
+                            .neg()?;
+                        // v = v_uncond + guidance·(v_cond − v_uncond). Combining the negated velocities is
+                        // linear, so it equals combining-then-negating.
+                        let delta = (&v_cond - &v_uncond)?;
+                        (v_uncond + (delta * guidance as f64)?)?
+                    }
+                    None => v_cond,
+                };
+                Ok(velocity)
+            },
+        )?;
+
+        on_progress(Progress::Decoding);
+        self.decode(&latents)
+    }
+
+    /// Deterministic, launch-portable initial latent noise (sc-3673): N(0,1) from a fixed-algorithm CPU
+    /// RNG seeded by `seed`, built on CPU then moved to the device at the model dtype. Shared by the
+    /// Turbo + base control loops so both are pure functions of `(seed, request)`.
+    fn seed_noise(&self, seed: u64, lat_h: usize, lat_w: usize) -> Result<Tensor> {
+        let n = LATENT_CHANNELS * lat_h * lat_w;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+        Ok(
+            Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
+                .to_device(&self.device)?
+                .to_dtype(DTYPE)?,
+        )
     }
 
     /// Prompt → `cap_feats` `(seq, 2560)` at bf16 via the Qwen3 encoder + the Qwen chat template (the
@@ -581,12 +782,30 @@ fn preprocess_control_image(
     Ok(Tensor::from_vec(data, (1, 3, h, w), device)?)
 }
 
-/// Resolve the Fun-Controlnet-Union weight **file** from a dir-or-file path.
+/// Deterministic overlay-file resolution (sc-8680): pick the intended Fun-Controlnet-**Union** weight
+/// **file** from a dir-or-file path, and NOT a Tile / `-lite` sibling.
+///
+/// A direct `File` path is used verbatim. For a `Dir`, the base + Turbo Fun-Controlnet-Union repos each
+/// ship **multiple** `.safetensors` in one snapshot (e.g. the base repo ships `…-Tile-2.1.safetensors`,
+/// `…-Tile-2.1-lite.safetensors`, `…-Union-2.1-lite.safetensors`, `…-Union-2.1.safetensors`), so a plain
+/// alphabetical "first file" grabs the wrong overlay (`Tile-…-lite` sorts first). We score candidates so
+/// the **full Union** checkpoint wins deterministically:
+///
+/// * exact well-known names first (base/Turbo Union-2.1 + the diffusers default),
+/// * else prefer files whose stem contains `union` over those that do not,
+/// * penalise `tile` and `lite` variants,
+/// * ties broken by the sorted path (stable/deterministic).
+///
+/// A dir with **no** Union-ish file still resolves the best-scoring `.safetensors` (a single-file control
+/// checkpoint dir), so a hand-placed non-standard name is not rejected.
 fn resolve_control_file(path: &Path) -> Result<PathBuf> {
     if path.is_file() {
         return Ok(path.to_path_buf());
     }
+    // Exact well-known filenames (base + Turbo Union-2.1, then the diffusers default) — an unambiguous fast
+    // path that also pins the base repo's `Z-Image-Fun-Controlnet-Union-2.1.safetensors` (sc-8680).
     for name in [
+        "Z-Image-Fun-Controlnet-Union-2.1.safetensors",
         "Z-Image-Turbo-Fun-Controlnet-Union-2.1.safetensors",
         "diffusion_pytorch_model.safetensors",
     ] {
@@ -595,7 +814,6 @@ fn resolve_control_file(path: &Path) -> Result<PathBuf> {
             return Ok(p);
         }
     }
-    // Otherwise the first .safetensors in the dir (a single-file control checkpoint).
     if path.is_dir() {
         let mut files: Vec<PathBuf> = std::fs::read_dir(path)
             .map_err(|e| {
@@ -604,8 +822,9 @@ fn resolve_control_file(path: &Path) -> Result<PathBuf> {
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
             .collect();
-        files.sort();
-        if let Some(f) = files.into_iter().next() {
+        files.sort(); // deterministic tie-break
+                      // Prefer the full Union checkpoint over Tile / `-lite` siblings (sc-8680).
+        if let Some(f) = files.iter().max_by_key(|p| control_file_score(p)).cloned() {
             return Ok(f);
         }
     }
@@ -614,6 +833,29 @@ fn resolve_control_file(path: &Path) -> Result<PathBuf> {
          .safetensors file or a dir containing one)",
         path.display()
     )))
+}
+
+/// Preference score for a candidate control `.safetensors` (sc-8680): higher = more preferred. Prefers a
+/// `union` stem, penalises `tile` and `lite` variants, so the full Fun-Controlnet-Union checkpoint is
+/// selected over the Tile-lite siblings the base repo ships alongside it. Pure (stem string only) so the
+/// resolution policy is unit-testable without real files.
+fn control_file_score(path: &Path) -> i32 {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut score = 0;
+    if stem.contains("union") {
+        score += 10;
+    }
+    if stem.contains("tile") {
+        score -= 10;
+    }
+    if stem.contains("lite") {
+        score -= 5;
+    }
+    score
 }
 
 /// mmap a [`VarBuilder`] over every `.safetensors` in `root/sub` at `dtype` (the txt2img loader).
@@ -657,7 +899,68 @@ mod tests {
         assert_eq!(r.steps, 4);
         assert_eq!(r.control_scale, DEFAULT_CONTROL_SCALE);
         assert_eq!(DEFAULT_CONTROL_SCALE, 1.0);
+        // Base-mode CFG fields default to None (unset → base default 4.0 / unconditional in base mode;
+        // ignored in Turbo mode).
+        assert!(r.guidance.is_none());
+        assert!(r.negative_prompt.is_none());
         assert!(!r.cancel.is_cancelled());
+    }
+
+    /// Base-mode constants (sc-8680) mirror the base txt2img pipeline + the mlx base control provider
+    /// (sc-8251): ~50-step default + CFG default 4.0, distinct from the Turbo distilled 4-step CFG-free
+    /// path. The base scheduler config lifts the static shift 3.0 → 6.0. GPU-free.
+    #[test]
+    fn base_mode_constants_and_scheduler() {
+        // Base vs Turbo defaults.
+        assert_eq!(BASE_DEFAULT_STEPS, 50);
+        assert_eq!(BASE_DEFAULT_GUIDANCE, 4.0);
+        assert_eq!(DEFAULT_STEPS, 4);
+        // The base control path drives shift=6.0 (reused from the base txt2img pipeline), Turbo 3.0.
+        let base_cfg = crate::pipeline::base_scheduler_config();
+        let turbo_cfg = SchedulerConfig::z_image_turbo();
+        assert_eq!(base_cfg.shift, 6.0);
+        assert_eq!(turbo_cfg.shift, 3.0);
+        assert!(!base_cfg.use_dynamic_shifting);
+
+        // Base mode builds a shift-6.0 σ table (set_timesteps(N, None) → the static-shift branch fires):
+        // N+1 sigmas, start 1.0, strictly decreasing to 0, and lifted above BOTH the linear ramp and the
+        // Turbo shift-3.0 table. This is what feeds the OneMinusSigma DiT timestep in `generate_base`.
+        let steps = BASE_DEFAULT_STEPS;
+        let mut base = FlowMatchEulerDiscreteScheduler::new(base_cfg);
+        base.set_timesteps(steps, None);
+        let mut turbo = FlowMatchEulerDiscreteScheduler::new(turbo_cfg);
+        turbo.set_timesteps(steps, None);
+        assert_eq!(base.sigmas.len(), steps + 1);
+        assert!((base.sigmas[0] - 1.0).abs() < 1e-9);
+        assert!(base.sigmas[steps].abs() < 1e-9);
+        for w in base.sigmas.windows(2) {
+            assert!(w[0] > w[1], "base sigmas must strictly decrease");
+        }
+        for i in 1..steps {
+            let linear = 1.0 - (i as f64) / (steps as f64);
+            assert!(base.sigmas[i] > linear + 1e-9, "shift lifts σ above linear");
+            assert!(
+                base.sigmas[i] > turbo.sigmas[i] + 1e-9,
+                "base shift 6.0 σ must exceed Turbo shift 3.0 σ at step {i}"
+            );
+        }
+    }
+
+    /// The base-mode step-count / guidance resolution logic (the head of `generate_base`, GPU-free):
+    /// `steps == 0` → the 50-step default (else the explicit request); `guidance` unset → 4.0, `Some(1.0)`
+    /// turns CFG off (single cond forward), any other value turns it on.
+    #[test]
+    fn base_mode_step_and_guidance_resolution() {
+        // Step default: 0 → BASE_DEFAULT_STEPS; explicit honored.
+        let resolve_steps = |s: usize| if s == 0 { BASE_DEFAULT_STEPS } else { s };
+        assert_eq!(resolve_steps(0), 50);
+        assert_eq!(resolve_steps(28), 28);
+        // Guidance default + CFG-on gate.
+        let resolve_g = |g: Option<f32>| g.unwrap_or(BASE_DEFAULT_GUIDANCE);
+        assert_eq!(resolve_g(None), 4.0);
+        assert_eq!(resolve_g(Some(3.5)), 3.5);
+        assert!(resolve_g(None) != 1.0, "default CFG is on");
+        assert!(resolve_g(Some(1.0)) == 1.0, "guidance 1.0 turns CFG off");
     }
 
     /// The VACE injection geometry: 15 main control layers at base places [0,2,…,28] + 2 refiner blocks
@@ -694,6 +997,7 @@ mod tests {
         assert!(preprocess_control_image(&img, 32, 8, &Device::Cpu).is_err());
     }
 
+    /// The exact-name fast path + `File` passthrough (Turbo repo's single-file layout).
     #[test]
     fn control_file_resolution() {
         let dir = std::env::temp_dir().join(format!("zimg_cn_{}", std::process::id()));
@@ -705,5 +1009,52 @@ mod tests {
         assert_eq!(resolve_control_file(&dir).unwrap(), f);
         assert_eq!(resolve_control_file(&f).unwrap(), f);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deterministic overlay resolution (sc-8680): a **base** Fun-Controlnet-Union snapshot ships the full
+    /// Union checkpoint alongside Tile / `-lite` siblings; resolution must pick the intended Union file,
+    /// NOT a Tile-lite variant (which sorts first alphabetically → the pre-fix bug that forced a manual
+    /// override during validation).
+    #[test]
+    fn control_file_resolution_prefers_union_over_tile_lite() {
+        let dir = std::env::temp_dir().join(format!("zimg_cn_union_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The four files the real base repo ships (alphabetical order: Tile-lite sorts FIRST).
+        let tile_lite = dir.join("Z-Image-Fun-Controlnet-Tile-2.1-lite.safetensors");
+        let tile = dir.join("Z-Image-Fun-Controlnet-Tile-2.1.safetensors");
+        let union_lite = dir.join("Z-Image-Fun-Controlnet-Union-2.1-lite.safetensors");
+        let union = dir.join("Z-Image-Fun-Controlnet-Union-2.1.safetensors");
+        for p in [&tile_lite, &tile, &union_lite, &union] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        // Must select the full Union-2.1 file (the exact-name fast path), never a Tile/lite sibling.
+        assert_eq!(resolve_control_file(&dir).unwrap(), union);
+
+        // Even with the exact name removed, the scored fallback prefers Union-lite over the Tile files
+        // (union stem beats tile, and lite penalty is smaller than the tile penalty).
+        std::fs::remove_file(&union).unwrap();
+        assert_eq!(resolve_control_file(&dir).unwrap(), union_lite);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The scoring policy directly (GPU-/fs-free): union > union-lite > (no keyword) > tile-lite > tile.
+    #[test]
+    fn control_file_score_orders_union_first() {
+        let s = |n: &str| control_file_score(Path::new(n));
+        assert!(s("Z-Image-Fun-Controlnet-Union-2.1.safetensors") > s("plain.safetensors"));
+        assert!(
+            s("Z-Image-Fun-Controlnet-Union-2.1.safetensors")
+                > s("Z-Image-Fun-Controlnet-Union-2.1-lite.safetensors")
+        );
+        assert!(
+            s("Z-Image-Fun-Controlnet-Union-2.1-lite.safetensors")
+                > s("Z-Image-Fun-Controlnet-Tile-2.1.safetensors")
+        );
+        assert!(
+            s("Z-Image-Fun-Controlnet-Tile-2.1.safetensors")
+                > s("Z-Image-Fun-Controlnet-Tile-2.1-lite.safetensors"),
+            "among Tile files, the full one beats the -lite (lite penalty)"
+        );
     }
 }
