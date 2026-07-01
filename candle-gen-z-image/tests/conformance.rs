@@ -130,3 +130,73 @@ fn base_z_image_smoke() {
     assert!(std > 8.0, "near-flat render (no structure): std={std:.1}");
     eprintln!("[base smoke] coherent 512x512 render: mean={mean:.1} std={std:.1}");
 }
+
+/// sc-8646 regression: base `z_image` CFG (`guidance = 4.0`) with an **unset** `negative_prompt` must
+/// render. The uncond branch encodes the empty string; before the fix this errored `z-image: empty
+/// prompt` because gen-core's tokenizer short-circuits an empty prompt before the chat template is
+/// applied. This is the exact request shape observed failing on real weights (a base txt2img with
+/// `guidance: Some(4.0)`, `negative_prompt: None`). `#[ignore]`d — needs the base weights + a CUDA GPU:
+///
+/// ```text
+/// set Z_IMAGE_BASE_SNAPSHOT=C:\Users\…\models--Tongyi-MAI--Z-Image\snapshots\<hash>
+/// set CUDA_VISIBLE_DEVICES=1
+/// cargo test -p candle-gen-z-image --features cuda --release --test conformance base_z_image_cfg_no_negative_smoke -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs Z_IMAGE_BASE_SNAPSHOT (a Tongyi-MAI/Z-Image diffusers snapshot dir) + a CUDA GPU; run with --features cuda --ignored"]
+fn base_z_image_cfg_no_negative_smoke() {
+    use candle_gen::gen_core::{GenerationOutput, GenerationRequest, Progress};
+
+    let snap = std::env::var("Z_IMAGE_BASE_SNAPSHOT")
+        .expect("set Z_IMAGE_BASE_SNAPSHOT to a Tongyi-MAI/Z-Image (base, non-Turbo) snapshot dir");
+    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(snap)));
+
+    let gen = candle_gen::gen_core::registry::load("z_image", &spec)
+        .expect("candle base z_image is registered");
+
+    // The regression shape: CFG on (guidance 4.0), negative_prompt UNSET. Must not error.
+    let req = GenerationRequest {
+        prompt: "a photo of a rusty robot holding a lit candle, dramatic cinematic lighting".into(),
+        negative_prompt: None,
+        guidance: Some(4.0),
+        width: 512,
+        height: 512,
+        steps: Some(12),
+        seed: Some(42),
+        count: 1,
+        ..Default::default()
+    };
+
+    let mut on_progress = |_p: Progress| {};
+    let out = gen
+        .generate(&req, &mut on_progress)
+        .expect("base CFG generate with an unset negative prompt (sc-8646)");
+    let images = match out {
+        GenerationOutput::Images(imgs) => imgs,
+        GenerationOutput::Video { .. } => panic!("expected images, got video"),
+    };
+    assert_eq!(images.len(), 1);
+    let img = &images[0];
+    assert_eq!(
+        (img.width, img.height),
+        (512, 512),
+        "output dims == request"
+    );
+
+    // Non-degenerate output: a coherent CFG render is neither a flat color nor pure noise.
+    let n = img.pixels.len() as f64;
+    let mean = img.pixels.iter().map(|&p| p as f64).sum::<f64>() / n;
+    let var = img
+        .pixels
+        .iter()
+        .map(|&p| (p as f64 - mean).powi(2))
+        .sum::<f64>()
+        / n;
+    let std = var.sqrt();
+    assert!(
+        (8.0..248.0).contains(&mean),
+        "degenerate (saturated/black) render: mean={mean:.1}"
+    );
+    assert!(std > 8.0, "near-flat render (no structure): std={std:.1}");
+    eprintln!("[base no-neg smoke] coherent 512x512 render: mean={mean:.1} std={std:.1}");
+}

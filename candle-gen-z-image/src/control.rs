@@ -588,7 +588,7 @@ impl ZImageControl {
         let cap = self.text_embeddings(&req.prompt)?;
         let neg_cap = if cfg_on {
             let neg = req.negative_prompt.as_deref().unwrap_or("");
-            Some(self.text_embeddings(neg)?)
+            Some(self.uncond_embeddings(neg)?)
         } else {
             None
         };
@@ -687,10 +687,11 @@ impl ZImageControl {
         )
     }
 
-    /// Prompt → `cap_feats` `(seq, 2560)` at bf16 via the Qwen3 encoder + the Qwen chat template (the
-    /// txt2img path's tokenizer config).
-    fn text_embeddings(&self, prompt: &str) -> Result<Tensor> {
-        let tok = TextTokenizer::from_file(
+    /// Build the Z-Image Qwen tokenizer (chat template + max-length policy). Shared by the conditional
+    /// ([`text_embeddings`](Self::text_embeddings)) and unconditional
+    /// ([`uncond_embeddings`](Self::uncond_embeddings)) encode paths.
+    fn tokenizer(&self) -> Result<TextTokenizer> {
+        TextTokenizer::from_file(
             self.root.join("tokenizer/tokenizer.json"),
             TokenizerConfig {
                 max_length: TOKENIZER_MAX_LEN,
@@ -699,18 +700,55 @@ impl ZImageControl {
                 pad_to_max_length: false,
             },
         )
-        .map_err(|e| CandleError::Msg(format!("z-image control: load tokenizer: {e}")))?;
-        let out = tok
+        .map_err(|e| CandleError::Msg(format!("z-image control: load tokenizer: {e}")))
+    }
+
+    /// Token `ids` → `cap_feats` `(seq, 2560)` at bf16 via the Qwen3 encoder.
+    fn encode_cap(&self, ids: &[i32]) -> Result<Tensor> {
+        let ids: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
+        let len = ids.len();
+        let input_ids = Tensor::from_vec(ids, (1, len), &self.device)?;
+        let enc = self.text_encoder.forward(&input_ids)?; // (1, L, 2560)
+        Ok(enc.squeeze(0)?.to_dtype(DTYPE)?)
+    }
+
+    /// Prompt → `cap_feats` `(seq, 2560)` at bf16 via the Qwen3 encoder + the Qwen chat template (the
+    /// txt2img path's tokenizer config).
+    fn text_embeddings(&self, prompt: &str) -> Result<Tensor> {
+        let out = self
+            .tokenizer()?
             .tokenize(prompt)
             .map_err(|e| CandleError::Msg(format!("z-image control: tokenize: {e}")))?;
         if out.ids.is_empty() {
             return Err(CandleError::Msg("z-image control: empty prompt".into()));
         }
-        let ids: Vec<u32> = out.ids.iter().map(|&i| i as u32).collect();
-        let len = ids.len();
-        let input_ids = Tensor::from_vec(ids, (1, len), &self.device)?;
-        let enc = self.text_encoder.forward(&input_ids)?; // (1, L, 2560)
-        Ok(enc.squeeze(0)?.to_dtype(DTYPE)?)
+        self.encode_cap(&out.ids)
+    }
+
+    /// Negative prompt → `cap_feats` for the **unconditional** CFG branch of the base control path
+    /// (sc-8680). Identical encoding to [`text_embeddings`](Self::text_embeddings), but the negative
+    /// prompt may be the **empty string** (the unconditional embedding).
+    ///
+    /// gen-core's [`TextTokenizer::tokenize`] short-circuits an empty prompt to a `(1, 0)` sequence
+    /// **before** the chat template is applied (`pad_to_max_length = false`), so an empty negative
+    /// prompt must be encoded via [`encode_chat_ids`], which renders the QwenInstruct scaffolding
+    /// around `""` and tokenizes it to the non-empty role-marker sequence — matching the reference
+    /// `mlx-gen-z-image::model_base_control` uncond branch and mirroring
+    /// [`crate::pipeline::Pipeline::uncond_embeddings`]. See sc-8646.
+    fn uncond_embeddings(&self, negative_prompt: &str) -> Result<Tensor> {
+        if !negative_prompt.is_empty() {
+            return self.text_embeddings(negative_prompt);
+        }
+        let ids = self
+            .tokenizer()?
+            .encode_chat_ids("", true)
+            .map_err(|e| CandleError::Msg(format!("z-image control: tokenize uncond: {e}")))?;
+        if ids.is_empty() {
+            return Err(CandleError::Msg(
+                "z-image control: unconditional embedding tokenized to an empty sequence".into(),
+            ));
+        }
+        self.encode_cap(&ids)
     }
 
     /// Build the 33ch VAE-encoded control context `(1, 33, 1, H/8, W/8)` (bf16): VAE-encode the pose to

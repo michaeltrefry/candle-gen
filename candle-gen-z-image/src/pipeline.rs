@@ -327,12 +327,12 @@ impl Pipeline {
         Ok(latents.to_dtype(self.dtype)?)
     }
 
-    /// Prompt → `cap_feats` `(seq, 2560)` at the compute dtype. Tokenizes with the Qwen chat
-    /// template (gen-core's [`TextTokenizer`]), runs the Qwen3 encoder, and squeezes the batch axis.
-    /// The reference `prepare_inputs` does the SEQ_MULTI_OF padding + attention mask downstream, so
-    /// every returned token is valid (no padding here).
-    pub(crate) fn text_embeddings(&self, te: &ZImageTextEncoder, prompt: &str) -> Result<Tensor> {
-        let tok = TextTokenizer::from_file(
+    /// Build the Z-Image Qwen tokenizer (chat template + max-length policy). Shared by the conditional
+    /// ([`text_embeddings`](Self::text_embeddings)) and unconditional
+    /// ([`uncond_embeddings`](Self::uncond_embeddings)) encode paths so their tokenization policy can
+    /// never drift.
+    fn tokenizer(&self) -> Result<TextTokenizer> {
+        TextTokenizer::from_file(
             self.root.join("tokenizer/tokenizer.json"),
             TokenizerConfig {
                 max_length: TOKENIZER_MAX_LEN,
@@ -341,8 +341,26 @@ impl Pipeline {
                 pad_to_max_length: false,
             },
         )
-        .map_err(|e| CandleError::Msg(format!("z-image: load tokenizer: {e}")))?;
-        let out = tok
+        .map_err(|e| CandleError::Msg(format!("z-image: load tokenizer: {e}")))
+    }
+
+    /// Token `ids` → `cap_feats` `(seq, 2560)` at the compute dtype: run the Qwen3 encoder and squeeze
+    /// the batch axis. The reference `prepare_inputs` does the SEQ_MULTI_OF padding + attention mask
+    /// downstream, so every id here is a valid token (no padding at this seam).
+    fn encode_cap(&self, te: &ZImageTextEncoder, ids: &[i32]) -> Result<Tensor> {
+        // candle embeddings index with u32; the chat-template ids are small non-negative Qwen ids.
+        let ids: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
+        let len = ids.len();
+        let input_ids = Tensor::from_vec(ids, (1, len), &self.device)?;
+        let enc = te.forward(&input_ids)?; // (1, L, 2560)
+        Ok(enc.squeeze(0)?.to_dtype(self.dtype)?) // (L, 2560)
+    }
+
+    /// Prompt → `cap_feats` `(seq, 2560)`. Tokenizes with the Qwen chat template (gen-core's
+    /// [`TextTokenizer`]) and runs the Qwen3 encoder.
+    pub(crate) fn text_embeddings(&self, te: &ZImageTextEncoder, prompt: &str) -> Result<Tensor> {
+        let out = self
+            .tokenizer()?
             .tokenize(prompt)
             .map_err(|e| CandleError::Msg(format!("z-image: tokenize: {e}")))?;
         if out.ids.is_empty() {
@@ -350,25 +368,44 @@ impl Pipeline {
             // (1, 0) tensor would reach the encoder.
             return Err(CandleError::Msg("z-image: empty prompt".into()));
         }
-        // candle embeddings index with u32; the chat-template ids are small non-negative Qwen ids.
-        let ids: Vec<u32> = out.ids.iter().map(|&i| i as u32).collect();
-        let len = ids.len();
-        let input_ids = Tensor::from_vec(ids, (1, len), &self.device)?;
-        let enc = te.forward(&input_ids)?; // (1, L, 2560)
-        Ok(enc.squeeze(0)?.to_dtype(self.dtype)?) // (L, 2560)
+        self.encode_cap(te, &out.ids)
     }
 
-    /// Prompt → `cap_feats` for the **unconditional** (negative-prompt) CFG branch of the base path
-    /// (sc-8414). Identical encoding to [`text_embeddings`](Self::text_embeddings) — same Qwen chat
-    /// template, same encoder — but the prompt may be the **empty string** (the unconditional
-    /// embedding), which the chat template still wraps into a non-empty token sequence, so the
-    /// empty-`ids` guard in `text_embeddings` never applies here.
+    /// Negative prompt → `cap_feats` for the **unconditional** CFG branch of the base path (sc-8414).
+    /// Identical encoding to [`text_embeddings`](Self::text_embeddings) — same Qwen chat template, same
+    /// encoder — but the negative prompt may be the **empty string** (the unconditional embedding).
+    ///
+    /// The empty-string case must NOT route through `text_embeddings`: gen-core's
+    /// [`TextTokenizer::tokenize`] short-circuits an empty prompt to a `(1, 0)` sequence **before** the
+    /// chat template is applied (our config has `pad_to_max_length = false`), so an empty negative
+    /// prompt would trip the empty-`ids` guard and error `z-image: empty prompt` (sc-8646, observed on
+    /// real weights: base CFG with an unset negative prompt). Instead we render the QwenInstruct
+    /// scaffolding around `""` via [`encode_chat_ids`] — `<|im_start|>user\n<|im_end|>\n<|im_start|>
+    /// assistant\n` — which tokenizes to the non-empty role-marker sequence the reference
+    /// `mlx-gen-z-image::model_base` feeds its uncond branch. A non-empty negative prompt takes the
+    /// ordinary `text_embeddings` path.
     pub(crate) fn uncond_embeddings(
         &self,
         te: &ZImageTextEncoder,
         negative_prompt: &str,
     ) -> Result<Tensor> {
-        self.text_embeddings(te, negative_prompt)
+        if !negative_prompt.is_empty() {
+            return self.text_embeddings(te, negative_prompt);
+        }
+        // `add_special_tokens = true` mirrors `tokenize`'s `encode(text, true)`. For Qwen this only
+        // governs the auto-added BOS/EOS (Qwen adds none), so the ids equal the templated tokens.
+        let ids = self
+            .tokenizer()?
+            .encode_chat_ids("", true)
+            .map_err(|e| CandleError::Msg(format!("z-image: tokenize uncond: {e}")))?;
+        if ids.is_empty() {
+            // Only reachable if a degenerate template rendered "" to nothing — surface as a typed
+            // error rather than letting a (1, 0) tensor reach the encoder.
+            return Err(CandleError::Msg(
+                "z-image: unconditional embedding tokenized to an empty sequence".into(),
+            ));
+        }
+        self.encode_cap(te, &ids)
     }
 
     /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring
@@ -706,6 +743,49 @@ mod tests {
         assert_eq!(turbo.shift, 3.0);
         assert!(!base.use_dynamic_shifting && !turbo.use_dynamic_shifting);
         assert_eq!(base.num_train_timesteps, turbo.num_train_timesteps);
+    }
+
+    /// sc-8646 root-cause guard at the tokenizer seam (no GPU / no model weights — only the snapshot's
+    /// `tokenizer/tokenizer.json`): base CFG with an **unset** negative prompt must be able to build an
+    /// unconditional embedding. gen-core's [`TextTokenizer::tokenize`] short-circuits an empty prompt to
+    /// a `(1, 0)` sequence **before** the chat template is applied (`pad_to_max_length = false`) — which
+    /// is why routing the empty uncond through `text_embeddings` errored `z-image: empty prompt`. The
+    /// fix ([`Pipeline::uncond_embeddings`]) encodes it via `encode_chat_ids("", true)`, which renders
+    /// the QwenInstruct scaffolding around `""` and yields a **non-empty** role-marker token sequence.
+    /// Set `Z_IMAGE_SNAPSHOT` or `Z_IMAGE_BASE_SNAPSHOT` (both ship the same Qwen tokenizer).
+    #[test]
+    #[ignore = "needs Z_IMAGE_SNAPSHOT/Z_IMAGE_BASE_SNAPSHOT for tokenizer.json (no GPU); run with --ignored"]
+    fn empty_uncond_tokenizes_via_chat_template() {
+        let snap = std::env::var("Z_IMAGE_BASE_SNAPSHOT")
+            .or_else(|_| std::env::var("Z_IMAGE_SNAPSHOT"))
+            .expect("set Z_IMAGE_SNAPSHOT or Z_IMAGE_BASE_SNAPSHOT to a Z-Image snapshot dir");
+        let tok = TextTokenizer::from_file(
+            Path::new(&snap).join("tokenizer/tokenizer.json"),
+            TokenizerConfig {
+                max_length: TOKENIZER_MAX_LEN,
+                pad_token_id: QWEN_PAD_TOKEN_ID,
+                chat_template: ChatTemplate::QwenInstruct,
+                pad_to_max_length: false,
+            },
+        )
+        .expect("load tokenizer.json");
+
+        // The trap: an empty prompt short-circuits to (1, 0) BEFORE the chat template is applied.
+        assert!(
+            tok.tokenize("").unwrap().ids.is_empty(),
+            "empty prompt must short-circuit before the chat template (the sc-8646 trap)"
+        );
+        // The fix: the QwenInstruct scaffolding around "" tokenizes to a non-empty sequence, distinct
+        // from a real prompt's encoding.
+        let uncond_ids = tok.encode_chat_ids("", true).expect("encode empty uncond");
+        assert!(
+            !uncond_ids.is_empty(),
+            "empty uncond must tokenize via the chat template to a non-empty sequence"
+        );
+        let real_ids = tok
+            .encode_chat_ids("a red fox", true)
+            .expect("encode real prompt");
+        assert_ne!(uncond_ids, real_ids, "uncond scaffolding != a real prompt");
     }
 
     /// The base static **shift=6.0** schedule (built `set_timesteps(steps, None)`) must: have
