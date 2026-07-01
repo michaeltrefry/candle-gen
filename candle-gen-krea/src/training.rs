@@ -73,7 +73,7 @@ use rand_distr::{Distribution, StandardNormal};
 
 use crate::config::Krea2Config;
 use crate::loader::Weights;
-use crate::schedule::{turbo_sigmas, TURBO_MU};
+use crate::schedule::{dynamic_mu, krea_sigmas};
 use crate::text_encoder::{KreaTeConfig, KreaTextEncoder};
 use crate::tokenizer::KreaTokenizer;
 use crate::train_dit::{KreaTrainDit, KREA_ATTN_TARGETS};
@@ -171,18 +171,23 @@ fn encode_caption(tok: &KreaTokenizer, te: &KreaTextEncoder, caption: &str) -> R
 }
 
 /// The Krea preview-sample render state (sc-8650) — everything [`KreaTrainer::render_sample`] needs to
-/// run the family's CFG-free Turbo denoise on the **in-progress** trainable DiT, built once in
-/// [`KreaTrainer::cache`] while the text encoder is still resident:
+/// run the family's **Raw** CFG denoise on the **in-progress** trainable DiT, built once in
+/// [`KreaTrainer::cache`] while the text encoder is still resident. The trainer's loaded weights are the
+/// undistilled Raw checkpoint, so the preview mirrors the MLX trainer's Raw recipe (dynamic-`mu`
+/// schedule + classifier-free guidance), NOT the deployed few-step CFG-free `krea_2_turbo` render:
 ///
 ///  * `contexts` — the per-prompt pre-encoded Qwen3-VL conditioning, each `(L, num_text_layers,
 ///    text_hidden)` at f32 (exactly what [`encode_caption`] returns and [`KreaTrainDit::forward`]
 ///    consumes once unsqueezed to a batch axis), 1:1 with [`SamplePlan::prompts`].
+///  * `ctx_neg` — one shared **empty-prompt** unconditional context (same shape/dtype) for the CFG
+///    branch; pre-encoded once here while the encoder is resident (mirrors the MLX trainer).
 ///  * `vae` — the resident Qwen-Image VAE **decoder** (`Arc` as inference holds it); the cache pass
 ///    loads only the encoder, so the decoder is loaded here for the preview path.
 ///  * `edge` — the square training-resolution edge (`bucket_resolution(cfg.resolution)`, the same edge
 ///    the cached latents use) the seeded preview noise is shaped at.
 pub struct KreaSampleState {
     contexts: Vec<Tensor>,
+    ctx_neg: Tensor,
     vae: Arc<QwenVae>,
     edge: u32,
 }
@@ -353,11 +358,15 @@ impl FlowMatchTrainer for KreaTrainer {
                 .iter()
                 .map(|p| encode_caption(&tokenizer, &text_encoder, p))
                 .collect::<Result<Vec<Tensor>>>()?;
+            // Shared empty-prompt unconditional context for the CFG preview branch (mirrors the MLX
+            // trainer) — pre-encoded here while the text encoder is still resident.
+            let ctx_neg = encode_caption(&tokenizer, &text_encoder, "")?;
             let vae = Arc::new(crate::vae::load_vae(&self.root, device)?);
             SamplePlan {
                 prompts,
                 state: Some(KreaSampleState {
                     contexts,
+                    ctx_neg,
                     vae,
                     edge,
                 }),
@@ -412,12 +421,15 @@ impl FlowMatchTrainer for KreaTrainer {
     }
 
     /// Render preview prompt `index` from the **in-progress** trainable DiT (sc-8650) — the training-side
-    /// mirror of [`crate::pipeline`]'s CFG-free Turbo `render`. Krea consumes the **raw** velocity at
-    /// timestep `σ` ([`TimestepConvention::Sigma`]), so the denoise closure feeds `dit.forward` the bare
-    /// σ and returns the raw velocity (no negation, no CFG — the TDM-distilled student is guidance-free,
-    /// so `sample_guidance_scale` is ignored). `TrainingConfig` carries no per-run sampler/scheduler
-    /// knob, so the native exponential-`mu` Turbo schedule is used (the byte-exact inference default).
-    /// Best-effort: any error here is logged + skipped by the driver, never aborting the run.
+    /// mirror of the MLX trainer's **Raw** preview render (`mlx-gen-krea`). The trainer's loaded weights
+    /// are the undistilled **Raw** DiT, so the preview uses the Raw sampler recipe — the
+    /// resolution-dynamic `mu` schedule ([`dynamic_mu`] over the image-sequence length `(edge/16)²`) and
+    /// classifier-free guidance — NOT the deployed few-step CFG-free `krea_2_turbo` render
+    /// ([`crate::pipeline`]). A CFG-free Turbo-schedule render of the Raw checkpoint collapses to
+    /// washed-out, unrepresentative output. Krea consumes the **raw** velocity at timestep `σ`
+    /// ([`TimestepConvention::Sigma`], no negation); the CFG mix is
+    /// `v = v_uncond + guidance·(v_cond − v_uncond)` (`guidance ≤ 1` ⇒ conditional-only, a single
+    /// forward). Best-effort: any error here is logged + skipped by the driver, never aborting the run.
     fn render_sample(
         &self,
         dit: &KreaTrainDit,
@@ -428,16 +440,18 @@ impl FlowMatchTrainer for KreaTrainer {
     ) -> Result<Image> {
         let device = &self.device;
         let steps = (cfg.sample_steps.max(1)) as usize;
-        // Native exponential-mu Turbo sigmas — the byte-exact default; `None` scheduler (no per-run knob
-        // on `TrainingConfig`) resolves to the native schedule.
-        let sigmas =
-            candle_gen::resolve_flow_schedule(None, TURBO_MU as f32, steps, &turbo_sigmas(steps));
+        // Raw resolution-dynamic `mu` schedule (image-sequence length = `(edge/16)²`), mirroring the MLX
+        // trainer — the Raw checkpoint is not TDM-distilled, so the fixed Turbo `mu` does not apply.
+        let img_seq = (state.edge as f64 / 16.0).powi(2);
+        let sigmas = krea_sigmas(steps, dynamic_mu(img_seq));
 
         let noise = sample_noise_latent(state.edge, seed, device)?;
         // The DiT's `text_fusion` consumes a batched `(1, L, n, d)` context — the cached
         // `encode_caption` output is `(L, n, d)`, so unsqueeze the batch axis exactly as
         // `compute_loss_grads` does before its own forward.
-        let context = state.contexts[index].unsqueeze(0)?;
+        let ctx_pos = state.contexts[index].unsqueeze(0)?;
+        let ctx_neg = state.ctx_neg.unsqueeze(0)?;
+        let guidance = cfg.sample_guidance_scale;
 
         // A preview need not honor cancel mid-denoise — a fresh never-cancel flag (the trainer's
         // `req.cancel` is only available in `cache`, not here).
@@ -453,7 +467,16 @@ impl FlowMatchTrainer for KreaTrainer {
             &mut on_progress,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let v = dit.forward(x, &t, &context)?;
+                let v_cond = dit.forward(x, &t, &ctx_pos)?;
+                // CFG: `v = v_uncond + guidance·(v_cond − v_uncond)`. `guidance ≤ 1` collapses to the
+                // conditional velocity, so skip the extra unconditional forward.
+                let v = if guidance > 1.0 {
+                    let v_uncond = dit.forward(x, &t, &ctx_neg)?;
+                    let guided = ((&v_cond - &v_uncond)? * guidance as f64)?;
+                    (&v_uncond + guided)?
+                } else {
+                    v_cond
+                };
                 Ok(v.to_dtype(DType::F32)?)
             },
         )?;
