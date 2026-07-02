@@ -10,7 +10,9 @@
 //!    `CombinedTimestepTextProjEmbeddings`). Each joint block's image stream gets a 6-chunk
 //!    modulation `(shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp)` from its own
 //!    `norm1.linear`; the text stream gets the same from `norm1_context.linear` — EXCEPT the LAST
-//!    block, whose context stream is `context_pre_only` (2-chunk scale/shift, no gate, no ff_context).
+//!    block, whose context stream is `context_pre_only` (2-chunk, no gate, no ff_context) — that one
+//!    is diffusers `AdaLayerNormContinuous`, so its chunk order is **scale, shift** (scale FIRST),
+//!    unlike the shift-first 6-chunk AdaLN-Zero (sc-8981).
 //!  - **Modulation application order** (the mlx-port bug magnet, epic 7841): the AdaLN-Zero chunk
 //!    split is `chunk(6) -> [shift, scale, gate_msa, shift, scale, gate_mlp]` and the apply is
 //!    `x * (1 + scale) + shift` then `x + gate * sublayer(...)`. Pinned by [`tests`].
@@ -632,6 +634,33 @@ impl JointBlock {
         Ok(())
     }
 
+    /// The context (text) stream's AdaLN: returns `(norm_txt, chunks)` where `norm_txt` is the
+    /// modulated `LN(txt)` fed to the joint attention and `chunks` are the raw modulation slices
+    /// (the non-final path also consumes chunks 2..=5 for its gate/mlp modulation).
+    ///
+    /// **Chunk order differs between the two block kinds** (sc-8981, the epic-7841 AdaLN bug
+    /// magnet):
+    ///  - non-final blocks: diffusers `AdaLayerNormZero` — 6 chunks `(shift_msa, scale_msa,
+    ///    gate_msa, shift_mlp, scale_mlp, gate_mlp)`, **shift FIRST** → `scale = cm[1]`,
+    ///    `shift = cm[0]`;
+    ///  - the final (`context_pre_only`) block: diffusers `AdaLayerNormContinuous` — 2 chunks
+    ///    `scale, shift = chunk(2)`, **scale FIRST** → `scale = cm[0]`, `shift = cm[1]` (the same
+    ///    order as `norm_out`, pinned by sc-7881).
+    ///
+    /// Pinned by [`tests::context_adaln_chunk_order_per_block_kind`].
+    fn context_modulation(&self, txt: &Tensor, temb: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
+        let cm = self.norm1_context.forward(temb)?;
+        let ln_txt = layer_norm(txt)?;
+        let norm_txt = if self.context_pre_only {
+            // AdaLayerNormContinuous order: scale = cm[0], shift = cm[1].
+            modulate(&ln_txt, &cm[0], &cm[1])?
+        } else {
+            // AdaLayerNormZero order: shift = cm[0], scale = cm[1].
+            modulate(&ln_txt, &cm[1], &cm[0])?
+        };
+        Ok((norm_txt, cm))
+    }
+
     /// `(image, text, temb)` → updated `(image, text)`. For the final (`context_pre_only`) block the
     /// returned `text` is unchanged (only `image` matters downstream). On a dual (MMDiT-X) block the
     /// image-only `attn2` residual is added before the joint-attn residual.
@@ -645,13 +674,7 @@ impl JointBlock {
         let norm_img = modulate(&ln_img, scale_msa, shift_msa)?;
 
         // Context norm.
-        let cm = self.norm1_context.forward(temb)?;
-        let norm_txt = if self.context_pre_only {
-            // 2-chunk scale/shift only.
-            modulate(&layer_norm(txt)?, &cm[1], &cm[0])?
-        } else {
-            modulate(&layer_norm(txt)?, &cm[1], &cm[0])?
-        };
+        let (norm_txt, cm) = self.context_modulation(txt, temb)?;
 
         let (img_attn, txt_attn) = self.attn.forward(&norm_img, &norm_txt)?;
 
@@ -953,6 +976,66 @@ mod tests {
             assert!(
                 (v - 2.0).abs() < 1e-4,
                 "shift must be the SECOND chunk (got {v}, expected 2)"
+            );
+        }
+    }
+
+    /// The joint block's context AdaLN chunk order depends on the block kind (sc-8981):
+    ///  - non-final (`AdaLayerNormZero`, 6 chunks): **shift FIRST** (`shift_msa, scale_msa, …`);
+    ///  - final / `context_pre_only` (`AdaLayerNormContinuous`, 2 chunks): **scale FIRST**
+    ///    (`scale, shift = chunk(2)` — the same diffusers order sc-7881 pinned for `norm_out`).
+    ///
+    /// Rig `norm1_context.linear` to a zero weight + a known bias so the chunks are observable, and
+    /// feed an all-ones text row so `LN(txt) = 0` and the modulated output isolates the SHIFT chunk.
+    /// Before the sc-8981 fix the pre-only branch applied `(1+shift)·LN + scale`, which this test
+    /// catches (it would return the scale constant instead of the shift constant).
+    #[test]
+    fn context_adaln_chunk_order_per_block_kind() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let inner = cfg.inner_dim;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+
+        // LN of a constant row is 0, so modulate(...) = (1+scale)·0 + shift = shift.
+        let txt = Tensor::ones((1, 1, inner), DType::F32, &dev).unwrap();
+        let temb = Tensor::randn(0f32, 1f32, (1, inner), &dev).unwrap();
+
+        // Final block: 2 chunks, scale FIRST (7), shift SECOND (2) — expect the shift, 2.
+        let mut pre_only =
+            JointBlock::new(&cfg, true, false, vb.pp("transformer_blocks").pp(0)).unwrap();
+        let w = Tensor::zeros((2 * inner, inner), DType::F32, &dev).unwrap();
+        let mut bias = vec![7f32; inner];
+        bias.extend(vec![2f32; inner]);
+        let b = Tensor::from_vec(bias, 2 * inner, &dev).unwrap();
+        pre_only.norm1_context.linear = Linear::new(w, Some(b));
+        let (norm_txt, cm) = pre_only.context_modulation(&txt, &temb).unwrap();
+        assert_eq!(cm.len(), 2);
+        for v in norm_txt.flatten_all().unwrap().to_vec1::<f32>().unwrap() {
+            assert!(
+                (v - 2.0).abs() < 1e-4,
+                "context_pre_only: shift must be the SECOND chunk (AdaLayerNormContinuous, \
+                 scale-first); got {v}, expected 2"
+            );
+        }
+
+        // Non-final block: 6 chunks, shift_msa FIRST (3), scale_msa SECOND (9) — expect the
+        // shift, 3.
+        let mut std_block =
+            JointBlock::new(&cfg, false, false, vb.pp("transformer_blocks").pp(1)).unwrap();
+        let w = Tensor::zeros((6 * inner, inner), DType::F32, &dev).unwrap();
+        let mut bias = vec![3f32; inner]; // shift_msa
+        bias.extend(vec![9f32; inner]); // scale_msa
+        bias.extend(vec![0f32; 4 * inner]); // gate_msa, shift_mlp, scale_mlp, gate_mlp
+        let b = Tensor::from_vec(bias, 6 * inner, &dev).unwrap();
+        std_block.norm1_context.linear = Linear::new(w, Some(b));
+        let (norm_txt, cm) = std_block.context_modulation(&txt, &temb).unwrap();
+        assert_eq!(cm.len(), 6);
+        for v in norm_txt.flatten_all().unwrap().to_vec1::<f32>().unwrap() {
+            assert!(
+                (v - 3.0).abs() < 1e-4,
+                "non-final: shift_msa must be the FIRST chunk (AdaLayerNormZero, shift-first); \
+                 got {v}, expected 3"
             );
         }
     }
